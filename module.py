@@ -87,6 +87,7 @@ class Module:
         self.message_handlers.update({
             'neighbor_discovery': self._handle_neighbor_discovery,
             'status_request': self._handle_status_request,
+            'status_response': self._handle_status_response,
             'damage_notification': self._handle_damage_notification,
         })
     
@@ -231,6 +232,24 @@ class Module:
         )
         self.send_message(response)
     
+    def _handle_status_response(self, message: Message):
+        """Handle status response messages."""
+        sender_id = message.sender_id
+        payload = message.payload
+        logger.debug(f"Module {self.id} received status from {sender_id}: active={payload.get('is_active')}")
+        
+        # Store neighbor status information
+        if 'neighbor_status' not in self.module_data:
+            self.module_data['neighbor_status'] = {}
+        
+        self.module_data['neighbor_status'][sender_id] = {
+            'is_active': payload.get('is_active'),
+            'is_pivotable': payload.get('is_pivotable'),
+            'position': payload.get('position'),
+            'connected_directions': payload.get('connected_directions'),
+            'available_ports': payload.get('available_ports')
+        }
+    
     def _handle_damage_notification(self, message: Message):
         """Handle damage notification from neighbors."""
         damaged_module = message.payload.get('module_id')
@@ -257,8 +276,156 @@ class Module:
     def __repr__(self):
         return f"Module(id={self.id}, active={self.is_active}, pos={self.position})"
 
-# Example usage and testing
+# Complex example demonstrating a larger modular system with damage scenarios
+def complex_example():
+    """More complex example demonstrating a larger modular system with damage scenarios."""
+    logger.info("=" * 60)
+    logger.info("COMPLEX EXAMPLE: 3x3 Grid with Damage Scenarios")
+    logger.info("=" * 60)
+    
+    # Create a 3x3 grid of modules
+    modules = {}
+    for x in range(3):
+        for y in range(3):
+            module_id = f"M{x}{y}"
+            position = np.array([x, y, 0])
+            modules[module_id] = Module(module_id, position)
+    
+    logger.info(f"Created {len(modules)} modules in 3x3 grid")
+    
+    # Connect adjacent modules in grid pattern
+    connections_made = 0
+    for x in range(3):
+        for y in range(3):
+            current_id = f"M{x}{y}"
+            current_module = modules[current_id]
+            
+            # Connect to right neighbor
+            if x < 2:
+                neighbor_id = f"M{x+1}{y}"
+                if current_module.connect_to_module(Direction.POS_X, neighbor_id):
+                    modules[neighbor_id].connect_to_module(Direction.NEG_X, current_id)
+                    connections_made += 1
+            
+            # Connect to top neighbor
+            if y < 2:
+                neighbor_id = f"M{x}{y+1}"
+                if current_module.connect_to_module(Direction.POS_Y, neighbor_id):
+                    modules[neighbor_id].connect_to_module(Direction.NEG_Y, current_id)
+                    connections_made += 1
+    
+    logger.info(f"Established {connections_made} bidirectional connections")
+    
+    # Test neighbor discovery messages
+    logger.info("\n--- Testing Neighbor Discovery ---")
+    for module_id, module in modules.items():
+        neighbor_count = len(module.neighbors_1hop)
+        logger.info(f"Module {module_id}: {neighbor_count} neighbors - {list(module.neighbors_1hop)}")
+    
+    # Test status request broadcast
+    logger.info("\n--- Testing Status Request Broadcast ---")
+    center_module = modules["M11"]  # Center module
+    center_module.send_message_to_neighbors("status_request", {"requester": "M11"})
+    
+    # Simulate message delivery and processing
+    for neighbor_id in center_module.neighbors_1hop:
+        neighbor_module = modules[neighbor_id]
+        # Create response message
+        status_message = Message(
+            sender_id=neighbor_id,
+            receiver_id="M11",
+            message_type="status_response",
+            payload=neighbor_module.get_status()
+        )
+        center_module.receive_message(status_message)
+    
+    center_module.process_messages()
+    
+    # Introduce multiple damage scenarios
+    logger.info("\n--- Damage Scenario 1: Corner Module Damage ---")
+    corner_module = modules["M00"]
+    corner_module.set_damage(True)
+    
+    # Process damage notifications
+    for neighbor_id in corner_module.neighbors_1hop:
+        neighbor_module = modules[neighbor_id]
+        damage_msg = Message(
+            sender_id="M00",
+            receiver_id=neighbor_id,
+            message_type="damage_notification",
+            payload={"module_id": "M00", "status": "damaged"}
+        )
+        neighbor_module.receive_message(damage_msg)
+        neighbor_module.process_messages()
+    
+    logger.info("\n--- Damage Scenario 2: Critical Hub Damage ---")
+    # Damage the center module (most connected)
+    center_module.set_damage(True)
+    
+    # Notify all neighbors
+    for neighbor_id in list(center_module.neighbors_1hop):  # Copy list to avoid modification during iteration
+        neighbor_module = modules[neighbor_id]
+        damage_msg = Message(
+            sender_id="M11",
+            receiver_id=neighbor_id,
+            message_type="damage_notification",
+            payload={"module_id": "M11", "status": "damaged"}
+        )
+        neighbor_module.receive_message(damage_msg)
+        neighbor_module.process_messages()
+    
+    # Test pivot capabilities after damage
+    logger.info("\n--- Testing Pivot Capabilities After Damage ---")
+    active_modules = [m for m in modules.values() if m.is_active]
+    pivotable_modules = [m for m in active_modules if m.can_pivot()]
+    pivot_axis_modules = [m for m in active_modules if m.can_be_pivot_axis()]
+    
+    logger.info(f"Active modules: {len(active_modules)}/{len(modules)}")
+    logger.info(f"Pivotable modules: {len(pivotable_modules)}")
+    logger.info(f"Pivot axis capable: {len(pivot_axis_modules)}")
+    
+    # Test message queue handling under load
+    logger.info("\n--- Stress Testing Message Queues ---")
+    test_module = modules["M22"]  # Corner module still active
+    
+    # Send multiple message types
+    message_types = ["neighbor_discovery", "status_request", "damage_notification", "custom_test"]
+    for i in range(10):
+        for msg_type in message_types:
+            test_msg = Message(
+                sender_id=f"EXTERNAL_{i}",
+                receiver_id="M22",
+                message_type=msg_type,
+                payload={"test_data": i, "batch": "stress_test"}
+            )
+            test_module.receive_message(test_msg)
+    
+    logger.info(f"Queued {len(test_module.message_queue)} messages for processing")
+    test_module.process_messages()
+    
+    # Final system state report
+    logger.info("\n--- Final System State Report ---")
+    active_count = sum(1 for m in modules.values() if m.is_active)
+    damaged_count = len(modules) - active_count
+    total_connections = sum(len(m.neighbors_1hop) for m in modules.values()) // 2  # Bidirectional
+    
+    logger.info(f"System Health: {active_count}/{len(modules)} modules active ({damaged_count} damaged)")
+    logger.info(f"Network Connectivity: {total_connections} connections maintained")
+    
+    # Test disconnection due to damage
+    logger.info("\n--- Testing Disconnection Scenarios ---")
+    if modules["M01"].is_active and modules["M02"].is_active:
+        # Test manual disconnection
+        before_neighbors = len(modules["M01"].neighbors_1hop)
+        modules["M01"].disconnect_from_direction(Direction.POS_X)
+        after_neighbors = len(modules["M01"].neighbors_1hop)
+        logger.info(f"M01 neighbors: {before_neighbors} -> {after_neighbors} after disconnection")
+    
+    logger.info("Complex example completed successfully")
+
+
 if __name__ == "__main__":
+    # Run simple example first
     logger.info("Starting modular system example")
     
     # Create a few modules
@@ -286,4 +453,7 @@ if __name__ == "__main__":
     module_b.receive_message(message)
     module_b.process_messages()
     
-    logger.info("Example completed")
+    logger.info("Simple example completed")
+    
+    # Run complex example
+    complex_example()
