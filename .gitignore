@@ -169,3 +169,4 @@ cython_debug/
 
 agents/ui_agent/weights
 external_data/
+.claude/
