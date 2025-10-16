@@ -1,6 +1,8 @@
 # Damage-Responsive Reconfiguration
 > **Project Type:** Research
 
+![An example gif from the simulation framework](gifs/general_pivot_demo.gif)
+
 ## About • Goal • Vision
 Implementation of a Unit Dual Quaternion Directed Graph (UDQDG) framework for modular spacecraft reconfiguration. The system models modular structures as spherical modules connected by pure translation transformations, enabling damage-responsive reconfiguration through pivot operations.
 
