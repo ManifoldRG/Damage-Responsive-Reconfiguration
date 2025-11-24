@@ -42,3 +42,11 @@ LATTICE_DIRECTIONS = {
     'POS_Z': (0, 0, 1),
     'NEG_Z': (0, 0, -1)
 }
+
+# 2D lattice directions (planar, z=0)
+LATTICE_DIRECTIONS_2D = {
+    'POS_X': (1, 0, 0),
+    'NEG_X': (-1, 0, 0),
+    'POS_Y': (0, 1, 0),
+    'NEG_Y': (0, -1, 0)
+}

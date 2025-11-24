@@ -2,10 +2,11 @@ import numpy as np
 from typing import Dict, List, Set, Tuple, Optional
 import random
 from dataclasses import dataclass
+import networkx as nx
 try:
-    from .dual_quaternion import UnitDualQuaternion, LATTICE_DIRECTIONS
+    from .dual_quaternion import UnitDualQuaternion, LATTICE_DIRECTIONS, LATTICE_DIRECTIONS_2D
 except ImportError:
-    from dual_quaternion import UnitDualQuaternion, LATTICE_DIRECTIONS
+    from dual_quaternion import UnitDualQuaternion, LATTICE_DIRECTIONS, LATTICE_DIRECTIONS_2D
 
 @dataclass
 class SphericalModule:
@@ -13,6 +14,7 @@ class SphericalModule:
     id: str
     position: np.ndarray
     is_active: bool = True
+    is_faulty: bool = False  # Damaged/faulty module flag
     radius: float = 0.5  # Half of unit lattice step for perfect touching
     color: Tuple[float, float, float] = (0.7, 0.7, 0.9)
 
@@ -26,10 +28,12 @@ class UDQDGSystem:
     - Corner and lateral pivot operations
     """
     
-    def __init__(self):
+    def __init__(self, mode_2d: bool = False):
         self.modules: Dict[str, SphericalModule] = {}
         self.edges: Dict[Tuple[str, str], UnitDualQuaternion] = {}
         self.time = 0
+        self.mode_2d = mode_2d
+        self.directions = LATTICE_DIRECTIONS_2D if mode_2d else LATTICE_DIRECTIONS
         
     def add_module(self, module_id: str, position: np.ndarray, active: bool = True) -> SphericalModule:
         """Add a spherical module to the system."""
@@ -69,7 +73,7 @@ class UDQDGSystem:
             
         # Check if direction is in allowed lattice directions
         direction = tuple(np.round(translation).astype(int))
-        return direction in LATTICE_DIRECTIONS.values()
+        return direction in self.directions.values()
     
     def get_neighbors(self, module_id: str) -> List[str]:
         """Get all connected neighbors of a module."""
@@ -98,7 +102,7 @@ class UDQDGSystem:
         
         # Calculate new position
         axis_pos = self.modules[axis_module].position
-        new_translation = np.array(LATTICE_DIRECTIONS[new_direction])
+        new_translation = np.array(self.directions[new_direction])
         new_position = axis_pos + new_translation
         
         # Update module position
@@ -176,7 +180,7 @@ class UDQDGSystem:
             return False
         if not (self.modules[pivot_module].is_active and self.modules[axis_module].is_active):
             return False
-        if new_direction not in LATTICE_DIRECTIONS:
+        if new_direction not in self.directions:
             return False
 
         # Check if pivot module is pivotable (all neighbors active)
@@ -187,13 +191,13 @@ class UDQDGSystem:
         current_edge = self.edges.get((pivot_module, axis_module))
         if current_edge:
             current_translation = current_edge.translation
-            new_translation = np.array(LATTICE_DIRECTIONS[new_direction])
+            new_translation = np.array(self.directions[new_direction])
 
             if not self._are_orthogonal(current_translation, new_translation):
                 return False
 
         # Check port exclusivity
-        new_dir_tuple = LATTICE_DIRECTIONS[new_direction]
+        new_dir_tuple = self.directions[new_direction]
         neg_new_dir = tuple(-x for x in new_dir_tuple)
 
         # Axis module must have free port in new_direction (where pivot module will be)
@@ -265,7 +269,7 @@ class UDQDGSystem:
             return False
             
         pivot_module, axis_module = random.choice(candidates)
-        new_direction = random.choice(list(LATTICE_DIRECTIONS.keys()))
+        new_direction = random.choice(list(self.directions.keys()))
         
         return self.corner_pivot(pivot_module, axis_module, new_direction)
     
@@ -320,3 +324,425 @@ class UDQDGSystem:
             edge = tuple(sorted([a, b]))
             edges.add(edge)
         return list(edges)
+
+    # Ego-based Fault Response Algorithm Methods
+
+    def mark_fault(self, module_id: str) -> bool:
+        """Mark a module as faulty (damaged)."""
+        if module_id not in self.modules:
+            return False
+        self.modules[module_id].is_faulty = True
+        self.modules[module_id].is_active = False
+        return True
+
+    def get_k_hop_neighbors(self, module_id: str, k: int) -> Set[str]:
+        """Get all neighbors within k hops using BFS."""
+        if module_id not in self.modules:
+            return set()
+
+        visited = set()
+        current_level = {module_id}
+
+        for _ in range(k):
+            next_level = set()
+            for node in current_level:
+                if node not in visited:
+                    visited.add(node)
+                    neighbors = self.get_neighbors(node)
+                    next_level.update(neighbors)
+            current_level = next_level
+
+        # Remove the starting module itself
+        visited.discard(module_id)
+        return visited
+
+    def is_leaf_node(self, module_id: str) -> bool:
+        """Check if module is a leaf (only one neighbor)."""
+        if module_id not in self.modules:
+            return False
+        neighbors = self.get_neighbors(module_id)
+        return len(neighbors) == 1
+
+    def can_respond_to_fault(self, module_id: str) -> bool:
+        """
+        Ego-based decision: Can this module respond to a fault signal?
+
+        Checks:
+        1. Am I a leaf node? (only one neighbor) → can move
+        2. Are pivot options available to me?
+        3. Are my 1-hop connections a subset of my 3-hop connections?
+           (ensures I'm not critical for connectivity)
+        """
+        if module_id not in self.modules:
+            return False
+
+        module = self.modules[module_id]
+        if not module.is_active or module.is_faulty:
+            return False
+
+        # Check 1: Leaf nodes can always move
+        if self.is_leaf_node(module_id):
+            return True
+
+        # Check 2: Are pivot options available?
+        neighbors = self.get_neighbors(module_id)
+        has_pivot_option = False
+
+        for neighbor in neighbors:
+            # Check corner pivots
+            for direction in self.directions.keys():
+                if self._can_corner_pivot(module_id, neighbor, direction):
+                    has_pivot_option = True
+                    break
+
+            # Check lateral pivots
+            neighbor_neighbors = self.get_neighbors(neighbor)
+            for new_neighbor in neighbor_neighbors:
+                if new_neighbor != module_id and self._can_lateral_pivot(module_id, neighbor, new_neighbor):
+                    has_pivot_option = True
+                    break
+
+            if has_pivot_option:
+                break
+
+        if not has_pivot_option:
+            return False
+
+        # Check 3: Are 1-hop ⊆ 3-hop? (connectivity check)
+        one_hop = set(self.get_neighbors(module_id))
+        three_hop = self.get_k_hop_neighbors(module_id, 3)
+
+        # If all my direct neighbors can still reach each other through 3-hop paths,
+        # then I'm not critical for connectivity
+        return one_hop.issubset(three_hop)
+
+    def _position_is_occupied(self, position: np.ndarray, exclude_module: Optional[str] = None) -> bool:
+        """Check if a position is occupied by any module."""
+        for module_id, module in self.modules.items():
+            if exclude_module and module_id == exclude_module:
+                continue
+            if np.allclose(module.position, position):
+                return True
+        return False
+
+    def get_available_pivots(self, module_id: str, target_pos: np.ndarray) -> List[Tuple[str, str, str, Optional[str]]]:
+        """
+        Get available pivot operations that move towards target position.
+
+        Returns list of tuples: (pivot_type, pivot_module, axis/old_neighbor, new_direction/new_neighbor)
+        - For corner: ('corner', module_id, axis_module, new_direction)
+        - For lateral: ('lateral', module_id, old_neighbor, new_neighbor)
+        """
+        if module_id not in self.modules:
+            return []
+
+        current_pos = self.modules[module_id].position
+        current_distance = np.linalg.norm(current_pos - target_pos)
+
+        available_pivots = []
+        neighbors = self.get_neighbors(module_id)
+
+        # Check corner pivots
+        for neighbor in neighbors:
+            for direction in self.directions.keys():
+                if self._can_corner_pivot(module_id, neighbor, direction):
+                    # Calculate new position after corner pivot
+                    neighbor_pos = self.modules[neighbor].position
+                    new_translation = np.array(self.directions[direction])
+                    new_pos = neighbor_pos + new_translation
+
+                    # Don't move onto the fault location itself
+                    if np.allclose(new_pos, target_pos):
+                        continue
+
+                    # Don't move to an occupied position (collision detection)
+                    if self._position_is_occupied(new_pos, exclude_module=module_id):
+                        continue
+
+                    new_distance = np.linalg.norm(new_pos - target_pos)
+
+                    # Only include if it moves us closer
+                    if new_distance < current_distance:
+                        available_pivots.append(('corner', module_id, neighbor, direction))
+
+        # Check lateral pivots
+        for old_neighbor in neighbors:
+            neighbor_neighbors = self.get_neighbors(old_neighbor)
+            for new_neighbor in neighbor_neighbors:
+                if new_neighbor != module_id and self._can_lateral_pivot(module_id, old_neighbor, new_neighbor):
+                    # Calculate new position after lateral pivot
+                    old_edge = self.edges.get((old_neighbor, module_id))
+                    if old_edge:
+                        direction = old_edge.translation
+                        new_neighbor_pos = self.modules[new_neighbor].position
+                        new_pos = new_neighbor_pos + direction
+
+                        # Don't move onto the fault location itself
+                        if np.allclose(new_pos, target_pos):
+                            continue
+
+                        # Don't move to an occupied position (collision detection)
+                        if self._position_is_occupied(new_pos, exclude_module=module_id):
+                            continue
+
+                        new_distance = np.linalg.norm(new_pos - target_pos)
+
+                        # Only include if it moves us closer
+                        if new_distance < current_distance:
+                            available_pivots.append(('lateral', module_id, old_neighbor, new_neighbor))
+
+        return available_pivots
+
+    def _form_new_connections(self) -> int:
+        """
+        Scan for and form new connections between adjacent modules.
+
+        Returns:
+            Number of new connections formed
+        """
+        new_connections = 0
+        active_modules = [mid for mid, m in self.modules.items() if m.is_active]
+
+        for module_id in active_modules:
+            module_pos = self.modules[module_id].position
+
+            # Check all other active modules
+            for other_id in active_modules:
+                if module_id == other_id:
+                    continue
+
+                # Skip if already connected
+                if (module_id, other_id) in self.edges:
+                    continue
+
+                other_pos = self.modules[other_id].position
+                translation = other_pos - module_pos
+
+                # Check if they're at unit lattice distance
+                if self._is_unit_lattice_step(translation):
+                    # Check if both modules have free ports for connection
+                    direction = tuple(translation.astype(int))
+                    neg_direction = tuple((-translation).astype(int))
+
+                    if self._is_port_available(module_id, direction) and \
+                       self._is_port_available(other_id, neg_direction):
+                        # Form the connection
+                        if self.connect_modules(module_id, other_id):
+                            new_connections += 1
+
+        return new_connections
+
+    def ego_fault_response(self, fault_id: str, max_iterations: int = 1000) -> Dict[str, any]:
+        """
+        Execute ego-based fault response algorithm with wave propagation.
+
+        The fault signal propagates outward one hop per timestep.
+        At each timestep, only modules that have received the signal (neighbors of
+        previously signaled modules) can make decisions and move.
+
+        The algorithm continues until either:
+        1. Active modules are reconnected (single connected component)
+        2. No more moves are possible
+        3. Max iterations reached
+
+        Returns:
+            Dictionary with statistics about the response
+        """
+        if fault_id not in self.modules:
+            return {"success": False, "reason": "Fault module not found"}
+
+        if not self.modules[fault_id].is_faulty:
+            return {"success": False, "reason": "Module is not marked as faulty"}
+
+        fault_pos = self.modules[fault_id].position
+        stats = {
+            "iterations": 0,
+            "total_moves": 0,
+            "modules_responded": set(),
+            "wave_fronts": [],
+            "reconnected": False,
+            "new_connections_formed": 0,
+            "success": True
+        }
+
+        for iteration in range(max_iterations):
+            stats["iterations"] = iteration + 1
+
+            # Check if we've reconnected
+            if self.is_connected(active_only=True):
+                stats["reconnected"] = True
+                break
+
+            moves_this_iteration = 0
+
+            # Propagate signal to all active modules
+            # In reconnection mode, all modules can respond each iteration
+            for module_id in sorted(self.modules.keys()):
+                module = self.modules[module_id]
+
+                # Skip if not active
+                if not module.is_active or module.is_faulty:
+                    continue
+
+                # Ego decision: Should I respond?
+                if not self.can_respond_to_fault(module_id):
+                    continue
+
+                # If disconnected, try to move toward other components for reconnection
+                # Otherwise move toward fault
+                if not self.is_connected(active_only=True):
+                    # Find target position: closest module in a different component
+                    components = self.get_connected_components(active_only=True)
+                    my_component = None
+                    for comp in components:
+                        if module_id in comp:
+                            my_component = comp
+                            break
+
+                    if my_component:
+                        # Find closest module in other components
+                        min_distance = float('inf')
+                        target_pos = fault_pos
+                        for comp in components:
+                            if comp == my_component:
+                                continue
+                            for other_id in comp:
+                                other_pos = self.modules[other_id].position
+                                distance = np.linalg.norm(module.position - other_pos)
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    target_pos = other_pos
+                    else:
+                        target_pos = fault_pos
+                else:
+                    target_pos = fault_pos
+
+                # Get available pivots towards target
+                pivots = self.get_available_pivots(module_id, target_pos)
+
+                if pivots:
+                    # Execute first available pivot
+                    pivot_type, pivot_module, param1, param2 = pivots[0]
+
+                    success = False
+                    if pivot_type == 'corner':
+                        success = self.corner_pivot(pivot_module, param1, param2)
+                    elif pivot_type == 'lateral':
+                        success = self.lateral_pivot(pivot_module, param1, param2)
+
+                    if success:
+                        moves_this_iteration += 1
+                        stats["modules_responded"].add(module_id)
+                        stats["total_moves"] += 1
+
+            # After all moves, scan for and form new connections
+            new_conn = self._form_new_connections()
+            stats["new_connections_formed"] += new_conn
+
+            # Stop if no moves were made this iteration AND no new connections formed
+            if moves_this_iteration == 0 and new_conn == 0:
+                break
+
+        stats["modules_responded"] = list(stats["modules_responded"])
+        return stats
+
+    def is_connected(self, active_only: bool = True) -> bool:
+        """
+        Check if the graph is connected.
+
+        Args:
+            active_only: If True, only check connectivity of active modules
+
+        Returns:
+            True if connected, False otherwise
+        """
+        if not self.modules:
+            return True
+
+        # Build networkx graph
+        G = nx.Graph()
+
+        # Add nodes
+        for module_id, module in self.modules.items():
+            if not active_only or module.is_active:
+                G.add_node(module_id)
+
+        # Add edges
+        for (src, dst) in self.edges:
+            if src in G.nodes and dst in G.nodes:
+                G.add_edge(src, dst)
+
+        # Check connectivity
+        return nx.is_connected(G) if G.number_of_nodes() > 0 else True
+
+    def get_connected_components(self, active_only: bool = True) -> List[Set[str]]:
+        """
+        Get all connected components.
+
+        Args:
+            active_only: If True, only consider active modules
+
+        Returns:
+            List of sets, each set containing module IDs in a component
+        """
+        if not self.modules:
+            return []
+
+        # Build networkx graph
+        G = nx.Graph()
+
+        # Add nodes
+        for module_id, module in self.modules.items():
+            if not active_only or module.is_active:
+                G.add_node(module_id)
+
+        # Add edges
+        for (src, dst) in self.edges:
+            if src in G.nodes and dst in G.nodes:
+                G.add_edge(src, dst)
+
+        # Get connected components
+        return [set(component) for component in nx.connected_components(G)]
+
+    def to_2d_array(self, padding: int = 1) -> np.ndarray:
+        """
+        Convert system to 2D array for visualization (assumes z=0 plane).
+
+        Args:
+            padding: Number of empty cells to pad around the modules (default: 1)
+
+        Returns:
+            2D numpy array where:
+            0 = empty space
+            1 = active module
+            -1 = faulty module
+        """
+        if not self.modules:
+            return np.array([[]])
+
+        # Find bounds
+        positions = [m.position for m in self.modules.values()]
+        x_coords = [int(p[0]) for p in positions]
+        y_coords = [int(p[1]) for p in positions]
+
+        min_x, max_x = min(x_coords), max(x_coords)
+        min_y, max_y = min(y_coords), max(y_coords)
+
+        # Create array with padding (note: y-axis is inverted for visualization)
+        width = max_x - min_x + 1 + 2 * padding
+        height = max_y - min_y + 1 + 2 * padding
+        array = np.zeros((height, width), dtype=int)
+
+        # Fill array (offset by padding)
+        for module in self.modules.values():
+            x = int(module.position[0]) - min_x + padding
+            y = int(module.position[1]) - min_y + padding
+
+            if module.is_faulty:
+                array[y, x] = -1
+            elif module.is_active:
+                array[y, x] = 1
+            else:
+                array[y, x] = 0
+
+        return array
