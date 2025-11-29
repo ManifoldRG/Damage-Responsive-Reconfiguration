@@ -144,6 +144,120 @@ class UDQDGVisualizer:
                 self._animate_parallel_pivots(ops, n_frames)
                 time.sleep(pause_between)
 
+    def animate_ego_response(
+        self,
+        steps,  # List[PivotStep] - avoid circular import
+        n_frames: int = 12,
+        pause_between: float = 0.5,
+        camera_mode: str = 'fixed',
+        reset_positions: bool = True,
+        parallel_groups=None  # List[List[PivotStep]] - for parallel animation
+    ):
+        """
+        Animate the steps recorded from ego_fault_response().
+
+        Args:
+            steps: List of PivotStep objects from ego_fault_response(record_steps=True)
+            n_frames: Number of interpolation frames per pivot
+            pause_between: Pause duration between pivots
+            camera_mode: Camera behavior - 'fixed', 'rotate', or 'follow'
+            reset_positions: If True, reset module positions to pre-algorithm state
+                            before animating (required since algorithm already ran)
+            parallel_groups: If provided, animate moves in parallel within each group.
+                           This overrides 'steps' parameter.
+        """
+        import time
+
+        # Use parallel groups if provided
+        use_parallel = parallel_groups is not None and len(parallel_groups) > 0
+
+        if use_parallel:
+            all_steps = [step for group in parallel_groups for step in group]
+        else:
+            all_steps = steps
+
+        if not all_steps:
+            print("No steps to animate")
+            return
+
+        # Reset module positions to their initial state before animation
+        # This is needed because ego_fault_response already modified positions
+        if reset_positions:
+            # Build map of each module's original position (first time it appears)
+            original_positions = {}
+            for step in all_steps:
+                if step.module_id not in original_positions:
+                    original_positions[step.module_id] = step.from_pos.copy()
+
+            # Reset positions
+            for module_id, pos in original_positions.items():
+                self.system.modules[module_id].position = pos.copy()
+
+            # Re-render to show initial state
+            self.render_system()
+            self.plotter.update()
+            time.sleep(0.5)  # Pause to show initial state
+
+        if use_parallel:
+            # Animate using parallel groups
+            total_groups = len(parallel_groups)
+            for i, group in enumerate(parallel_groups):
+                iteration = group[0].iteration if group else 0
+                print(f"[Iteration {iteration}] Animating {len(group)} modules in parallel")
+
+                # Handle camera mode
+                if camera_mode == 'rotate':
+                    progress = i / total_groups
+                    self.plotter.camera.azimuth = progress * 90
+                elif camera_mode == 'follow' and group:
+                    # Center on centroid of moving modules
+                    positions = [self.system.modules[s.module_id].position for s in group]
+                    centroid = sum(positions) / len(positions)
+                    self.plotter.camera.focal_point = tuple(centroid)
+
+                # Convert steps to pivot operations format
+                pivot_ops = [step.to_tuple() for step in group]
+                self._animate_parallel_pivots(pivot_ops, n_frames)
+
+                time.sleep(pause_between)
+
+            print(f"Animation complete: {total_groups} parallel groups, {len(all_steps)} total moves")
+        else:
+            # Sequential animation (original behavior)
+            current_iteration = None
+
+            for i, step in enumerate(steps):
+                # Log iteration changes
+                if step.iteration != current_iteration:
+                    current_iteration = step.iteration
+                    print(f"[Iteration {current_iteration}]")
+
+                print(f"  Animating: {step.pivot_type} {step.module_id}")
+
+                # Handle camera mode
+                if camera_mode == 'follow':
+                    # Center camera on the moving module
+                    module_pos = self.system.modules[step.module_id].position
+                    self.plotter.camera.focal_point = tuple(module_pos)
+                elif camera_mode == 'rotate':
+                    # Gradual rotation during animation
+                    progress = i / len(steps)
+                    self.plotter.camera.azimuth = progress * 90  # Rotate 90 degrees total
+
+                # Animate using existing methods (which also execute the pivot)
+                if step.pivot_type == 'corner':
+                    self._animate_single_corner_pivot(
+                        step.module_id, step.param1, step.param2, n_frames
+                    )
+                elif step.pivot_type == 'lateral':
+                    self._animate_single_lateral_pivot(
+                        step.module_id, step.param1, step.param2, n_frames
+                    )
+
+                time.sleep(pause_between)
+
+            print(f"Animation complete: {len(steps)} steps")
+
     def _animate_single_corner_pivot(self, pivot_module: str, axis_module: str,
                                       new_direction: str, n_frames: int = None):
         """Internal method for animating a single corner pivot."""

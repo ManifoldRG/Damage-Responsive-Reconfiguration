@@ -18,6 +18,23 @@ class SphericalModule:
     radius: float = 0.5  # Half of unit lattice step for perfect touching
     color: Tuple[float, float, float] = (0.7, 0.7, 0.9)
 
+
+@dataclass
+class PivotStep:
+    """Records a single pivot operation for visualization/replay."""
+    iteration: int
+    pivot_type: str  # 'corner' or 'lateral'
+    module_id: str
+    param1: str      # axis_module (corner) or old_neighbor (lateral)
+    param2: str      # new_direction (corner) or new_neighbor (lateral)
+    from_pos: np.ndarray
+    to_pos: np.ndarray
+
+    def to_tuple(self) -> Tuple:
+        """Convert to animation-compatible tuple format."""
+        return (self.pivot_type, self.module_id, self.param1, self.param2)
+
+
 class UDQDGSystem:
     """
     Simple Unit Dual Quaternion Directed Graph system.
@@ -86,31 +103,36 @@ class UDQDGSystem:
     def corner_pivot(self, pivot_module: str, axis_module: str, new_direction: str) -> bool:
         """
         Perform corner pivot: move pivot_module around corner of axis_module.
-        
+
         Args:
             pivot_module: Module to pivot
-            axis_module: Module to pivot around  
+            axis_module: Module to pivot around
             new_direction: New lattice direction (e.g., 'POS_X')
         """
         if not self._can_corner_pivot(pivot_module, axis_module, new_direction):
             return False
-            
-        # Remove old connection
-        if (pivot_module, axis_module) in self.edges:
-            del self.edges[(pivot_module, axis_module)]
-            del self.edges[(axis_module, pivot_module)]
-        
+
+        # Get all current neighbors before moving
+        old_neighbors = self.get_neighbors(pivot_module)
+
+        # Remove ALL connections (we'll reconnect valid ones after move)
+        for neighbor in old_neighbors:
+            if (pivot_module, neighbor) in self.edges:
+                del self.edges[(pivot_module, neighbor)]
+            if (neighbor, pivot_module) in self.edges:
+                del self.edges[(neighbor, pivot_module)]
+
         # Calculate new position
         axis_pos = self.modules[axis_module].position
         new_translation = np.array(self.directions[new_direction])
         new_position = axis_pos + new_translation
-        
+
         # Update module position
         self.modules[pivot_module].position = new_position
-        
-        # Create new connection
+
+        # Reconnect to axis module (guaranteed to be adjacent after corner pivot)
         self.connect_modules(axis_module, pivot_module)
-        
+
         return True
     
     def lateral_pivot(self, pivot_module: str, old_neighbor: str, new_neighbor: str) -> bool:
@@ -127,22 +149,26 @@ class UDQDGSystem:
 
         direction = old_edge.translation
 
-        # Remove old connection (edges are bidirectional)
-        if (pivot_module, old_neighbor) in self.edges:
-            del self.edges[(pivot_module, old_neighbor)]
-        if (old_neighbor, pivot_module) in self.edges:
-            del self.edges[(old_neighbor, pivot_module)]
-        
+        # Get all current neighbors before moving
+        old_neighbors = self.get_neighbors(pivot_module)
+
+        # Remove ALL connections (we'll reconnect valid ones after move)
+        for neighbor in old_neighbors:
+            if (pivot_module, neighbor) in self.edges:
+                del self.edges[(pivot_module, neighbor)]
+            if (neighbor, pivot_module) in self.edges:
+                del self.edges[(neighbor, pivot_module)]
+
         # Calculate new position
         new_neighbor_pos = self.modules[new_neighbor].position
         new_position = new_neighbor_pos + direction
-        
+
         # Update module position
         self.modules[pivot_module].position = new_position
-        
-        # Create new connection # TODO fix this connection I think?
+
+        # Reconnect to new_neighbor (guaranteed to be adjacent after lateral pivot)
         self.connect_modules(new_neighbor, pivot_module)
-        
+
         return True
     
     def _is_pivotable(self, module_id: str) -> bool:
@@ -370,7 +396,7 @@ class UDQDGSystem:
         Checks:
         1. Am I a leaf node? (only one neighbor) → can move
         2. Are pivot options available to me?
-        3. Are my 1-hop connections a subset of my 3-hop connections?
+        3. Can my neighbors reach each other WITHOUT going through me?
            (ensures I'm not critical for connectivity)
         """
         if module_id not in self.modules:
@@ -408,13 +434,113 @@ class UDQDGSystem:
         if not has_pivot_option:
             return False
 
-        # Check 3: Are 1-hop ⊆ 3-hop? (connectivity check)
-        one_hop = set(self.get_neighbors(module_id))
-        three_hop = self.get_k_hop_neighbors(module_id, 3)
+        # Check 3: Can my neighbors reach each other without me?
+        # Use 3-hop information but exclude paths through self
+        neighbors = self.get_neighbors(module_id)
+        if len(neighbors) <= 1:
+            return True  # Only one neighbor, can't break connectivity
 
-        # If all my direct neighbors can still reach each other through 3-hop paths,
-        # then I'm not critical for connectivity
-        return one_hop.issubset(three_hop)
+        # For each neighbor, check if it can reach all other neighbors
+        # through paths that don't go through me (using 3-hop limit)
+        for i, neighbor_a in enumerate(neighbors):
+            # Get 3-hop neighbors of neighbor_a, excluding paths through module_id
+            reachable = self._get_k_hop_neighbors_excluding(neighbor_a, 3, exclude={module_id})
+
+            # Check if all other neighbors are reachable
+            for neighbor_b in neighbors[i+1:]:
+                if neighbor_b not in reachable:
+                    # neighbor_a can't reach neighbor_b without going through me
+                    # So I'm critical for connectivity - can't move
+                    return False
+
+        return True
+
+    def _get_k_hop_neighbors_excluding(
+        self,
+        module_id: str,
+        k: int,
+        exclude: Set[str]
+    ) -> Set[str]:
+        """
+        Get all modules reachable within k hops, excluding certain modules from paths.
+
+        Args:
+            module_id: Starting module
+            k: Maximum number of hops
+            exclude: Set of module IDs to exclude from paths
+
+        Returns:
+            Set of reachable module IDs (excluding self and excluded modules)
+        """
+        if k <= 0:
+            return set()
+
+        visited = {module_id} | exclude  # Don't revisit self or excluded
+        current_frontier = {module_id}
+        all_reachable = set()
+
+        for _ in range(k):
+            next_frontier = set()
+            for node in current_frontier:
+                for neighbor in self.get_neighbors(node):
+                    if neighbor not in visited:
+                        # Only include active, non-faulty modules
+                        if self.modules[neighbor].is_active and not self.modules[neighbor].is_faulty:
+                            next_frontier.add(neighbor)
+                            all_reachable.add(neighbor)
+                            visited.add(neighbor)
+            current_frontier = next_frontier
+            if not current_frontier:
+                break
+
+        return all_reachable
+
+    def select_responding_module(
+        self,
+        component: Set[str],
+        fault_pos: np.ndarray,
+        all_components: Optional[List[Set[str]]] = None
+    ) -> Optional[str]:
+        """
+        Select ONE module from a component to respond to fault.
+
+        Selection criteria (models damage signal propagation):
+        1. Must be able to respond (can_respond_to_fault)
+        2. Must have at least one valid pivot move available
+        3. Primary sort: distance to fault (ascending - closer modules respond first)
+        4. Tiebreaker: module ID (lexicographic for determinism)
+
+        Args:
+            component: Set of module IDs in this connected component
+            fault_pos: Position of the fault
+            all_components: All connected components (for target calculation)
+
+        Returns:
+            Module ID of selected responder, or None if no valid candidates
+        """
+        candidates = []
+        for module_id in component:
+            if self.can_respond_to_fault(module_id):
+                dist = np.linalg.norm(self.modules[module_id].position - fault_pos)
+                candidates.append((dist, module_id))
+
+        if not candidates:
+            return None
+
+        # Sort by distance (ascending), then by ID (lexicographic)
+        candidates.sort(key=lambda x: (x[0], x[1]))
+
+        # Find first candidate that actually has valid pivots
+        for dist, module_id in candidates:
+            target_pos = self._get_target_position(
+                module_id, component, all_components or [component], fault_pos
+            )
+            pivots = self.get_available_pivots(module_id, target_pos)
+            if pivots:
+                return module_id
+
+        # No candidate has valid pivots
+        return None
 
     def _position_is_occupied(self, position: np.ndarray, exclude_module: Optional[str] = None) -> bool:
         """Check if a position is occupied by any module."""
@@ -432,6 +558,10 @@ class UDQDGSystem:
         Returns list of tuples: (pivot_type, pivot_module, axis/old_neighbor, new_direction/new_neighbor)
         - For corner: ('corner', module_id, axis_module, new_direction)
         - For lateral: ('lateral', module_id, old_neighbor, new_neighbor)
+
+        Note: Only returns moves that strictly decrease distance to target.
+        This is a greedy algorithm that may get stuck in some configurations
+        (e.g., line split in middle where leaves can't bridge the gap).
         """
         if module_id not in self.modules:
             return []
@@ -532,21 +662,96 @@ class UDQDGSystem:
 
         return new_connections
 
-    def ego_fault_response(self, fault_id: str, max_iterations: int = 1000) -> Dict[str, any]:
+    def _calculate_pivot_destination(
+        self,
+        module_id: str,
+        pivot: Tuple[str, str, str, str]
+    ) -> np.ndarray:
         """
-        Execute ego-based fault response algorithm with wave propagation.
+        Calculate where a module will end up after executing a pivot.
 
-        The fault signal propagates outward one hop per timestep.
-        At each timestep, only modules that have received the signal (neighbors of
-        previously signaled modules) can make decisions and move.
+        Args:
+            module_id: The module being pivoted
+            pivot: Tuple of (pivot_type, module_id, param1, param2)
+
+        Returns:
+            The destination position as numpy array
+        """
+        pivot_type, _, param1, param2 = pivot
+        module_pos = self.modules[module_id].position
+
+        if pivot_type == 'corner':
+            # Corner pivot: rotate 90 degrees around axis_module
+            axis_module = param1
+            new_direction = param2  # String like 'POS_X', 'NEG_Y', etc.
+            axis_pos = self.modules[axis_module].position
+
+            # Get direction vector from LATTICE_DIRECTIONS or self.directions
+            if new_direction in self.directions:
+                direction_vec = np.array(self.directions[new_direction], dtype=float)
+            else:
+                # Fallback: return axis position
+                return axis_pos.copy()
+
+            # New position is axis position + direction
+            return axis_pos + direction_vec
+
+        elif pivot_type == 'lateral':
+            # Lateral pivot: roll from old_neighbor to new_neighbor
+            old_neighbor = param1
+            new_neighbor = param2
+            new_neighbor_pos = self.modules[new_neighbor].position
+
+            # Calculate direction from new_neighbor to module's destination
+            # The module ends up on the opposite side of new_neighbor from old_neighbor
+            old_neighbor_pos = self.modules[old_neighbor].position
+
+            # Module moves to position that's adjacent to new_neighbor,
+            # continuing in same direction as old_neighbor -> new_neighbor
+            direction = new_neighbor_pos - old_neighbor_pos
+            direction = direction / np.linalg.norm(direction)  # Normalize
+            return new_neighbor_pos + direction
+
+        # Fallback: return current position
+        return module_pos.copy()
+
+    def ego_fault_response(
+        self,
+        fault_id: str,
+        max_iterations: int = 1000,
+        one_per_subgraph: bool = True,
+        parallel_subgraphs: bool = True,
+        record_steps: bool = False
+    ) -> Dict[str, any]:
+        """
+        Execute ego-based fault response algorithm.
+
+        Models damage signal propagation where modules closer to the fault
+        respond first. When one_per_subgraph=True (default), only ONE module
+        per connected component moves per iteration, selected by distance to fault.
+
+        When parallel_subgraphs=True (default), all subgraphs move their selected
+        module simultaneously. Collisions are resolved using distance+ID tiebreaker.
 
         The algorithm continues until either:
         1. Active modules are reconnected (single connected component)
         2. No more moves are possible
         3. Max iterations reached
 
+        Args:
+            fault_id: ID of the faulty module
+            max_iterations: Maximum iterations to run
+            one_per_subgraph: If True, only one module per component moves per iteration
+                             (models signal propagation). If False, all responsive
+                             modules can move (legacy behavior).
+            parallel_subgraphs: If True, all subgraphs move simultaneously with
+                               collision detection. If False, sequential execution.
+            record_steps: If True, record each pivot operation for visualization/replay.
+
         Returns:
-            Dictionary with statistics about the response
+            Dictionary with statistics about the response.
+            If record_steps=True, includes 'steps' (list of PivotStep) and
+            'failed_attempts' (list of failed pivot info for debugging).
         """
         if fault_id not in self.modules:
             return {"success": False, "reason": "Fault module not found"}
@@ -562,8 +767,15 @@ class UDQDGSystem:
             "wave_fronts": [],
             "reconnected": False,
             "new_connections_formed": 0,
+            "collisions_resolved": 0,
             "success": True
         }
+
+        # Step recording for visualization
+        if record_steps:
+            stats["steps"] = []
+            stats["parallel_steps"] = []  # Groups of simultaneous moves
+            stats["failed_attempts"] = []
 
         for iteration in range(max_iterations):
             stats["iterations"] = iteration + 1
@@ -575,65 +787,221 @@ class UDQDGSystem:
 
             moves_this_iteration = 0
 
-            # Propagate signal to all active modules
-            # In reconnection mode, all modules can respond each iteration
-            for module_id in sorted(self.modules.keys()):
-                module = self.modules[module_id]
+            # Get all connected components
+            components = self.get_connected_components(active_only=True)
 
-                # Skip if not active
-                if not module.is_active or module.is_faulty:
-                    continue
+            if one_per_subgraph:
+                # One module per subgraph mode
+                # Step 1: Collect candidate moves from all components
+                candidate_moves = []  # List of (module_id, pivot, target_pos, from_pos, dist_to_fault)
 
-                # Ego decision: Should I respond?
-                if not self.can_respond_to_fault(module_id):
-                    continue
+                for component in components:
+                    module_id = self.select_responding_module(
+                        component, fault_pos, all_components=components
+                    )
 
-                # If disconnected, try to move toward other components for reconnection
-                # Otherwise move toward fault
-                if not self.is_connected(active_only=True):
-                    # Find target position: closest module in a different component
-                    components = self.get_connected_components(active_only=True)
+                    if module_id is None:
+                        continue
+
+                    target_pos = self._get_target_position(
+                        module_id, component, components, fault_pos
+                    )
+
+                    pivots = self.get_available_pivots(module_id, target_pos)
+
+                    if pivots:
+                        pivot = pivots[0]
+                        from_pos = self.modules[module_id].position.copy()
+                        dist_to_fault = np.linalg.norm(from_pos - fault_pos)
+
+                        # Calculate where module will end up after pivot
+                        pivot_target = self._calculate_pivot_destination(
+                            module_id, pivot
+                        )
+
+                        candidate_moves.append({
+                            "module_id": module_id,
+                            "pivot": pivot,
+                            "target_pos": pivot_target,
+                            "from_pos": from_pos,
+                            "dist_to_fault": dist_to_fault
+                        })
+
+                if parallel_subgraphs and len(candidate_moves) > 1:
+                    # Step 2: Detect and resolve collisions
+                    # Group moves by target position
+                    position_groups = {}
+                    for move in candidate_moves:
+                        pos_key = tuple(move["target_pos"].astype(int))
+                        if pos_key not in position_groups:
+                            position_groups[pos_key] = []
+                        position_groups[pos_key].append(move)
+
+                    # Resolve collisions using distance + ID tiebreaker
+                    moves_to_execute = []
+                    for pos_key, moves in position_groups.items():
+                        if len(moves) == 1:
+                            moves_to_execute.append(moves[0])
+                        else:
+                            # Collision! Sort by distance to fault, then by ID
+                            moves.sort(key=lambda m: (m["dist_to_fault"], m["module_id"]))
+                            winner = moves[0]
+                            moves_to_execute.append(winner)
+                            stats["collisions_resolved"] += len(moves) - 1
+
+                            if record_steps:
+                                # Log collision losers
+                                for loser in moves[1:]:
+                                    stats["failed_attempts"].append({
+                                        "iteration": iteration + 1,
+                                        "module_id": loser["module_id"],
+                                        "pivot_type": loser["pivot"][0],
+                                        "reason": f"collision with {winner['module_id']} at {pos_key}"
+                                    })
+
+                    # Step 3: Execute all non-colliding moves (parallel)
+                    parallel_group = []  # For step recording
+                    for move in moves_to_execute:
+                        pivot_type, pivot_module, param1, param2 = move["pivot"]
+                        module_id = move["module_id"]
+                        from_pos = move["from_pos"]
+
+                        success = False
+                        if pivot_type == 'corner':
+                            success = self.corner_pivot(pivot_module, param1, param2)
+                        elif pivot_type == 'lateral':
+                            success = self.lateral_pivot(pivot_module, param1, param2)
+
+                        if success:
+                            moves_this_iteration += 1
+                            stats["modules_responded"].add(module_id)
+                            stats["total_moves"] += 1
+
+                            if record_steps:
+                                to_pos = self.modules[module_id].position.copy()
+                                step = PivotStep(
+                                    iteration=iteration + 1,
+                                    pivot_type=pivot_type,
+                                    module_id=module_id,
+                                    param1=param1,
+                                    param2=param2,
+                                    from_pos=from_pos,
+                                    to_pos=to_pos
+                                )
+                                stats["steps"].append(step)
+                                parallel_group.append(step)
+                        elif record_steps:
+                            stats["failed_attempts"].append({
+                                "iteration": iteration + 1,
+                                "module_id": module_id,
+                                "pivot_type": pivot_type,
+                                "param1": param1,
+                                "param2": param2
+                            })
+
+                    # Record parallel group for visualization
+                    if record_steps and parallel_group:
+                        stats["parallel_steps"].append(parallel_group)
+
+                else:
+                    # Sequential execution (single component or parallel_subgraphs=False)
+                    for move in candidate_moves:
+                        pivot_type, pivot_module, param1, param2 = move["pivot"]
+                        module_id = move["module_id"]
+                        from_pos = move["from_pos"]
+
+                        success = False
+                        if pivot_type == 'corner':
+                            success = self.corner_pivot(pivot_module, param1, param2)
+                        elif pivot_type == 'lateral':
+                            success = self.lateral_pivot(pivot_module, param1, param2)
+
+                        if success:
+                            moves_this_iteration += 1
+                            stats["modules_responded"].add(module_id)
+                            stats["total_moves"] += 1
+
+                            if record_steps:
+                                to_pos = self.modules[module_id].position.copy()
+                                step = PivotStep(
+                                    iteration=iteration + 1,
+                                    pivot_type=pivot_type,
+                                    module_id=module_id,
+                                    param1=param1,
+                                    param2=param2,
+                                    from_pos=from_pos,
+                                    to_pos=to_pos
+                                )
+                                stats["steps"].append(step)
+                        elif record_steps:
+                            stats["failed_attempts"].append({
+                                "iteration": iteration + 1,
+                                "module_id": module_id,
+                                "pivot_type": pivot_type,
+                                "param1": param1,
+                                "param2": param2
+                            })
+            else:
+                # Legacy mode: all responsive modules can move
+                for module_id in sorted(self.modules.keys()):
+                    module = self.modules[module_id]
+
+                    if not module.is_active or module.is_faulty:
+                        continue
+
+                    if not self.can_respond_to_fault(module_id):
+                        continue
+
                     my_component = None
                     for comp in components:
                         if module_id in comp:
                             my_component = comp
                             break
 
-                    if my_component:
-                        # Find closest module in other components
-                        min_distance = float('inf')
-                        target_pos = fault_pos
-                        for comp in components:
-                            if comp == my_component:
-                                continue
-                            for other_id in comp:
-                                other_pos = self.modules[other_id].position
-                                distance = np.linalg.norm(module.position - other_pos)
-                                if distance < min_distance:
-                                    min_distance = distance
-                                    target_pos = other_pos
-                    else:
-                        target_pos = fault_pos
-                else:
-                    target_pos = fault_pos
+                    target_pos = self._get_target_position(
+                        module_id, my_component, components, fault_pos
+                    )
 
-                # Get available pivots towards target
-                pivots = self.get_available_pivots(module_id, target_pos)
+                    pivots = self.get_available_pivots(module_id, target_pos)
 
-                if pivots:
-                    # Execute first available pivot
-                    pivot_type, pivot_module, param1, param2 = pivots[0]
+                    if pivots:
+                        pivot_type, pivot_module, param1, param2 = pivots[0]
 
-                    success = False
-                    if pivot_type == 'corner':
-                        success = self.corner_pivot(pivot_module, param1, param2)
-                    elif pivot_type == 'lateral':
-                        success = self.lateral_pivot(pivot_module, param1, param2)
+                        # Record position before pivot
+                        from_pos = self.modules[module_id].position.copy()
 
-                    if success:
-                        moves_this_iteration += 1
-                        stats["modules_responded"].add(module_id)
-                        stats["total_moves"] += 1
+                        success = False
+                        if pivot_type == 'corner':
+                            success = self.corner_pivot(pivot_module, param1, param2)
+                        elif pivot_type == 'lateral':
+                            success = self.lateral_pivot(pivot_module, param1, param2)
+
+                        if success:
+                            moves_this_iteration += 1
+                            stats["modules_responded"].add(module_id)
+                            stats["total_moves"] += 1
+
+                            # Record step for visualization
+                            if record_steps:
+                                to_pos = self.modules[module_id].position.copy()
+                                step = PivotStep(
+                                    iteration=iteration + 1,
+                                    pivot_type=pivot_type,
+                                    module_id=module_id,
+                                    param1=param1,
+                                    param2=param2,
+                                    from_pos=from_pos,
+                                    to_pos=to_pos
+                                )
+                                stats["steps"].append(step)
+                        elif record_steps:
+                            stats["failed_attempts"].append({
+                                "iteration": iteration + 1,
+                                "module_id": module_id,
+                                "pivot_type": pivot_type,
+                                "param1": param1,
+                                "param2": param2
+                            })
 
             # After all moves, scan for and form new connections
             new_conn = self._form_new_connections()
@@ -645,6 +1013,39 @@ class UDQDGSystem:
 
         stats["modules_responded"] = list(stats["modules_responded"])
         return stats
+
+    def _get_target_position(
+        self,
+        module_id: str,
+        my_component: Optional[Set[str]],
+        all_components: List[Set[str]],
+        fault_pos: np.ndarray
+    ) -> np.ndarray:
+        """
+        Determine target position for a module to move towards.
+
+        If disconnected (multiple components), targets closest module in other component.
+        Otherwise, targets the fault position.
+        """
+        if len(all_components) > 1 and my_component is not None:
+            # Find closest module in other components
+            module_pos = self.modules[module_id].position
+            min_distance = float('inf')
+            target_pos = fault_pos
+
+            for comp in all_components:
+                if comp == my_component:
+                    continue
+                for other_id in comp:
+                    other_pos = self.modules[other_id].position
+                    distance = np.linalg.norm(module_pos - other_pos)
+                    if distance < min_distance:
+                        min_distance = distance
+                        target_pos = other_pos
+
+            return target_pos
+        else:
+            return fault_pos
 
     def is_connected(self, active_only: bool = True) -> bool:
         """

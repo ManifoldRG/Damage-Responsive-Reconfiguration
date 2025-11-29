@@ -25,7 +25,11 @@ from src.configurations import (
     create_line_configuration,
     create_cross_configuration,
     create_helix_configuration,
-    create_l_shape_configuration
+    create_l_shape_configuration,
+    create_grid_configuration,
+    create_lattice_plane_configuration,
+    create_t_shape_configuration,
+    create_ring_configuration
 )
 
 # ============================================
@@ -287,6 +291,465 @@ def demo_damage_response():
     viz.show()
 
 
+def demo_ego_fault_response(parallel: bool = True):
+    """
+    Demonstrate the ego-based fault response algorithm with step-by-step animation.
+    Shows how modules autonomously respond to a fault and reconnect.
+
+    Args:
+        parallel: If True, animate parallel subgraph moves simultaneously
+    """
+    print("=== Ego Fault Response Demo ===")
+    print("Creating 3D star configuration...")
+
+    import time
+
+    # Step 1: Create system and run algorithm to get steps
+    # We run on a separate system to capture the steps
+    system_for_steps = create_star_configuration(size=2)
+    system_for_steps.mark_fault('C')  # Fault at center disconnects all arms
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules")
+    print("Fault location: Center (C)")
+    print("This disconnects all 6 arms into separate components\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response(
+        'C',
+        record_steps=True,
+        parallel_subgraphs=parallel
+    )
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+    print(f"  Steps recorded: {len(stats['steps'])}")
+    if parallel and stats.get('parallel_steps'):
+        print(f"  Parallel groups: {len(stats['parallel_steps'])}")
+
+    # Step 2: Create a fresh system for visualization
+    system = create_star_configuration(size=2)
+    system.mark_fault('C')  # Mark fault (visual indicator)
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    print("Controls:")
+    print("  - Left click + drag: Rotate view")
+    print("  - Right click + drag: Pan view")
+    print("  - Scroll: Zoom in/out")
+    print("  - 'q': Quit\n")
+
+    # Initialize window
+    viz.show_window()
+
+    # Pause to show initial state with fault
+    print("Showing initial state with fault (red module)...")
+    time.sleep(1.0)
+
+    # Animate the recorded steps
+    if parallel and stats.get('parallel_steps'):
+        print("\nAnimating ego fault response steps (parallel mode)...")
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        print("\nAnimating ego fault response steps (sequential mode)...")
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    # Pause at end
+    print("\nAnimation complete! System reconnected.")
+    time.sleep(1.0)
+
+    viz.plotter.close()
+
+
+def demo_ego_large_star():
+    """
+    Demonstrate ego fault response on a larger 3D star (size=3).
+    More modules means more parallel moves and potential collisions.
+    """
+    print("=== Ego Fault Response - Large Star Demo ===")
+    print("Creating large 3D star configuration (size=3)...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_star_configuration(size=3)
+    system_for_steps.mark_fault('C')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules")
+    print("Fault location: Center (C)")
+    print("This disconnects all 6 arms (18 modules total)\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+    if stats.get('parallel_steps'):
+        print(f"  Parallel groups: {len(stats['parallel_steps'])}")
+
+    # Fresh system for visualization
+    system = create_star_configuration(size=3)
+    system.mark_fault('C')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_ego_t_shape():
+    """
+    Demonstrate ego fault response on a T-shaped configuration.
+    Center fault creates 3 disconnected arms that must reconnect.
+    """
+    print("=== Ego Fault Response - T-Shape Demo ===")
+    print("Creating T-shaped configuration...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_t_shape_configuration(arm_length=3)
+    system_for_steps.mark_fault('C')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules")
+    print("Fault location: Center (C)")
+    print("This disconnects 3 arms\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+
+    # Fresh system for visualization
+    system = create_t_shape_configuration(arm_length=3)
+    system.mark_fault('C')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_ego_cross():
+    """
+    Demonstrate ego fault response on a cross/+ configuration.
+    Center fault creates 5 disconnected arms (4 in XY plane + 1 in Z).
+    """
+    print("=== Ego Fault Response - Cross Demo ===")
+    print("Creating cross configuration...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_cross_configuration(arm_length=2)
+    system_for_steps.mark_fault('C')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules")
+    print("Fault location: Center (C)")
+    print("This disconnects 5 arms\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+
+    # Fresh system for visualization
+    system = create_cross_configuration(arm_length=2)
+    system.mark_fault('C')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_ego_line():
+    """
+    Demonstrate ego fault response on a 9-module line.
+    Middle fault splits the line into two halves that must reconnect.
+    """
+    print("=== Ego Fault Response - Line Demo ===")
+    print("Creating 9-module line configuration...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_line_configuration(length=9, axis='X')
+    # Fault in the middle (M4)
+    system_for_steps.mark_fault('M4')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules in a line")
+    print("Fault location: M4 (middle)")
+    print("This splits into two halves: [M0-M3] and [M5-M8]\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('M4', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+    if stats.get('parallel_steps'):
+        print(f"  Parallel groups: {len(stats['parallel_steps'])}")
+
+    # Fresh system for visualization
+    system = create_line_configuration(length=9, axis='X')
+    system.mark_fault('M4')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_ego_grid():
+    """
+    Demonstrate ego fault response on a 3x3x3 grid.
+    Center fault tests reconnection in a dense 3D structure.
+    """
+    print("=== Ego Fault Response - 3D Grid Demo ===")
+    print("Creating 3x3x3 grid configuration...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_grid_configuration(size=3)
+    # Fault in the center
+    system_for_steps.mark_fault('M1_1_1')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules in 3x3x3 grid")
+    print("Fault location: M1_1_1 (center)")
+
+    print("\nRunning ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('M1_1_1', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+
+    # Fresh system for visualization
+    system = create_grid_configuration(size=3)
+    system.mark_fault('M1_1_1')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_ego_ring():
+    """
+    Demonstrate ego fault response on a ring/loop configuration.
+    Breaking one module in a ring should still leave it connected.
+    """
+    print("=== Ego Fault Response - Ring Demo ===")
+    print("Creating ring configuration...")
+
+    import time
+
+    # Run algorithm
+    system_for_steps = create_ring_configuration(radius=2)
+    # Find a module to fault - pick one on the top edge
+    system_for_steps.mark_fault('T0')
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules in a ring")
+    print("Fault location: T0 (top center)")
+    print("Ring should remain connected since it's a loop!\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response('T0', record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+
+    # Fresh system for visualization
+    system = create_ring_configuration(radius=2)
+    system.mark_fault('T0')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps') and stats['parallel_steps']:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    elif stats['steps']:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+    else:
+        print("No moves needed - ring remained connected!")
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
 def demo_general_sequence():
     """Demonstrate the general-purpose pivot sequence animator."""
     print("=== General Pivot Sequence Demo ===")
@@ -431,9 +894,171 @@ def export_demo_gif(demo_name: str, output_path: str = None):
                 ('corner', 'NX3', 'NX2', 'NEG_Y'),
             ]),
         ]
+    elif demo_name == 'ego':
+        # Ego fault response - run algorithm and convert steps to sequence
+        system_for_steps = create_star_configuration(size=2)
+        system_for_steps.mark_fault('C')
+        stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+        # Create fresh system for visualization
+        system = create_star_configuration(size=2)
+        system.mark_fault('C')
+
+        # Convert parallel groups to sequence format with parallel wrappers
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    # Single step, no need for parallel wrapper
+                    sequence.append(group[0].to_tuple())
+                else:
+                    # Multiple steps, wrap in parallel tuple
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            # Fallback to sequential
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-large':
+        # Larger star fault response
+        system_for_steps = create_star_configuration(size=3)
+        system_for_steps.mark_fault('C')
+        stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+        system = create_star_configuration(size=3)
+        system.mark_fault('C')
+
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-large algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-large algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-t':
+        # T-shape fault response
+        system_for_steps = create_t_shape_configuration(arm_length=3)
+        system_for_steps.mark_fault('C')
+        stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+        system = create_t_shape_configuration(arm_length=3)
+        system.mark_fault('C')
+
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-T algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-T algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-cross':
+        # Cross fault response
+        system_for_steps = create_cross_configuration(arm_length=2)
+        system_for_steps.mark_fault('C')
+        stats = system_for_steps.ego_fault_response('C', record_steps=True, parallel_subgraphs=True)
+
+        system = create_cross_configuration(arm_length=2)
+        system.mark_fault('C')
+
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-cross algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-cross algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-line':
+        # 9-module line fault response
+        system_for_steps = create_line_configuration(length=9, axis='X')
+        system_for_steps.mark_fault('M4')
+        stats = system_for_steps.ego_fault_response('M4', record_steps=True, parallel_subgraphs=True)
+
+        system = create_line_configuration(length=9, axis='X')
+        system.mark_fault('M4')
+
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-line algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-line algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-grid':
+        # 3x3x3 grid fault response
+        system_for_steps = create_grid_configuration(size=3)
+        system_for_steps.mark_fault('M1_1_1')
+        stats = system_for_steps.ego_fault_response('M1_1_1', record_steps=True, parallel_subgraphs=True)
+
+        system = create_grid_configuration(size=3)
+        system.mark_fault('M1_1_1')
+
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-grid algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-grid algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'ego-ring':
+        # Ring fault response
+        system_for_steps = create_ring_configuration(radius=2)
+        system_for_steps.mark_fault('T0')
+        stats = system_for_steps.ego_fault_response('T0', record_steps=True, parallel_subgraphs=True)
+
+        system = create_ring_configuration(radius=2)
+        system.mark_fault('T0')
+
+        if stats.get('parallel_steps') and stats['parallel_steps']:
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0].to_tuple())
+                else:
+                    parallel_ops = [step.to_tuple() for step in group]
+                    sequence.append(('parallel', parallel_ops))
+            print(f"Ego-ring algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        elif stats.get('steps'):
+            sequence = [step.to_tuple() for step in stats['steps']]
+            print(f"Ego-ring algorithm: {len(sequence)} steps to export (sequential)")
+        else:
+            sequence = []
+            print("Ego-ring algorithm: No moves needed - ring remained connected!")
     else:
         print(f"Unknown demo: {demo_name}")
-        print("Available: corner, lateral, spiral, parallel, general")
+        print("Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
         return
 
     # Create visualizer and export
@@ -802,6 +1427,20 @@ def main():
             demo_reconfiguration_sequence()
         elif command == 'damage':
             demo_damage_response()
+        elif command == 'ego':
+            demo_ego_fault_response()
+        elif command == 'ego-large':
+            demo_ego_large_star()
+        elif command == 'ego-t':
+            demo_ego_t_shape()
+        elif command == 'ego-cross':
+            demo_ego_cross()
+        elif command == 'ego-line':
+            demo_ego_line()
+        elif command == 'ego-grid':
+            demo_ego_grid()
+        elif command == 'ego-ring':
+            demo_ego_ring()
         elif command == 'general':
             demo_general_sequence()
         elif command == 'export':
@@ -812,7 +1451,7 @@ def main():
                 export_demo_gif(demo_name, output_path)
             else:
                 print("Usage: python examples/visualize_pivots.py export <demo_name> [output_path]")
-                print("Available demos: corner, lateral, spiral, parallel, general")
+                print("Available demos: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
         else:
             # Interactive mode with specified configuration
             interactive_visualization(command)
@@ -821,23 +1460,31 @@ def main():
         print("UDQDG System Visualization Demos")
         print("=" * 40)
         print("\nAvailable demos:")
-        print("  python examples/visualize_pivots.py corner    - Corner pivot demo")
-        print("  python examples/visualize_pivots.py lateral   - Lateral pivot demo")
-        print("  python examples/visualize_pivots.py parallel  - Parallel pivots demo")
-        print("  python examples/visualize_pivots.py spiral    - Spiral motion demo")
-        print("  python examples/visualize_pivots.py general   - General sequence demo")
-        print("  python examples/visualize_pivots.py sequence  - Reconfiguration sequence")
-        print("  python examples/visualize_pivots.py damage    - Damage response demo")
+        print("  python examples/visualize_pivots.py corner     - Corner pivot demo")
+        print("  python examples/visualize_pivots.py lateral    - Lateral pivot demo")
+        print("  python examples/visualize_pivots.py parallel   - Parallel pivots demo")
+        print("  python examples/visualize_pivots.py spiral     - Spiral motion demo")
+        print("  python examples/visualize_pivots.py general    - General sequence demo")
+        print("  python examples/visualize_pivots.py sequence   - Reconfiguration sequence")
+        print("  python examples/visualize_pivots.py damage     - Damage response demo")
+        print("\nEgo fault response demos (parallel subgraph movement):")
+        print("  python examples/visualize_pivots.py ego        - Star (size=2) fault response")
+        print("  python examples/visualize_pivots.py ego-large  - Large star (size=3) fault response")
+        print("  python examples/visualize_pivots.py ego-t      - T-shape fault response")
+        print("  python examples/visualize_pivots.py ego-cross  - Cross fault response")
+        print("  python examples/visualize_pivots.py ego-line   - 9-module line fault response")
+        print("  python examples/visualize_pivots.py ego-grid   - 3x3x3 grid fault response")
+        print("  python examples/visualize_pivots.py ego-ring   - Ring/loop fault response")
         print("\nExport animations:")
         print("  python examples/visualize_pivots.py export <demo> [path]")
-        print("    Available: corner, lateral, spiral, parallel, general")
-        print("    Example: python examples/visualize_pivots.py export spiral output/my_spiral.gif")
+        print("    Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
+        print("    Example: python examples/visualize_pivots.py export ego gifs/ego_response.gif")
         print("\nInteractive configurations:")
-        print("  python examples/visualize_pivots.py star      - Star configuration")
-        print("  python examples/visualize_pivots.py tree      - Tree configuration")
-        print("  python examples/visualize_pivots.py line      - Line configuration")
-        print("  python examples/visualize_pivots.py cross     - Cross configuration")
-        print("  python examples/visualize_pivots.py l_shape   - L-shape configuration")
+        print("  python examples/visualize_pivots.py star       - Star configuration")
+        print("  python examples/visualize_pivots.py tree       - Tree configuration")
+        print("  python examples/visualize_pivots.py line       - Line configuration")
+        print("  python examples/visualize_pivots.py cross      - Cross configuration")
+        print("  python examples/visualize_pivots.py l_shape    - L-shape configuration")
         print("\n" + "=" * 40)
 
         # Run default interactive demo

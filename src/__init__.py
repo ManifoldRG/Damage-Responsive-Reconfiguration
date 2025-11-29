@@ -1,7 +1,7 @@
 
 # UDQDG System - Unit Dual Quaternion Directed Graph Framework
 from .dual_quaternion import UnitDualQuaternion, LATTICE_DIRECTIONS
-from .udqdg_system import UDQDGSystem, SphericalModule
+from .udqdg_system import UDQDGSystem, SphericalModule, PivotStep
 
 # Optional visualization imports (Manim-based, may not be available)
 try:
@@ -37,6 +37,7 @@ __all__ = [
     "LATTICE_DIRECTIONS",
     "UDQDGSystem",
     "SphericalModule",
+    "PivotStep",
 ]
 
 # Add visualization exports if available

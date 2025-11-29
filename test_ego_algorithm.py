@@ -239,17 +239,149 @@ def test_disconnected_fault():
 
     print_array(system.to_2d_array(), "Final Configuration")
 
+
+# ============================================================
+# 3D TEST CASES
+# ============================================================
+
+def test_3d_star_center_fault():
+    """Test ego algorithm on 3D star with center fault (disconnects all arms)."""
+    print("\n" + "="*60)
+    print("TEST: 3D Star Configuration with Center Fault")
+    print("="*60)
+
+    from src.configurations import create_star_configuration
+
+    # Create 3D star (6 arms, size 2 = 13 modules)
+    system = create_star_configuration(size=2)
+
+    initial_count = len(system.modules)
+    print(f"\nInitial system: {initial_count} modules, {len(system.get_all_edges())} edges")
+    print(f"Mode 2D: {system.mode_2d} (should be False)")
+    print(f"Directions available: {len(system.directions)} (should be 6)")
+
+    # Mark center as faulty - this disconnects all 6 arms
+    center = "C"
+    system.mark_fault(center)
+    components = system.get_connected_components(active_only=True)
+    print(f"\n[FAULT] Marked module {center} as faulty")
+    print(f"Components after fault: {len(components)} (should be 6)")
+
+    # Run ego-based fault response with new one_per_subgraph mode
+    print("\n[RUNNING] Ego-based fault response algorithm (one_per_subgraph=True)...")
+    stats = system.ego_fault_response(center, one_per_subgraph=True)
+
+    # Print results
+    final_count = len(system.modules)
+    final_connected = system.is_connected(active_only=True)
+    final_components = system.get_connected_components(active_only=True)
+
+    print(f"\n[COMPLETE] Algorithm completed")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Modules responded: {len(stats['modules_responded'])}")
+    if stats['modules_responded']:
+        print(f"  Which modules: {sorted(stats['modules_responded'])}")
+    print(f"  Module count: {initial_count} -> {final_count} ({'PRESERVED' if initial_count == final_count else 'LOST'})")
+    print(f"  Connectivity: {'CONNECTED' if final_connected else f'DISCONNECTED ({len(final_components)} components)'}")
+    print(f"  Reconnected: {'YES' if stats.get('reconnected', False) else 'NO'}")
+    print(f"  New connections formed: {stats.get('new_connections_formed', 0)}")
+
+    # Verify success
+    assert stats['reconnected'], "3D star should reconnect after center fault"
+    assert final_connected, "Final state should be connected"
+    print("\n[PASS] 3D star center fault test passed!")
+
+
+def test_3d_star_arm_fault():
+    """Test ego algorithm on 3D star with arm fault (simpler case)."""
+    print("\n" + "="*60)
+    print("TEST: 3D Star Configuration with Arm Fault")
+    print("="*60)
+
+    from src.configurations import create_star_configuration
+
+    # Create 3D star
+    system = create_star_configuration(size=2)
+
+    initial_count = len(system.modules)
+    print(f"\nInitial system: {initial_count} modules")
+
+    # Mark arm tip as faulty (PZ2 = positive Z arm tip)
+    arm_tip = "PZ2"
+    system.mark_fault(arm_tip)
+    print(f"\n[FAULT] Marked module {arm_tip} as faulty")
+
+    initial_connected = system.is_connected(active_only=True)
+    print(f"Connected after fault: {initial_connected} (should be True - arm tip doesn't disconnect)")
+
+    # Run ego-based fault response
+    print("\n[RUNNING] Ego-based fault response algorithm...")
+    stats = system.ego_fault_response(arm_tip, one_per_subgraph=True)
+
+    print(f"\n[COMPLETE] Algorithm completed")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {'YES' if stats.get('reconnected', False) else 'NO'}")
+
+    # Should complete quickly since already connected
+    assert stats['iterations'] <= 2, "Already connected, should complete quickly"
+    print("\n[PASS] 3D star arm fault test passed!")
+
+
+def test_one_per_subgraph_comparison():
+    """Compare one_per_subgraph=True vs False behavior."""
+    print("\n" + "="*60)
+    print("TEST: one_per_subgraph Mode Comparison")
+    print("="*60)
+
+    from src.configurations import create_star_configuration
+
+    # Test with one_per_subgraph=True (new default)
+    system1 = create_star_configuration(size=2)
+    system1.mark_fault("C")
+    stats1 = system1.ego_fault_response("C", one_per_subgraph=True)
+
+    # Test with one_per_subgraph=False (legacy)
+    system2 = create_star_configuration(size=2)
+    system2.mark_fault("C")
+    stats2 = system2.ego_fault_response("C", one_per_subgraph=False)
+
+    print(f"\none_per_subgraph=True (new mode):")
+    print(f"  Iterations: {stats1['iterations']}")
+    print(f"  Total moves: {stats1['total_moves']}")
+    print(f"  Reconnected: {stats1['reconnected']}")
+
+    print(f"\none_per_subgraph=False (legacy mode):")
+    print(f"  Iterations: {stats2['iterations']}")
+    print(f"  Total moves: {stats2['total_moves']}")
+    print(f"  Reconnected: {stats2['reconnected']}")
+
+    # Both should reconnect
+    assert stats1['reconnected'], "New mode should reconnect"
+    assert stats2['reconnected'], "Legacy mode should reconnect"
+
+    # New mode should be same or more efficient
+    print(f"\nComparison: New mode uses {stats1['total_moves']} moves vs legacy {stats2['total_moves']} moves")
+    print("\n[PASS] Mode comparison test passed!")
+
+
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("EGO-BASED FAULT RESPONSE ALGORITHM TESTS")
     print("="*60)
 
-    # Run all tests
+    # Run 2D tests
     test_ego_checks()
     test_simple_grid()
     test_corner_fault()
     test_edge_fault()
     test_disconnected_fault()
+
+    # Run 3D tests
+    test_3d_star_center_fault()
+    test_3d_star_arm_fault()
+    test_one_per_subgraph_comparison()
 
     print("\n" + "="*60)
     print("ALL TESTS COMPLETED")

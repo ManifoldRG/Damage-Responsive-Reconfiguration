@@ -250,3 +250,206 @@ def create_l_shape_configuration() -> UDQDGSystem:
     system.connect_modules("M3", "M4")
 
     return system
+
+
+def create_grid_configuration(size: int = 3) -> UDQDGSystem:
+    """
+    Create a 3D cubic grid configuration.
+
+    Args:
+        size: Side length of the grid (size x size x size)
+
+    Returns:
+        UDQDGSystem with grid configuration
+    """
+    system = UDQDGSystem()
+
+    # Create all modules
+    for x in range(size):
+        for y in range(size):
+            for z in range(size):
+                module_id = f"M{x}_{y}_{z}"
+                system.add_module(module_id, np.array([x, y, z], dtype=float))
+
+    # Connect adjacent modules
+    for x in range(size):
+        for y in range(size):
+            for z in range(size):
+                module_id = f"M{x}_{y}_{z}"
+
+                # Connect to +X neighbor
+                if x + 1 < size:
+                    system.connect_modules(module_id, f"M{x+1}_{y}_{z}")
+
+                # Connect to +Y neighbor
+                if y + 1 < size:
+                    system.connect_modules(module_id, f"M{x}_{y+1}_{z}")
+
+                # Connect to +Z neighbor
+                if z + 1 < size:
+                    system.connect_modules(module_id, f"M{x}_{y}_{z+1}")
+
+    return system
+
+
+def create_lattice_plane_configuration(width: int = 5, height: int = 5) -> UDQDGSystem:
+    """
+    Create a 2D lattice plane configuration (flat grid in XY plane).
+
+    Args:
+        width: Width of the grid in X direction
+        height: Height of the grid in Y direction
+
+    Returns:
+        UDQDGSystem with lattice plane configuration
+    """
+    system = UDQDGSystem()
+
+    # Create all modules
+    for x in range(width):
+        for y in range(height):
+            module_id = f"M{x}_{y}"
+            system.add_module(module_id, np.array([x, y, 0], dtype=float))
+
+    # Connect adjacent modules
+    for x in range(width):
+        for y in range(height):
+            module_id = f"M{x}_{y}"
+
+            # Connect to +X neighbor
+            if x + 1 < width:
+                system.connect_modules(module_id, f"M{x+1}_{y}")
+
+            # Connect to +Y neighbor
+            if y + 1 < height:
+                system.connect_modules(module_id, f"M{x}_{y+1}")
+
+    return system
+
+
+def create_ring_configuration(radius: int = 3) -> UDQDGSystem:
+    """
+    Create a ring/loop configuration approximating a circle.
+
+    Args:
+        radius: Approximate radius of the ring
+
+    Returns:
+        UDQDGSystem with ring configuration
+    """
+    system = UDQDGSystem()
+
+    # Create a square loop for simplicity (actual circle needs more modules)
+    # This creates a loop in the XY plane
+    modules = []
+
+    # Top edge
+    for x in range(-radius, radius + 1):
+        module_id = f"T{x}"
+        system.add_module(module_id, np.array([x, radius, 0], dtype=float))
+        modules.append(module_id)
+
+    # Right edge (excluding top corner)
+    for y in range(radius - 1, -radius - 1, -1):
+        module_id = f"R{y}"
+        system.add_module(module_id, np.array([radius, y, 0], dtype=float))
+        modules.append(module_id)
+
+    # Bottom edge (excluding right corner)
+    for x in range(radius - 1, -radius - 1, -1):
+        module_id = f"B{x}"
+        system.add_module(module_id, np.array([x, -radius, 0], dtype=float))
+        modules.append(module_id)
+
+    # Left edge (excluding bottom and top corners)
+    for y in range(-radius + 1, radius):
+        module_id = f"L{y}"
+        system.add_module(module_id, np.array([-radius, y, 0], dtype=float))
+        modules.append(module_id)
+
+    # Connect in sequence forming a loop
+    for i in range(len(modules)):
+        system.connect_modules(modules[i], modules[(i + 1) % len(modules)])
+
+    return system
+
+
+def create_snake_configuration(length: int = 10) -> UDQDGSystem:
+    """
+    Create a snake-like configuration that winds through 3D space.
+
+    Args:
+        length: Number of modules in the snake
+
+    Returns:
+        UDQDGSystem with snake configuration
+    """
+    system = UDQDGSystem()
+
+    # Pattern: go right, turn up, go right, turn down, repeat
+    directions = [
+        np.array([1, 0, 0]),   # Right
+        np.array([0, 1, 0]),   # Up
+        np.array([1, 0, 0]),   # Right
+        np.array([0, -1, 0]),  # Down
+    ]
+
+    pos = np.array([0, 0, 0], dtype=float)
+    prev_module = None
+
+    for i in range(length):
+        module_id = f"S{i}"
+        system.add_module(module_id, pos.copy())
+
+        if prev_module:
+            system.connect_modules(prev_module, module_id)
+
+        prev_module = module_id
+
+        # Move to next position (cycling through directions)
+        direction = directions[i % len(directions)]
+        pos = pos + direction
+
+    return system
+
+
+def create_t_shape_configuration(arm_length: int = 3) -> UDQDGSystem:
+    """
+    Create a T-shaped configuration with a central junction.
+
+    Args:
+        arm_length: Length of each arm of the T
+
+    Returns:
+        UDQDGSystem with T configuration
+    """
+    system = UDQDGSystem()
+
+    # Center at origin
+    system.add_module("C", np.array([0, 0, 0], dtype=float))
+
+    # Top arm (stem of T)
+    prev = "C"
+    for i in range(1, arm_length + 1):
+        module_id = f"T{i}"
+        system.add_module(module_id, np.array([0, i, 0], dtype=float))
+        system.connect_modules(prev, module_id)
+        prev = module_id
+
+    # Left arm
+    prev = "C"
+    for i in range(1, arm_length + 1):
+        module_id = f"L{i}"
+        system.add_module(module_id, np.array([-i, 0, 0], dtype=float))
+        system.connect_modules(prev, module_id)
+        prev = module_id
+
+    # Right arm
+    prev = "C"
+    for i in range(1, arm_length + 1):
+        module_id = f"R{i}"
+        system.add_module(module_id, np.array([i, 0, 0], dtype=float))
+        system.connect_modules(prev, module_id)
+        prev = module_id
+
+    return system
