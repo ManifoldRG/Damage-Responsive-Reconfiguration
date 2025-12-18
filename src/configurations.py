@@ -453,3 +453,84 @@ def create_t_shape_configuration(arm_length: int = 3) -> UDQDGSystem:
         prev = module_id
 
     return system
+
+
+def create_dual_star_bridge_configuration(star_size: int = 3, bridge_length: int = 5) -> UDQDGSystem:
+    """
+    Create two star structures connected by a bridge line.
+    Configuration is symmetric with damage at visual center.
+
+    Args:
+        star_size: Length of each star arm (from center)
+        bridge_length: Length of the connecting bridge between stars (should be odd for centered damage)
+
+    Returns:
+        UDQDGSystem with dual star configuration connected by a bridge
+    """
+    system = UDQDGSystem()
+
+    # Calculate positions to center the bridge damage at origin
+    # Bridge goes from -bridge_length//2 to +bridge_length//2
+    # First star at negative X, second star at positive X
+    half_bridge = bridge_length // 2
+
+    # First star center (to the left of bridge)
+    star1_center_x = -(half_bridge + 1)
+    system.add_module("C1", np.array([star1_center_x, 0, 0]))
+
+    # Create first star's arms (excluding +X to avoid bridge overlap)
+    directions_star1 = [
+        ('A_NX', np.array([-1, 0, 0])),  # Negative X (away from bridge)
+        ('A_PY', np.array([0, 1, 0])),   # Positive Y
+        ('A_NY', np.array([0, -1, 0])),  # Negative Y
+        ('A_PZ', np.array([0, 0, 1])),   # Positive Z
+        ('A_NZ', np.array([0, 0, -1]))   # Negative Z
+    ]
+
+    for prefix, direction in directions_star1:
+        prev_module = "C1"
+        for i in range(1, star_size + 1):
+            module_id = f"{prefix}{i}"
+            position = np.array([star1_center_x, 0, 0], dtype=float) + i * direction
+            system.add_module(module_id, position)
+            system.connect_modules(prev_module, module_id)
+            prev_module = module_id
+
+    # Create bridge centered at origin
+    # Bridge spans from -half_bridge to +half_bridge
+    prev_module = "C1"
+    for i in range(1, bridge_length + 1):
+        bridge_x = -(half_bridge + 1) + i
+        module_id = f"BR{i}"
+        position = np.array([bridge_x, 0, 0], dtype=float)
+        system.add_module(module_id, position)
+        system.connect_modules(prev_module, module_id)
+        prev_module = module_id
+
+    # Second star center (to the right of bridge)
+    star2_center_x = half_bridge + 1
+    system.add_module("C2", np.array([star2_center_x, 0, 0]))
+    system.connect_modules(prev_module, "C2")
+
+    # Create second star's arms (excluding -X to avoid bridge overlap)
+    directions_star2 = [
+        ('B_PX', np.array([1, 0, 0])),   # Positive X (away from bridge)
+        ('B_PY', np.array([0, 1, 0])),   # Positive Y
+        ('B_NY', np.array([0, -1, 0])),  # Negative Y
+        ('B_PZ', np.array([0, 0, 1])),   # Positive Z
+        ('B_NZ', np.array([0, 0, -1]))   # Negative Z
+    ]
+
+    for prefix, direction in directions_star2:
+        prev_module = "C2"
+        for i in range(1, star_size + 1):
+            module_id = f"{prefix}{i}"
+            position = np.array([star2_center_x, 0, 0], dtype=float) + i * direction
+            system.add_module(module_id, position)
+            system.connect_modules(prev_module, module_id)
+            prev_module = module_id
+
+    # Validate no overlapping modules
+    system.validate_no_overlaps()
+
+    return system

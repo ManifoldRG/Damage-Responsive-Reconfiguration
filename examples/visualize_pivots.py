@@ -29,7 +29,8 @@ from src.configurations import (
     create_grid_configuration,
     create_lattice_plane_configuration,
     create_t_shape_configuration,
-    create_ring_configuration
+    create_ring_configuration,
+    create_dual_star_bridge_configuration
 )
 
 # ============================================
@@ -750,6 +751,72 @@ def demo_ego_ring():
     viz.plotter.close()
 
 
+def demo_ego_dual_star_bridge():
+    """
+    Demonstrate ego fault response on dual star bridge configuration.
+    Bridge damage disconnects the two stars.
+    """
+    print("=== Ego Fault Response - Dual Star Bridge Demo ===")
+    print("Creating dual star bridge configuration...")
+
+    import time
+
+    # Run algorithm
+    bridge_length = 9
+    center_module = f'BR{bridge_length // 2 + 1}'  # BR5 for 9-module bridge
+
+    system_for_steps = create_dual_star_bridge_configuration(star_size=3, bridge_length=bridge_length)
+    system_for_steps.mark_fault(center_module)
+
+    print(f"\nConfiguration: {len(system_for_steps.modules)} modules")
+    print(f"Fault location: {center_module} (center of {bridge_length}-module bridge)")
+    print("This disconnects the two stars\n")
+
+    print("Running ego_fault_response algorithm...")
+    stats = system_for_steps.ego_fault_response(center_module, record_steps=True, parallel_subgraphs=True)
+
+    print(f"Algorithm complete:")
+    print(f"  Iterations: {stats['iterations']}")
+    print(f"  Total moves: {stats['total_moves']}")
+    print(f"  Reconnected: {stats['reconnected']}")
+    print(f"  Collisions resolved: {stats['collisions_resolved']}")
+    if stats.get('parallel_steps'):
+        print(f"  Parallel groups: {len(stats['parallel_steps'])}")
+
+    # Fresh system for visualization
+    system = create_dual_star_bridge_configuration(star_size=3, bridge_length=3)
+    system.mark_fault('BR2')
+
+    viz = UDQDGVisualizer(system)
+
+    print("\nStarting visualization...")
+    viz.show_window()
+
+    time.sleep(1.0)
+
+    if stats.get('parallel_steps'):
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False,
+            parallel_groups=stats['parallel_steps']
+        )
+    else:
+        viz.animate_ego_response(
+            stats['steps'],
+            n_frames=TOTAL_FRAMES,
+            pause_between=PAUSE_BETWEEN,
+            camera_mode='fixed',
+            reset_positions=False
+        )
+
+    print("\nAnimation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
 def demo_general_sequence():
     """Demonstrate the general-purpose pivot sequence animator."""
     print("=== General Pivot Sequence Demo ===")
@@ -1056,21 +1123,53 @@ def export_demo_gif(demo_name: str, output_path: str = None):
         else:
             sequence = []
             print("Ego-ring algorithm: No moves needed - ring remained connected!")
+    elif demo_name == 'ego-dual-star':
+        # Dual star bridge fault response - fault center of bridge
+        bridge_length = 9
+        center_module = f'BR{bridge_length // 2 + 1}'  # BR5 for 9-module bridge
+
+        system_for_steps = create_dual_star_bridge_configuration(star_size=3, bridge_length=bridge_length)
+        system_for_steps.mark_fault(center_module)
+        stats = system_for_steps.ego_fault_response(center_module, record_steps=True, parallel_subgraphs=True)
+
+        # Create fresh system for visualization
+        system = create_dual_star_bridge_configuration(star_size=3, bridge_length=bridge_length)
+        system.mark_fault(center_module)
+
+        # Keep the actual PivotStep objects instead of converting to tuples
+        # This preserves from_pos and to_pos
+        if stats.get('parallel_steps'):
+            sequence = []
+            for group in stats['parallel_steps']:
+                if len(group) == 1:
+                    sequence.append(group[0])  # Keep PivotStep object
+                else:
+                    sequence.append(('parallel', group))  # Keep PivotStep objects in list
+            print(f"Ego-dual-star algorithm: {stats['total_moves']} moves in {len(sequence)} groups (parallel)")
+            print(f"  Collisions resolved: {stats['collisions_resolved']}")
+        else:
+            sequence = stats['steps']  # Keep PivotStep objects
+            print(f"Ego-dual-star algorithm: {len(sequence)} steps to export (sequential)")
     else:
         print(f"Unknown demo: {demo_name}")
-        print("Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
+        print("Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring, ego-dual-star")
         return
 
     # Create visualizer and export
     viz = UDQDGVisualizer(system)
     viz.setup_scene()
-    viz.render_system()
 
-    # Open GIF writer with high frame rate for smooth playback
+    # Open GIF writer BEFORE rendering system
     viz.plotter.open_gif(output_path, fps=30)
 
+    # Now render the system (including inactive/red BR2)
+    viz.render_system()
+
+    # IMPORTANT: Write the initial frame immediately to capture BR2 in red
+    viz.plotter.write_frame()
+
     # Pause at beginning (0.5 seconds at 30fps = 15 frames)
-    initial_pause_frames = 15
+    initial_pause_frames = 14  # Reduced by 1 since we already wrote one frame
     for _ in range(initial_pause_frames):
         viz.plotter.write_frame()
 
@@ -1078,7 +1177,17 @@ def export_demo_gif(demo_name: str, output_path: str = None):
     print(f"Rendering {len(sequence)} operations...")
 
     # Calculate total frames for camera rotation (including pauses)
-    total_operations = sum(len(op[1]) if op[0] == 'parallel' else 1 for op in sequence)
+    total_operations = 0
+    for op in sequence:
+        if hasattr(op, 'pivot_type'):
+            # PivotStep object - single operation
+            total_operations += 1
+        elif op[0] == 'parallel':
+            # Parallel tuple - multiple operations
+            total_operations += len(op[1])
+        else:
+            # Regular tuple - single operation
+            total_operations += 1
     pause_frames = int(PAUSE_BETWEEN * 30)
     total_animation_frames = total_operations * EXPORT_FRAMES + (len(sequence) - 1) * pause_frames
     frame_counter = 0
@@ -1092,23 +1201,48 @@ def export_demo_gif(demo_name: str, output_path: str = None):
     total_rotation_elevation = 30.0
 
     for idx, operation in enumerate(sequence):
-        if operation[0] == 'corner':
+        # Check if operation is a PivotStep object (has pivot_type attribute) or tuple
+        if hasattr(operation, 'pivot_type'):
+            # It's a PivotStep object - use recorded positions
+            if operation.pivot_type == 'corner':
+                _export_corner_pivot(viz, operation.module_id, operation.param1, operation.param2, EXPORT_FRAMES,
+                                   frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
+                                   total_rotation_azimuth, total_rotation_elevation,
+                                   from_pos=operation.from_pos, to_pos=operation.to_pos)
+            elif operation.pivot_type == 'lateral':
+                _export_lateral_pivot(viz, operation.module_id, operation.param1, operation.param2, EXPORT_FRAMES,
+                                    frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
+                                    total_rotation_azimuth, total_rotation_elevation,
+                                    from_pos=operation.from_pos, to_pos=operation.to_pos)
+            frame_counter += EXPORT_FRAMES
+        elif operation[0] == 'corner':
+            # Legacy tuple format
             _, pivot_module, axis_module, new_direction = operation
             _export_corner_pivot(viz, pivot_module, axis_module, new_direction, EXPORT_FRAMES,
                                frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
                                total_rotation_azimuth, total_rotation_elevation)
             frame_counter += EXPORT_FRAMES
         elif operation[0] == 'lateral':
+            # Legacy tuple format
             _, pivot_module, old_neighbor, new_neighbor = operation
             _export_lateral_pivot(viz, pivot_module, old_neighbor, new_neighbor, EXPORT_FRAMES,
                                 frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
                                 total_rotation_azimuth, total_rotation_elevation)
             frame_counter += EXPORT_FRAMES
         elif operation[0] == 'parallel':
+            # Parallel operations - check if they're PivotSteps or tuples
             _, ops = operation
-            _export_parallel_pivots(viz, ops, EXPORT_FRAMES,
-                                  frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
-                                  total_rotation_azimuth, total_rotation_elevation)
+            # Convert PivotSteps to tuples with positions for parallel export
+            if ops and hasattr(ops[0], 'pivot_type'):
+                # PivotStep objects - need to handle specially
+                _export_parallel_pivotsteps(viz, ops, EXPORT_FRAMES,
+                                          frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
+                                          total_rotation_azimuth, total_rotation_elevation)
+            else:
+                # Legacy tuples
+                _export_parallel_pivots(viz, ops, EXPORT_FRAMES,
+                                      frame_counter, total_animation_frames, initial_azimuth, initial_elevation,
+                                      total_rotation_azimuth, total_rotation_elevation)
             frame_counter += EXPORT_FRAMES
 
         # Add pause frames between operations (but not after the last one)
@@ -1132,19 +1266,44 @@ def export_demo_gif(demo_name: str, output_path: str = None):
     print(f"✓ Saved to {output_path}")
 
 
+def _render_all_static_modules(viz, exclude_modules=set()):
+    """Re-render all modules except the ones being animated."""
+    sphere = pv.Sphere(radius=viz.sphere_radius)
+    for module_id, module in viz.system.modules.items():
+        if module_id not in exclude_modules:
+            sphere_at_pos = sphere.copy()
+            sphere_at_pos.points += module.position
+            color = viz.colors['active'] if module.is_active else viz.colors['inactive']
+            viz.plotter.add_mesh(
+                sphere_at_pos,
+                color=color,
+                opacity=viz.sphere_opacity,
+                name=f"module_{module_id}",
+                reset_camera=False
+            )
+
+
 def _export_corner_pivot(viz, pivot_module, axis_module, new_direction, n_frames,
                          frame_offset=0, total_frames=None, initial_azimuth=0, initial_elevation=0,
-                         total_rotation_azimuth=90.0, total_rotation_elevation=30.0):
+                         total_rotation_azimuth=90.0, total_rotation_elevation=30.0,
+                         from_pos=None, to_pos=None):
     """Helper to export a corner pivot without interactive updates."""
-    initial_pos = viz.system.modules[pivot_module].position.copy()
-    success = viz.system.corner_pivot(pivot_module, axis_module, new_direction)
+    if from_pos is not None and to_pos is not None:
+        # Use recorded positions (doesn't modify graph)
+        initial_pos = from_pos.copy()
+        final_pos = to_pos.copy()
+        axis_pos = viz.system.modules[axis_module].position.copy()
+    else:
+        # Legacy mode: actually execute pivot
+        initial_pos = viz.system.modules[pivot_module].position.copy()
+        success = viz.system.corner_pivot(pivot_module, axis_module, new_direction)
 
-    if not success:
-        return
+        if not success:
+            return
 
-    final_pos = viz.system.modules[pivot_module].position.copy()
-    axis_pos = viz.system.modules[axis_module].position.copy()
-    viz.system.modules[pivot_module].position = initial_pos.copy()
+        final_pos = viz.system.modules[pivot_module].position.copy()
+        axis_pos = viz.system.modules[axis_module].position.copy()
+        viz.system.modules[pivot_module].position = initial_pos.copy()
 
     v1 = initial_pos - axis_pos
     v2 = final_pos - axis_pos
@@ -1164,6 +1323,10 @@ def _export_corner_pivot(viz, pivot_module, axis_module, new_direction, n_frames
             viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
             viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
 
+        # Re-render all static modules first
+        _render_all_static_modules(viz, {pivot_module})
+
+        # Then render the moving module on top
         sphere_moved = sphere.copy()
         sphere_moved.points += interp_pos
         viz.plotter.add_mesh(sphere_moved, color=viz.colors['pivoting'], opacity=viz.sphere_opacity,
@@ -1171,28 +1334,37 @@ def _export_corner_pivot(viz, pivot_module, axis_module, new_direction, n_frames
         viz.plotter.write_frame()
 
     # Final frame with correct color
+    _render_all_static_modules(viz, {pivot_module})
     sphere_final = sphere.copy()
     sphere_final.points += final_pos
-    viz.plotter.add_mesh(sphere_final, color=viz.colors['active'], opacity=viz.sphere_opacity,
+    color = viz.colors['active'] if viz.system.modules[pivot_module].is_active else viz.colors['inactive']
+    viz.plotter.add_mesh(sphere_final, color=color, opacity=viz.sphere_opacity,
                         name=f"module_{pivot_module}", reset_camera=False)
     viz.plotter.write_frame()
 
 
 def _export_lateral_pivot(viz, pivot_module, old_neighbor, new_neighbor, n_frames,
                            frame_offset=0, total_frames=None, initial_azimuth=0, initial_elevation=0,
-                           total_rotation_azimuth=90.0, total_rotation_elevation=30.0):
+                           total_rotation_azimuth=90.0, total_rotation_elevation=30.0,
+                           from_pos=None, to_pos=None):
     """Helper to export a lateral pivot without interactive updates."""
-    initial_pos = viz.system.modules[pivot_module].position.copy()
     old_neighbor_pos = viz.system.modules[old_neighbor].position.copy()
     new_neighbor_pos = viz.system.modules[new_neighbor].position.copy()
 
-    success = viz.system.lateral_pivot(pivot_module, old_neighbor, new_neighbor)
+    if from_pos is not None and to_pos is not None:
+        # Use recorded positions (doesn't modify graph)
+        initial_pos = from_pos.copy()
+        final_pos = to_pos.copy()
+    else:
+        # Legacy mode: actually execute pivot
+        initial_pos = viz.system.modules[pivot_module].position.copy()
+        success = viz.system.lateral_pivot(pivot_module, old_neighbor, new_neighbor)
 
-    if not success:
-        return
+        if not success:
+            return
 
-    final_pos = viz.system.modules[pivot_module].position.copy()
-    viz.system.modules[pivot_module].position = initial_pos.copy()
+        final_pos = viz.system.modules[pivot_module].position.copy()
+        viz.system.modules[pivot_module].position = initial_pos.copy()
 
     # Calculate arc midpoint (same logic as interactive visualizer)
     neighbor_midpoint = (old_neighbor_pos + new_neighbor_pos) / 2.0
@@ -1270,11 +1442,93 @@ def _export_lateral_pivot(viz, pivot_module, old_neighbor, new_neighbor, n_frame
                             name=f"module_{pivot_module}", reset_camera=False)
         viz.plotter.write_frame()
 
-    # Final frame
+    # Final frame with correct color
     sphere_final = sphere.copy()
     sphere_final.points += final_pos
-    viz.plotter.add_mesh(sphere_final, color=viz.colors['active'], opacity=viz.sphere_opacity,
+    color = viz.colors['active'] if viz.system.modules[pivot_module].is_active else viz.colors['inactive']
+    viz.plotter.add_mesh(sphere_final, color=color, opacity=viz.sphere_opacity,
                         name=f"module_{pivot_module}", reset_camera=False)
+    viz.plotter.write_frame()
+
+
+def _export_parallel_pivotsteps(viz, pivot_steps, n_frames,
+                                frame_offset=0, total_frames=None, initial_azimuth=0, initial_elevation=0,
+                                total_rotation_azimuth=90.0, total_rotation_elevation=30.0):
+    """Export parallel pivots using PivotStep objects with recorded positions."""
+    # Store initial positions and prepare data for each pivot
+    pivot_data = []
+    for step in pivot_steps:
+        data = {
+            'module_id': step.module_id,
+            'pivot_type': step.pivot_type,
+            'param1': step.param1,
+            'param2': step.param2,
+            'from_pos': step.from_pos.copy(),
+            'to_pos': step.to_pos.copy(),
+            'sphere': pv.Sphere(radius=viz.sphere_radius)
+        }
+
+        if step.pivot_type == 'corner':
+            data['axis_pos'] = viz.system.modules[step.param1].position.copy()
+            v1 = data['from_pos'] - data['axis_pos']
+            v2 = data['to_pos'] - data['axis_pos']
+            data['v1'] = v1
+            data['v2'] = v2
+        elif step.pivot_type == 'lateral':
+            data['old_neighbor_pos'] = viz.system.modules[step.param1].position.copy()
+            data['new_neighbor_pos'] = viz.system.modules[step.param2].position.copy()
+
+        pivot_data.append(data)
+
+    # Animate all pivots in parallel
+    for i in range(n_frames + 1):
+        t = i / n_frames
+
+        # Update camera
+        if total_frames:
+            global_t = (frame_offset + i) / total_frames
+            viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+            viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
+        # Update each pivoting module
+        for data in pivot_data:
+            if data['pivot_type'] == 'corner':
+                # Corner pivot arc
+                angle = t * np.pi / 2
+                interp_v = np.cos(angle) * data['v1'] + np.sin(angle) * data['v2']
+                interp_v = interp_v / np.linalg.norm(interp_v) * np.linalg.norm(data['v1'])
+                interp_pos = data['axis_pos'] + interp_v
+            elif data['pivot_type'] == 'lateral':
+                # Simplified lateral path (linear interpolation for parallel export)
+                interp_pos = (1 - t) * data['from_pos'] + t * data['to_pos']
+
+            viz.system.modules[data['module_id']].position = interp_pos
+
+            # Render sphere
+            sphere_moved = data['sphere'].copy()
+            sphere_moved.points += interp_pos
+            viz.plotter.add_mesh(
+                sphere_moved,
+                color=viz.colors['pivoting'],
+                opacity=viz.sphere_opacity,
+                name=f"module_{data['module_id']}",
+                reset_camera=False
+            )
+
+        viz.plotter.write_frame()
+
+    # Final frame with correct colors
+    for data in pivot_data:
+        sphere_final = data['sphere'].copy()
+        sphere_final.points += data['to_pos']
+        color = viz.colors['active'] if viz.system.modules[data['module_id']].is_active else viz.colors['inactive']
+        viz.plotter.add_mesh(
+            sphere_final,
+            color=color,
+            opacity=viz.sphere_opacity,
+            name=f"module_{data['module_id']}",
+            reset_camera=False
+        )
     viz.plotter.write_frame()
 
 
@@ -1441,6 +1695,8 @@ def main():
             demo_ego_grid()
         elif command == 'ego-ring':
             demo_ego_ring()
+        elif command == 'ego-dual-star':
+            demo_ego_dual_star_bridge()
         elif command == 'general':
             demo_general_sequence()
         elif command == 'export':
@@ -1468,16 +1724,17 @@ def main():
         print("  python examples/visualize_pivots.py sequence   - Reconfiguration sequence")
         print("  python examples/visualize_pivots.py damage     - Damage response demo")
         print("\nEgo fault response demos (parallel subgraph movement):")
-        print("  python examples/visualize_pivots.py ego        - Star (size=2) fault response")
-        print("  python examples/visualize_pivots.py ego-large  - Large star (size=3) fault response")
-        print("  python examples/visualize_pivots.py ego-t      - T-shape fault response")
-        print("  python examples/visualize_pivots.py ego-cross  - Cross fault response")
-        print("  python examples/visualize_pivots.py ego-line   - 9-module line fault response")
-        print("  python examples/visualize_pivots.py ego-grid   - 3x3x3 grid fault response")
-        print("  python examples/visualize_pivots.py ego-ring   - Ring/loop fault response")
+        print("  python examples/visualize_pivots.py ego            - Star (size=2) fault response")
+        print("  python examples/visualize_pivots.py ego-large      - Large star (size=3) fault response")
+        print("  python examples/visualize_pivots.py ego-t          - T-shape fault response")
+        print("  python examples/visualize_pivots.py ego-cross      - Cross fault response")
+        print("  python examples/visualize_pivots.py ego-line       - 9-module line fault response")
+        print("  python examples/visualize_pivots.py ego-grid       - 3x3x3 grid fault response")
+        print("  python examples/visualize_pivots.py ego-ring       - Ring/loop fault response")
+        print("  python examples/visualize_pivots.py ego-dual-star  - Dual star bridge fault response")
         print("\nExport animations:")
         print("  python examples/visualize_pivots.py export <demo> [path]")
-        print("    Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
+        print("    Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring, ego-dual-star")
         print("    Example: python examples/visualize_pivots.py export ego gifs/ego_response.gif")
         print("\nInteractive configurations:")
         print("  python examples/visualize_pivots.py star       - Star configuration")

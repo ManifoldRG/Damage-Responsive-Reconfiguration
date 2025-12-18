@@ -57,7 +57,22 @@ class UDQDGSystem:
         module = SphericalModule(module_id, np.array(position, dtype=float), active)
         self.modules[module_id] = module
         return module
-        
+
+    def validate_no_overlaps(self) -> None:
+        """
+        Validate that no two modules occupy the same position.
+        Raises ValueError if overlapping modules are found.
+        """
+        positions = {}
+        for module_id, module in self.modules.items():
+            pos_tuple = tuple(module.position.round(6))  # Round to avoid floating point issues
+            if pos_tuple in positions:
+                raise ValueError(
+                    f"Configuration error: Module '{module_id}' at position {module.position} "
+                    f"overlaps with module '{positions[pos_tuple]}' at the same position!"
+                )
+            positions[pos_tuple] = module_id
+
     def connect_modules(self, module_a: str, module_b: str) -> bool:
         """Connect two modules with dual quaternion edge gain."""
         if module_a not in self.modules or module_b not in self.modules:
