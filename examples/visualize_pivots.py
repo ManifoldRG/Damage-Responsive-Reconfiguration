@@ -872,6 +872,336 @@ def demo_general_sequence():
 
     viz.plotter.close()
 
+def export_full_damage_response_gif(
+    config_func,
+    config_kwargs: dict,
+    fault_module: str,
+    output_path: str = None
+):
+    """
+    Export a full damage response animation (Phase 1 + Phase 2) as a GIF.
+
+    Args:
+        config_func: Configuration creation function (e.g., create_star_configuration)
+        config_kwargs: Keyword arguments for the configuration function
+        fault_module: ID of the module to fault
+        output_path: Output file path (defaults to gifs/full_damage_response.gif)
+    """
+    import os
+
+    if output_path is None:
+        os.makedirs('gifs', exist_ok=True)
+        output_path = f'gifs/full_damage_response.gif'
+
+    print(f"=== Exporting Full Damage Response to GIF ===")
+    print(f"Output: {output_path}")
+
+    # Run the full damage response algorithm to get all data
+    system_for_data = config_func(**config_kwargs)
+    result = system_for_data.full_damage_response(
+        fault_module,
+        restore_positions=True,
+        max_phase2_iterations=100,
+        record_steps=True
+    )
+
+    if not result.get('overall_success') and not result.get('phase1', {}).get('reconnected'):
+        print(f"Damage response failed: {result.get('error', 'Phase 1 failed')}")
+        return
+
+    phase1 = result['phase1']
+    phase2 = result.get('phase2')
+    histories = result['movement_histories']
+
+    print(f"\nPhase 1: {phase1.get('total_moves', 0)} moves")
+    if phase2:
+        print(f"Phase 2: {phase2.get('restoration_moves', 0)} moves")
+
+    # Create fresh system for visualization
+    system = config_func(**config_kwargs)
+    system.mark_fault(fault_module)
+
+    viz = UDQDGVisualizer(system)
+    viz.setup_scene()
+
+    # Open GIF writer
+    viz.plotter.open_gif(output_path, fps=30)
+
+    # Render initial state
+    viz.render_system()
+    viz.plotter.write_frame()
+
+    # Initial pause (0.5 sec at 30fps = 15 frames)
+    for _ in range(14):
+        viz.plotter.write_frame()
+
+    # Calculate total frames for camera rotation
+    phase1_steps = phase1.get('steps', [])
+    parallel_groups = phase1.get('parallel_steps', None)
+    phase2_steps = phase2.get('steps', []) if phase2 else []
+
+    # Count Phase 1 operations
+    if parallel_groups:
+        phase1_ops = sum(len(g) for g in parallel_groups)
+        phase1_groups = len(parallel_groups)
+    else:
+        phase1_ops = len(phase1_steps)
+        phase1_groups = len(phase1_steps)
+
+    phase2_ops = len(phase2_steps)
+    pause_frames = int(PAUSE_BETWEEN * 30)
+    phase_pause_frames = int(2.0 * 30)  # 2 second pause between phases
+
+    total_animation_frames = (
+        phase1_groups * EXPORT_FRAMES +
+        (phase1_groups - 1) * pause_frames +
+        phase_pause_frames +
+        phase2_ops * EXPORT_FRAMES +
+        max(0, phase2_ops - 1) * pause_frames
+    )
+
+    frame_counter = 0
+    initial_azimuth = viz.plotter.camera.azimuth
+    initial_elevation = viz.plotter.camera.elevation
+    total_rotation_azimuth = 120.0  # More rotation for full response
+    total_rotation_elevation = 30.0
+
+    # ========== ADD GHOST MARKERS FOR ALL DISPLACED MODULES ==========
+    # Show ghost markers at original positions before Phase 1 starts
+    ghost_sphere = pv.Sphere(radius=viz.sphere_radius * 0.9)
+    ghost_positions = {}
+
+    for module_id, history in histories.items():
+        if history.has_moved():
+            original_pos = history.get_original_position()
+            ghost_positions[module_id] = original_pos
+
+            ghost = ghost_sphere.copy()
+            ghost.points += original_pos
+            viz.plotter.add_mesh(
+                ghost,
+                color=viz.colors['ghost'],
+                opacity=0.3,
+                name=f"ghost_{module_id}",
+                reset_camera=False
+            )
+
+    # Write frame with ghosts visible
+    viz.plotter.write_frame()
+
+    # ========== PHASE 1: Reconnection ==========
+    print("\n--- Phase 1: Connectivity Restoration ---")
+
+    if parallel_groups:
+        for idx, group in enumerate(parallel_groups):
+            print(f"  [Iteration {group[0].iteration if group else 0}] {len(group)} parallel moves")
+
+            # Update camera
+            global_t = frame_counter / max(1, total_animation_frames)
+            viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+            viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
+            # Animate parallel group
+            _export_parallel_pivotsteps(
+                viz, group, EXPORT_FRAMES,
+                frame_counter, total_animation_frames,
+                initial_azimuth, initial_elevation,
+                total_rotation_azimuth, total_rotation_elevation
+            )
+            frame_counter += EXPORT_FRAMES
+
+            # Pause between groups
+            if idx < len(parallel_groups) - 1:
+                for i in range(pause_frames):
+                    # Use frame_counter + i to smoothly rotate camera during pause
+                    global_t = (frame_counter + i) / max(1, total_animation_frames)
+                    viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+                    viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+                    viz.plotter.write_frame()
+                frame_counter += pause_frames
+    else:
+        for idx, step in enumerate(phase1_steps):
+            print(f"  {step.pivot_type} {step.module_id}")
+
+            if step.pivot_type == 'corner':
+                _export_corner_pivot(
+                    viz, step.module_id, step.param1, step.param2, EXPORT_FRAMES,
+                    frame_counter, total_animation_frames,
+                    initial_azimuth, initial_elevation,
+                    total_rotation_azimuth, total_rotation_elevation,
+                    from_pos=step.from_pos, to_pos=step.to_pos
+                )
+            elif step.pivot_type == 'lateral':
+                _export_lateral_pivot(
+                    viz, step.module_id, step.param1, step.param2, EXPORT_FRAMES,
+                    frame_counter, total_animation_frames,
+                    initial_azimuth, initial_elevation,
+                    total_rotation_azimuth, total_rotation_elevation,
+                    from_pos=step.from_pos, to_pos=step.to_pos
+                )
+            frame_counter += EXPORT_FRAMES
+
+            if idx < len(phase1_steps) - 1:
+                for i in range(pause_frames):
+                    # Use frame_counter + i to smoothly rotate camera during pause
+                    global_t = (frame_counter + i) / max(1, total_animation_frames)
+                    viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+                    viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+                    viz.plotter.write_frame()
+                frame_counter += pause_frames
+
+    # ========== PAUSE BETWEEN PHASES ==========
+    print("\n--- Pause between phases ---")
+    for i in range(phase_pause_frames):
+        # Use frame_counter + i to smoothly rotate camera during pause
+        global_t = (frame_counter + i) / max(1, total_animation_frames)
+        viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+        viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+        viz.plotter.write_frame()
+    frame_counter += phase_pause_frames
+
+    # ========== PHASE 2: Position Restoration ==========
+    if phase2_steps:
+        print("\n--- Phase 2: Position Restoration ---")
+
+        # Ghost markers already added before Phase 1
+        # Animate Phase 2 steps
+        for idx, step in enumerate(phase2_steps):
+            dist_improvement = step.distance_before - step.distance_after
+            print(f"  {step.pivot_type} {step.module_id}: {step.distance_before:.2f} → {step.distance_after:.2f}")
+
+            # Update camera
+            global_t = frame_counter / max(1, total_animation_frames)
+            viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+            viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
+            # Animate restoration pivot (with green color)
+            _export_restoration_pivot(
+                viz, step.module_id, step.param1, step.param2,
+                step.pivot_type, EXPORT_FRAMES,
+                frame_counter, total_animation_frames,
+                initial_azimuth, initial_elevation,
+                total_rotation_azimuth, total_rotation_elevation,
+                from_pos=step.from_pos, to_pos=step.to_pos
+            )
+            frame_counter += EXPORT_FRAMES
+
+            # Remove ghost if module reached original position
+            if step.is_restoration_complete and step.module_id in ghost_positions:
+                viz.plotter.remove_actor(f"ghost_{step.module_id}", reset_camera=False)
+                print(f"    ✓ {step.module_id} restored!")
+
+            # Pause between steps
+            if idx < len(phase2_steps) - 1:
+                for i in range(pause_frames):
+                    # Use frame_counter + i to smoothly rotate camera during pause
+                    global_t = (frame_counter + i) / max(1, total_animation_frames)
+                    viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+                    viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+                    viz.plotter.write_frame()
+                frame_counter += pause_frames
+
+        # Keep ghost markers visible at end (don't remove them)
+
+    # Final pause - continue smooth camera rotation
+    for i in range(15):
+        global_t = min(1.0, (frame_counter + i) / max(1, total_animation_frames))
+        viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+        viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+        viz.plotter.write_frame()
+
+    viz.plotter.close()
+    print(f"\n✓ Saved to {output_path}")
+
+
+def _export_restoration_pivot(viz, pivot_module, param1, param2, pivot_type, n_frames,
+                               frame_offset=0, total_frames=None, initial_azimuth=0, initial_elevation=0,
+                               total_rotation_azimuth=90.0, total_rotation_elevation=30.0,
+                               from_pos=None, to_pos=None):
+    """Helper to export a restoration pivot with green color."""
+    if from_pos is None or to_pos is None:
+        return
+
+    initial_pos = from_pos.copy()
+    final_pos = to_pos.copy()
+
+    sphere = pv.Sphere(radius=viz.sphere_radius)
+
+    if pivot_type == 'corner':
+        axis_pos = viz.system.modules[param1].position.copy()
+        v1 = initial_pos - axis_pos
+        v2 = final_pos - axis_pos
+
+        for i in range(n_frames + 1):
+            t = i / n_frames
+            angle = t * np.pi / 2
+            interp_v = np.cos(angle) * v1 + np.sin(angle) * v2
+            interp_v = interp_v / np.linalg.norm(interp_v) * np.linalg.norm(v1)
+            interp_pos = axis_pos + interp_v
+
+            viz.system.modules[pivot_module].position = interp_pos
+
+            # Update camera
+            if total_frames:
+                global_t = (frame_offset + i) / total_frames
+                viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+                viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
+            # Re-render static modules
+            _render_all_static_modules(viz, {pivot_module})
+
+            # Render moving module in green
+            sphere_moved = sphere.copy()
+            sphere_moved.points += interp_pos
+            viz.plotter.add_mesh(
+                sphere_moved,
+                color=viz.colors['restoring'],  # Green!
+                opacity=viz.sphere_opacity,
+                name=f"module_{pivot_module}",
+                reset_camera=False
+            )
+            viz.plotter.write_frame()
+
+    else:  # lateral
+        for i in range(n_frames + 1):
+            t = i / n_frames
+            t_smooth = t * t * (3 - 2 * t)
+            interp_pos = (1 - t_smooth) * initial_pos + t_smooth * final_pos
+
+            viz.system.modules[pivot_module].position = interp_pos
+
+            if total_frames:
+                global_t = (frame_offset + i) / total_frames
+                viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+                viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
+            _render_all_static_modules(viz, {pivot_module})
+
+            sphere_moved = sphere.copy()
+            sphere_moved.points += interp_pos
+            viz.plotter.add_mesh(
+                sphere_moved,
+                color=viz.colors['restoring'],
+                opacity=viz.sphere_opacity,
+                name=f"module_{pivot_module}",
+                reset_camera=False
+            )
+            viz.plotter.write_frame()
+
+    # Final frame with active color
+    _render_all_static_modules(viz, {pivot_module})
+    sphere_final = sphere.copy()
+    sphere_final.points += final_pos
+    viz.plotter.add_mesh(
+        sphere_final,
+        color=viz.colors['active'],
+        opacity=viz.sphere_opacity,
+        name=f"module_{pivot_module}",
+        reset_camera=False
+    )
+    viz.plotter.write_frame()
+
+
 def export_demo_gif(demo_name: str, output_path: str = None):
     """
     Export a demo animation as a GIF.
@@ -1150,9 +1480,29 @@ def export_demo_gif(demo_name: str, output_path: str = None):
         else:
             sequence = stats['steps']  # Keep PivotStep objects
             print(f"Ego-dual-star algorithm: {len(sequence)} steps to export (sequential)")
+    elif demo_name == 'full':
+        # Full damage response (Phase 1 + Phase 2) - star size=2
+        return export_full_damage_response_gif(
+            create_star_configuration, {'size': 2}, 'C', output_path
+        )
+    elif demo_name == 'full-large':
+        # Full damage response - large star size=3
+        return export_full_damage_response_gif(
+            create_star_configuration, {'size': 3}, 'C', output_path
+        )
+    elif demo_name == 'full-dual-star':
+        # Full damage response - dual star bridge
+        bridge_length = 9
+        center_module = f'BR{bridge_length // 2 + 1}'
+        return export_full_damage_response_gif(
+            create_dual_star_bridge_configuration,
+            {'star_size': 3, 'bridge_length': bridge_length},
+            center_module,
+            output_path
+        )
     else:
         print(f"Unknown demo: {demo_name}")
-        print("Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring, ego-dual-star")
+        print("Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring, ego-dual-star, full, full-large, full-dual-star")
         return
 
     # Create visualizer and export
@@ -1333,7 +1683,12 @@ def _export_corner_pivot(viz, pivot_module, axis_module, new_direction, n_frames
                             name=f"module_{pivot_module}", reset_camera=False)
         viz.plotter.write_frame()
 
-    # Final frame with correct color
+    # Final frame with correct color - maintain camera rotation
+    if total_frames:
+        global_t = (frame_offset + n_frames + 1) / total_frames
+        viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+        viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
     _render_all_static_modules(viz, {pivot_module})
     sphere_final = sphere.copy()
     sphere_final.points += final_pos
@@ -1517,7 +1872,12 @@ def _export_parallel_pivotsteps(viz, pivot_steps, n_frames,
 
         viz.plotter.write_frame()
 
-    # Final frame with correct colors
+    # Final frame with correct colors - maintain camera rotation
+    if total_frames:
+        global_t = (frame_offset + n_frames + 1) / total_frames
+        viz.plotter.camera.azimuth = initial_azimuth + global_t * total_rotation_azimuth
+        viz.plotter.camera.elevation = initial_elevation + global_t * total_rotation_elevation
+
     for data in pivot_data:
         sphere_final = data['sphere'].copy()
         sphere_final.points += data['to_pos']
@@ -1530,6 +1890,269 @@ def _export_parallel_pivotsteps(viz, pivot_steps, n_frames,
             reset_camera=False
         )
     viz.plotter.write_frame()
+
+
+# ============================================
+# PHASE 2: POSITION RESTORATION DEMOS
+# ============================================
+
+def demo_restoration():
+    """
+    Demonstrate Phase 2 position restoration after a fault response.
+    Shows modules returning to their original positions with ghost markers.
+    """
+    print("=== Phase 2: Position Restoration Demo ===")
+    print("Creating star configuration...")
+
+    import time
+
+    # Step 1: Run Phase 1 to get movement histories
+    system = create_star_configuration(size=2)
+    system.mark_fault('C')
+
+    print(f"\nConfiguration: {len(system.modules)} modules")
+    print("Fault location: Center (C)")
+
+    print("\nRunning Phase 1 (ego_fault_response_with_history)...")
+    phase1_stats, histories = system.ego_fault_response_with_history('C')
+
+    if not phase1_stats.get('reconnected'):
+        print("Phase 1 failed to reconnect - cannot demonstrate restoration")
+        return
+
+    print(f"Phase 1 complete:")
+    print(f"  Iterations: {phase1_stats['iterations']}")
+    print(f"  Total moves: {phase1_stats['total_moves']}")
+    print(f"  Modules displaced: {phase1_stats['modules_displaced']}")
+
+    # Step 2: Run Phase 2 restoration
+    print("\nRunning Phase 2 (position_restoration)...")
+    fault_positions = {(0, 0, 0)}  # Center position
+
+    phase2_stats = system.position_restoration(
+        histories,
+        fault_positions,
+        max_iterations=50,
+        record_steps=True
+    )
+
+    print(f"Phase 2 complete:")
+    print(f"  Restoration moves: {phase2_stats['restoration_moves']}")
+    print(f"  Fully restored: {len(phase2_stats['fully_restored'])}")
+    print(f"  Initial displacement: {phase2_stats['initial_displacement']:.2f}")
+    print(f"  Final displacement: {phase2_stats['final_displacement']:.2f}")
+
+    if not phase2_stats.get('steps'):
+        print("\nNo restoration steps to animate (modules may not have moved)")
+        return
+
+    # Step 3: Create fresh system for visualization
+    viz_system = create_star_configuration(size=2)
+    viz_system.mark_fault('C')
+
+    # Run Phase 1 again on visualization system to get it to post-Phase-1 state
+    viz_phase1_stats, viz_histories = viz_system.ego_fault_response_with_history('C')
+
+    viz = UDQDGVisualizer(viz_system)
+
+    print("\nStarting restoration animation...")
+    viz.show_window()
+
+    time.sleep(0.5)
+
+    # Animate restoration with ghost markers
+    viz.animate_restoration(
+        steps=phase2_stats['steps'],
+        movement_histories=viz_histories,
+        n_frames=TOTAL_FRAMES,
+        pause_between=PAUSE_BETWEEN,
+        camera_mode='fixed',
+        show_ghosts=True,
+        reset_positions=False  # Don't reset - we're already in post-Phase-1 state
+    )
+
+    print("\nRestoration animation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_full_damage_response():
+    """
+    Demonstrate complete damage response: Phase 1 + Phase 2.
+    Shows the full cycle from fault detection to position restoration.
+    """
+    print("=== Full Damage Response Demo (Phase 1 + Phase 2) ===")
+    print("Creating star configuration...")
+
+    import time
+
+    # Run full damage response
+    system_for_data = create_star_configuration(size=2)
+    result = system_for_data.full_damage_response('C', restore_positions=True, max_phase2_iterations=50)
+
+    if not result.get('overall_success'):
+        print(f"Damage response failed: {result.get('error', 'Unknown error')}")
+        return
+
+    print(f"\n{system_for_data.get_damage_response_summary(result)}")
+
+    phase1 = result['phase1']
+    phase2 = result['phase2']
+    histories = result['movement_histories']
+
+    # Check if we have animation data
+    if not phase1.get('parallel_steps') and not phase1.get('steps'):
+        print("No Phase 1 steps recorded")
+        return
+
+    # Create fresh system for visualization
+    viz_system = create_star_configuration(size=2)
+    viz_system.mark_fault('C')
+
+    viz = UDQDGVisualizer(viz_system)
+
+    print("\nStarting full damage response animation...")
+    viz.show_window()
+
+    time.sleep(0.5)
+
+    # Animate full damage response
+    phase1_steps = phase1.get('steps', [])
+    parallel_groups = phase1.get('parallel_steps', None)
+    phase2_steps = phase2.get('steps', []) if phase2 else []
+
+    viz.animate_full_damage_response(
+        phase1_steps=phase1_steps,
+        phase2_steps=phase2_steps,
+        movement_histories=histories,
+        n_frames=TOTAL_FRAMES,
+        pause_between=PAUSE_BETWEEN,
+        pause_between_phases=2.0,
+        camera_mode='fixed',
+        parallel_groups=parallel_groups,
+        show_ghosts=True
+    )
+
+    print("\nFull damage response animation complete!")
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_full_large_star():
+    """
+    Demonstrate full damage response on a larger star (size=3).
+    More modules = more dramatic restoration.
+    """
+    print("=== Full Damage Response - Large Star Demo ===")
+    print("Creating large star configuration (size=3)...")
+
+    import time
+
+    # Run full damage response
+    system_for_data = create_star_configuration(size=3)
+    result = system_for_data.full_damage_response('C', restore_positions=True, max_phase2_iterations=100)
+
+    if not result.get('overall_success'):
+        print(f"Damage response failed: {result.get('error', 'Unknown error')}")
+        return
+
+    print(f"\n{system_for_data.get_damage_response_summary(result)}")
+
+    phase1 = result['phase1']
+    phase2 = result['phase2']
+    histories = result['movement_histories']
+
+    # Create fresh system for visualization
+    viz_system = create_star_configuration(size=3)
+    viz_system.mark_fault('C')
+
+    viz = UDQDGVisualizer(viz_system)
+
+    print("\nStarting animation...")
+    viz.show_window()
+
+    time.sleep(0.5)
+
+    phase1_steps = phase1.get('steps', [])
+    parallel_groups = phase1.get('parallel_steps', None)
+    phase2_steps = phase2.get('steps', []) if phase2 else []
+
+    viz.animate_full_damage_response(
+        phase1_steps=phase1_steps,
+        phase2_steps=phase2_steps,
+        movement_histories=histories,
+        n_frames=TOTAL_FRAMES,
+        pause_between=PAUSE_BETWEEN,
+        pause_between_phases=2.0,
+        camera_mode='fixed',
+        parallel_groups=parallel_groups,
+        show_ghosts=True
+    )
+
+    time.sleep(1.0)
+    viz.plotter.close()
+
+
+def demo_full_dual_star():
+    """
+    Demonstrate full damage response on dual star bridge configuration.
+    Bridge damage disconnects the two stars, then restoration moves modules back.
+    """
+    print("=== Full Damage Response - Dual Star Bridge Demo ===")
+    print("Creating dual star bridge configuration...")
+
+    import time
+
+    bridge_length = 9
+    center_module = f'BR{bridge_length // 2 + 1}'  # BR5 for 9-module bridge
+
+    # Run full damage response
+    system_for_data = create_dual_star_bridge_configuration(star_size=3, bridge_length=bridge_length)
+    result = system_for_data.full_damage_response(
+        center_module,
+        restore_positions=True,
+        max_phase2_iterations=100
+    )
+
+    if not result.get('overall_success'):
+        print(f"Damage response failed: {result.get('error', 'Unknown error')}")
+        return
+
+    print(f"\n{system_for_data.get_damage_response_summary(result)}")
+
+    phase1 = result['phase1']
+    phase2 = result['phase2']
+    histories = result['movement_histories']
+
+    # Create fresh system for visualization
+    viz_system = create_dual_star_bridge_configuration(star_size=3, bridge_length=bridge_length)
+    viz_system.mark_fault(center_module)
+
+    viz = UDQDGVisualizer(viz_system)
+
+    print("\nStarting animation...")
+    viz.show_window()
+
+    time.sleep(0.5)
+
+    phase1_steps = phase1.get('steps', [])
+    parallel_groups = phase1.get('parallel_steps', None)
+    phase2_steps = phase2.get('steps', []) if phase2 else []
+
+    viz.animate_full_damage_response(
+        phase1_steps=phase1_steps,
+        phase2_steps=phase2_steps,
+        movement_histories=histories,
+        n_frames=TOTAL_FRAMES,
+        pause_between=PAUSE_BETWEEN,
+        pause_between_phases=2.0,
+        camera_mode='fixed',
+        parallel_groups=parallel_groups,
+        show_ghosts=True
+    )
+
+    time.sleep(1.0)
+    viz.plotter.close()
 
 
 def _export_parallel_pivots(viz, pivot_operations, n_frames,
@@ -1699,6 +2322,15 @@ def main():
             demo_ego_dual_star_bridge()
         elif command == 'general':
             demo_general_sequence()
+        # Phase 2 restoration demos
+        elif command == 'restore':
+            demo_restoration()
+        elif command == 'full':
+            demo_full_damage_response()
+        elif command == 'full-large':
+            demo_full_large_star()
+        elif command == 'full-dual-star':
+            demo_full_dual_star()
         elif command == 'export':
             # Export mode: python examples/visualize_pivots.py export <demo_name> [output_path]
             if len(sys.argv) > 2:
@@ -1723,7 +2355,7 @@ def main():
         print("  python examples/visualize_pivots.py general    - General sequence demo")
         print("  python examples/visualize_pivots.py sequence   - Reconfiguration sequence")
         print("  python examples/visualize_pivots.py damage     - Damage response demo")
-        print("\nEgo fault response demos (parallel subgraph movement):")
+        print("\nPhase 1: Ego fault response demos (parallel subgraph movement):")
         print("  python examples/visualize_pivots.py ego            - Star (size=2) fault response")
         print("  python examples/visualize_pivots.py ego-large      - Large star (size=3) fault response")
         print("  python examples/visualize_pivots.py ego-t          - T-shape fault response")
@@ -1732,6 +2364,11 @@ def main():
         print("  python examples/visualize_pivots.py ego-grid       - 3x3x3 grid fault response")
         print("  python examples/visualize_pivots.py ego-ring       - Ring/loop fault response")
         print("  python examples/visualize_pivots.py ego-dual-star  - Dual star bridge fault response")
+        print("\nPhase 2: Position restoration demos (modules return to original positions):")
+        print("  python examples/visualize_pivots.py restore        - Phase 2 restoration only")
+        print("  python examples/visualize_pivots.py full           - Full Phase 1 + Phase 2 (star)")
+        print("  python examples/visualize_pivots.py full-large     - Full Phase 1 + Phase 2 (large star)")
+        print("  python examples/visualize_pivots.py full-dual-star - Full Phase 1 + Phase 2 (dual star)")
         print("\nExport animations:")
         print("  python examples/visualize_pivots.py export <demo> [path]")
         print("    Available: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring, ego-dual-star")

@@ -22,10 +22,15 @@ class UDQDGVisualizer:
         self.colors = {
             'active': '#00D9FF',      # Vibrant cyan
             'inactive': '#8B0000',    # Dark red
-            'pivoting': '#FF8C00',    # Orange highlight
+            'pivoting': '#FF8C00',    # Orange highlight for Phase 1
+            'restoring': '#32CD32',   # Lime green for Phase 2 restoration
+            'ghost': '#4A4A4A',       # Dark gray for original position markers
             'edge': '#E0E0E0',        # Light gray
             'background': '#1A1A1A'   # Dark background
         }
+
+        # Ghost markers for original positions during restoration
+        self.ghost_actors = {}
 
         self.sphere_radius = 0.5  # Half of unit lattice step for perfect touching
         self.edge_radius = 0.08
@@ -837,6 +842,337 @@ class UDQDGVisualizer:
         self.setup_scene()
         self.render_system()
         self.plotter.show(interactive_update=True, auto_close=False)
+
+    def show_ghost_markers(self, movement_histories: Dict, opacity: float = 0.3):
+        """
+        Show translucent ghost markers at original positions during restoration.
+
+        Args:
+            movement_histories: Dict of module_id -> MovementHistory objects
+            opacity: Transparency of ghost markers (0.0 to 1.0)
+        """
+        # Clear any existing ghost markers
+        self.hide_ghost_markers()
+
+        ghost_sphere = pv.Sphere(radius=self.sphere_radius * 0.9)  # Slightly smaller
+
+        for module_id, history in movement_histories.items():
+            if history.has_moved():
+                original_pos = history.get_original_position()
+
+                # Create ghost marker at original position
+                ghost = ghost_sphere.copy()
+                ghost.points += original_pos
+
+                actor = self.plotter.add_mesh(
+                    ghost,
+                    color=self.colors['ghost'],
+                    opacity=opacity,
+                    name=f"ghost_{module_id}",
+                    reset_camera=False
+                )
+
+                self.ghost_actors[module_id] = actor
+
+    def hide_ghost_markers(self):
+        """Remove all ghost markers from the scene."""
+        for module_id in list(self.ghost_actors.keys()):
+            self.plotter.remove_actor(f"ghost_{module_id}", reset_camera=False)
+        self.ghost_actors.clear()
+
+    def animate_restoration(
+        self,
+        steps,  # List[RestorationStep]
+        movement_histories: Dict,
+        n_frames: int = 12,
+        pause_between: float = 0.5,
+        camera_mode: str = 'fixed',
+        show_ghosts: bool = True,
+        reset_positions: bool = True
+    ):
+        """
+        Animate Phase 2 restoration steps.
+
+        Args:
+            steps: List of RestorationStep objects from position_restoration(record_steps=True)
+            movement_histories: Dict of module_id -> MovementHistory for ghost markers
+            n_frames: Number of interpolation frames per pivot
+            pause_between: Pause duration between pivots
+            camera_mode: Camera behavior - 'fixed', 'rotate', or 'follow'
+            show_ghosts: If True, show ghost markers at original positions
+            reset_positions: If True, reset module positions to pre-restoration state
+        """
+        import time
+
+        if not steps:
+            print("No restoration steps to animate")
+            return
+
+        # Reset module positions to their initial state before animation
+        if reset_positions:
+            # Build map of each module's original position (first time it appears in steps)
+            restore_positions = {}
+            for step in steps:
+                if step.module_id not in restore_positions:
+                    restore_positions[step.module_id] = step.from_pos.copy()
+
+            # Reset positions
+            for module_id, pos in restore_positions.items():
+                self.system.modules[module_id].position = pos.copy()
+
+            # Re-render to show initial state
+            self.render_system()
+            self.plotter.update()
+
+        # Show ghost markers at original positions
+        if show_ghosts and movement_histories:
+            self.show_ghost_markers(movement_histories)
+            self.plotter.update()
+            time.sleep(0.5)  # Pause to show ghosts
+
+        print(f"\n=== Phase 2: Position Restoration ===")
+        print(f"Restoring {len(set(s.module_id for s in steps))} modules in {len(steps)} moves")
+
+        current_iteration = None
+
+        for i, step in enumerate(steps):
+            # Log iteration changes
+            if step.iteration != current_iteration:
+                current_iteration = step.iteration
+                print(f"\n[Restoration Iteration {current_iteration}]")
+
+            # Calculate progress for camera
+            progress = i / len(steps) if len(steps) > 1 else 0
+
+            # Handle camera mode
+            if camera_mode == 'follow':
+                module_pos = self.system.modules[step.module_id].position
+                self.plotter.camera.focal_point = tuple(module_pos)
+            elif camera_mode == 'rotate':
+                self.plotter.camera.azimuth = progress * 90
+
+            # Print restoration progress
+            distance_improvement = step.distance_before - step.distance_after
+            print(f"  {step.pivot_type} {step.module_id}: "
+                  f"dist {step.distance_before:.2f} → {step.distance_after:.2f} "
+                  f"(Δ {distance_improvement:+.2f})")
+
+            # Animate using the restoring color (green)
+            if step.pivot_type == 'corner':
+                self._animate_single_restoration_pivot(
+                    step.module_id, step.param1, step.param2,
+                    n_frames, pivot_type='corner'
+                )
+            elif step.pivot_type == 'lateral':
+                self._animate_single_restoration_pivot(
+                    step.module_id, step.param1, step.param2,
+                    n_frames, pivot_type='lateral'
+                )
+
+            # Check if module reached original position
+            if step.is_restoration_complete:
+                # Remove ghost marker when module is restored
+                if step.module_id in self.ghost_actors:
+                    self.plotter.remove_actor(f"ghost_{step.module_id}", reset_camera=False)
+                    del self.ghost_actors[step.module_id]
+                    self.plotter.update()
+                print(f"    ✓ {step.module_id} restored to original position!")
+
+            time.sleep(pause_between)
+
+        # Hide remaining ghost markers at the end
+        self.hide_ghost_markers()
+
+        # Print summary
+        restored_count = sum(1 for s in steps if s.is_restoration_complete)
+        print(f"\nRestoration complete: {len(steps)} moves, {restored_count} modules fully restored")
+
+    def _animate_single_restoration_pivot(
+        self,
+        pivot_module: str,
+        param1: str,
+        param2: str,
+        n_frames: int,
+        pivot_type: str
+    ):
+        """
+        Internal method for animating a single restoration pivot with green color.
+        Uses the same animation logic as Phase 1 but with restoration color.
+        """
+        if n_frames is None:
+            n_frames = 12
+
+        if pivot_type == 'corner':
+            axis_module = param1
+            new_direction = param2
+
+            initial_pos = self.system.modules[pivot_module].position.copy()
+            success = self.system.corner_pivot(pivot_module, axis_module, new_direction)
+
+            if not success:
+                return False
+
+            final_pos = self.system.modules[pivot_module].position.copy()
+            axis_pos = self.system.modules[axis_module].position.copy()
+
+            # Restore initial position for smooth animation
+            self.system.modules[pivot_module].position = initial_pos.copy()
+
+            v1 = initial_pos - axis_pos
+            v2 = final_pos - axis_pos
+
+            sphere = pv.Sphere(radius=self.sphere_radius)
+
+            for i in range(n_frames + 1):
+                t = i / n_frames
+                angle = t * np.pi / 2
+
+                interp_v = np.cos(angle) * v1 + np.sin(angle) * v2
+                interp_v = interp_v / np.linalg.norm(interp_v) * np.linalg.norm(v1)
+                interp_pos = axis_pos + interp_v
+
+                self.system.modules[pivot_module].position = interp_pos
+
+                sphere_moved = sphere.copy()
+                sphere_moved.points += interp_pos
+                self.plotter.add_mesh(
+                    sphere_moved,
+                    color=self.colors['restoring'],  # Green for restoration
+                    opacity=self.sphere_opacity,
+                    name=f"module_{pivot_module}",
+                    reset_camera=False
+                )
+                self.plotter.update()
+
+            # Restore default color after animation
+            sphere_final = sphere.copy()
+            sphere_final.points += final_pos
+            self.plotter.add_mesh(
+                sphere_final,
+                color=self.colors['active'],
+                opacity=self.sphere_opacity,
+                name=f"module_{pivot_module}",
+                reset_camera=False
+            )
+            self.plotter.update()
+
+        elif pivot_type == 'lateral':
+            old_neighbor = param1
+            new_neighbor = param2
+
+            initial_pos = self.system.modules[pivot_module].position.copy()
+            success = self.system.lateral_pivot(pivot_module, old_neighbor, new_neighbor)
+
+            if not success:
+                return False
+
+            final_pos = self.system.modules[pivot_module].position.copy()
+
+            # Restore initial position for smooth animation
+            self.system.modules[pivot_module].position = initial_pos.copy()
+
+            sphere = pv.Sphere(radius=self.sphere_radius)
+
+            # Use smooth easing interpolation
+            for i in range(n_frames + 1):
+                t = i / n_frames
+                t_smooth = t * t * (3 - 2 * t)  # Ease-in-out
+                interp_pos = (1 - t_smooth) * initial_pos + t_smooth * final_pos
+
+                self.system.modules[pivot_module].position = interp_pos
+
+                sphere_moved = sphere.copy()
+                sphere_moved.points += interp_pos
+                self.plotter.add_mesh(
+                    sphere_moved,
+                    color=self.colors['restoring'],  # Green for restoration
+                    opacity=self.sphere_opacity,
+                    name=f"module_{pivot_module}",
+                    reset_camera=False
+                )
+                self.plotter.update()
+
+            # Restore final state and color
+            self.system.modules[pivot_module].position = final_pos.copy()
+            sphere_final = sphere.copy()
+            sphere_final.points += final_pos
+            self.plotter.add_mesh(
+                sphere_final,
+                color=self.colors['active'],
+                opacity=self.sphere_opacity,
+                name=f"module_{pivot_module}",
+                reset_camera=False
+            )
+            self.plotter.update()
+
+        return True
+
+    def animate_full_damage_response(
+        self,
+        phase1_steps,  # List[PivotStep]
+        phase2_steps,  # List[RestorationStep]
+        movement_histories: Dict,
+        n_frames: int = 12,
+        pause_between: float = 0.5,
+        pause_between_phases: float = 2.0,
+        camera_mode: str = 'fixed',
+        parallel_groups=None,  # List[List[PivotStep]] for Phase 1
+        show_ghosts: bool = True
+    ):
+        """
+        Animate complete damage response: Phase 1 (reconnection) → Phase 2 (restoration).
+
+        Args:
+            phase1_steps: List of PivotStep objects from ego_fault_response
+            phase2_steps: List of RestorationStep objects from position_restoration
+            movement_histories: Dict of module_id -> MovementHistory
+            n_frames: Number of interpolation frames per pivot
+            pause_between: Pause duration between pivots
+            pause_between_phases: Pause duration between Phase 1 and Phase 2
+            camera_mode: Camera behavior - 'fixed', 'rotate', or 'follow'
+            parallel_groups: If provided, animate Phase 1 moves in parallel
+            show_ghosts: If True, show ghost markers during Phase 2
+        """
+        import time
+
+        print("\n" + "=" * 60)
+        print("FULL DAMAGE RESPONSE ANIMATION")
+        print("=" * 60)
+
+        # Phase 1: Ego Fault Response
+        if phase1_steps or parallel_groups:
+            print("\n=== Phase 1: Connectivity Restoration ===")
+            self.animate_ego_response(
+                steps=phase1_steps,
+                n_frames=n_frames,
+                pause_between=pause_between,
+                camera_mode=camera_mode,
+                reset_positions=True,
+                parallel_groups=parallel_groups
+            )
+
+            print(f"\n[Pause between phases: {pause_between_phases}s]")
+            time.sleep(pause_between_phases)
+        else:
+            print("\n[Phase 1: No moves required]")
+
+        # Phase 2: Position Restoration
+        if phase2_steps:
+            self.animate_restoration(
+                steps=phase2_steps,
+                movement_histories=movement_histories,
+                n_frames=n_frames,
+                pause_between=pause_between,
+                camera_mode=camera_mode,
+                show_ghosts=show_ghosts,
+                reset_positions=False  # Don't reset - continue from Phase 1 state
+            )
+        else:
+            print("\n[Phase 2: No restoration moves required]")
+
+        print("\n" + "=" * 60)
+        print("ANIMATION COMPLETE")
+        print("=" * 60)
 
     def export_animation(self, filename: str, operations: List[Tuple]):
         """Export animation sequence to file (GIF or MP4)."""
