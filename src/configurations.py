@@ -1,5 +1,6 @@
 import numpy as np
-from typing import Tuple
+import random
+from typing import Tuple, Set, Optional
 try:
     from .udqdg_system import UDQDGSystem
     from .dual_quaternion import LATTICE_DIRECTIONS
@@ -532,5 +533,121 @@ def create_dual_star_bridge_configuration(star_size: int = 3, bridge_length: int
 
     # Validate no overlapping modules
     system.validate_no_overlaps()
+
+    return system
+
+
+def create_random_configuration(
+    n_modules: int,
+    seed: Optional[int] = None,
+    mode_2d: bool = False,
+    fully_connected: bool = False
+) -> UDQDGSystem:
+    """
+    Create a random connected structure using random walk growth.
+
+    Algorithm:
+    1. Start with a single module at the origin
+    2. Maintain a frontier of unoccupied adjacent positions
+    3. Randomly select from frontier and add modules until n_modules reached
+    4. Connect new modules to ONE adjacent module (chain-like, default)
+       OR all adjacent modules (fully connected, if fully_connected=True)
+
+    Args:
+        n_modules: Number of modules to create (must be >= 1)
+        seed: Random seed for reproducibility
+        mode_2d: If True, only grow in XY plane (Z=0)
+        fully_connected: If True, connect to all adjacent modules (more branches).
+                        If False (default), connect to only one adjacent module
+                        (more chain-like, requires more moves to restore).
+
+    Returns:
+        UDQDGSystem with n_modules in a connected configuration
+
+    Raises:
+        ValueError: If n_modules < 1
+    """
+    if n_modules < 1:
+        raise ValueError("n_modules must be at least 1")
+
+    if seed is not None:
+        random.seed(seed)
+
+    system = UDQDGSystem(mode_2d=mode_2d)
+
+    # Define growth directions based on mode
+    if mode_2d:
+        directions = [
+            np.array([1, 0, 0]),   # +X
+            np.array([-1, 0, 0]),  # -X
+            np.array([0, 1, 0]),   # +Y
+            np.array([0, -1, 0]), # -Y
+        ]
+    else:
+        directions = [
+            np.array([1, 0, 0]),   # +X
+            np.array([-1, 0, 0]),  # -X
+            np.array([0, 1, 0]),   # +Y
+            np.array([0, -1, 0]),  # -Y
+            np.array([0, 0, 1]),   # +Z
+            np.array([0, 0, -1]),  # -Z
+        ]
+
+    # Track occupied positions as tuples for hashability
+    occupied: Set[Tuple[int, int, int]] = set()
+
+    # Start with first module at origin
+    origin = np.array([0, 0, 0], dtype=float)
+    system.add_module("M0", origin)
+    occupied.add((0, 0, 0))
+
+    # Frontier: set of (position_tuple, adjacent_module_ids)
+    # Each frontier position knows which existing modules it's adjacent to
+    frontier: dict[Tuple[int, int, int], Set[str]] = {}
+
+    # Initialize frontier with positions adjacent to origin
+    for direction in directions:
+        pos = tuple(int(x) for x in direction)
+        frontier[pos] = {"M0"}
+
+    # Grow until we have n_modules
+    module_count = 1
+    while module_count < n_modules:
+        if not frontier:
+            # Shouldn't happen with connected growth, but handle gracefully
+            break
+
+        # Pick random frontier position
+        frontier_positions = list(frontier.keys())
+        chosen_pos = random.choice(frontier_positions)
+        adjacent_modules = frontier.pop(chosen_pos)
+
+        # Create new module
+        module_id = f"M{module_count}"
+        position = np.array(chosen_pos, dtype=float)
+        system.add_module(module_id, position)
+        occupied.add(chosen_pos)
+
+        # Connect to adjacent modules based on mode
+        if fully_connected:
+            # Connect to ALL adjacent existing modules (more branches)
+            for adj_module_id in adjacent_modules:
+                system.connect_modules(adj_module_id, module_id)
+        else:
+            # Connect to only ONE adjacent module (chain-like)
+            # Pick randomly from adjacent modules
+            adj_module_id = random.choice(list(adjacent_modules))
+            system.connect_modules(adj_module_id, module_id)
+
+        # Update frontier with new adjacent positions
+        for direction in directions:
+            new_pos = tuple(int(chosen_pos[i] + direction[i]) for i in range(3))
+            if new_pos not in occupied:
+                if new_pos in frontier:
+                    frontier[new_pos].add(module_id)
+                else:
+                    frontier[new_pos] = {module_id}
+
+        module_count += 1
 
     return system
