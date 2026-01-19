@@ -16,11 +16,16 @@ from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 
 try:
-    from .configurations import create_random_configuration
+    from .configurations import create_random_configuration, create_random_tree_configuration
     from .udqdg_system import UDQDGSystem
 except ImportError:
-    from configurations import create_random_configuration
+    from configurations import create_random_configuration, create_random_tree_configuration
     from udqdg_system import UDQDGSystem
+
+
+# Configuration generation modes
+CONFIG_MODE_RANDOM = "random"  # Random walk with full connectivity (default)
+CONFIG_MODE_TREE = "tree"      # Tree structure (no cycles)
 
 
 @dataclass
@@ -132,7 +137,8 @@ def run_single_trial(
     seed: int,
     trial_id: int = 0,
     mode_2d: bool = False,
-    fully_connected: bool = False
+    fully_connected: bool = True,
+    config_mode: str = CONFIG_MODE_RANDOM
 ) -> TrialResult:
     """
     Execute a single Monte Carlo trial.
@@ -143,16 +149,22 @@ def run_single_trial(
         seed: Random seed for reproducibility (structure uses seed, faults use seed+1000)
         trial_id: Identifier for this trial
         mode_2d: If True, use 2D mode
-        fully_connected: If True, connect to all adjacent modules (more branches).
-                        If False (default), connect to only one (chain-like).
+        fully_connected: If True (default), connect to all adjacent modules (more branches).
+                        If False, connect to only one (chain-like). Only used for 'random' mode.
+        config_mode: Configuration generation mode ('random' or 'tree')
 
     Returns:
         TrialResult with metrics and outcomes
     """
-    # Generate random structure
-    system = create_random_configuration(
-        n_modules, seed=seed, mode_2d=mode_2d, fully_connected=fully_connected
-    )
+    # Generate structure based on config mode
+    if config_mode == CONFIG_MODE_TREE:
+        system = create_random_tree_configuration(
+            n_modules, seed=seed, mode_2d=mode_2d, balanced=False
+        )
+    else:
+        system = create_random_configuration(
+            n_modules, seed=seed, mode_2d=mode_2d, fully_connected=fully_connected
+        )
 
     # Record original positions
     original_positions = {
@@ -231,8 +243,9 @@ def run_monte_carlo(
     n_trials: int = 100,
     seed: Optional[int] = None,
     mode_2d: bool = False,
-    fully_connected: bool = False,
-    verbose: bool = False
+    fully_connected: bool = True,
+    verbose: bool = False,
+    config_mode: str = CONFIG_MODE_RANDOM
 ) -> MonteCarloResults:
     """
     Run Monte Carlo simulation with given parameters.
@@ -243,9 +256,10 @@ def run_monte_carlo(
         n_trials: Number of trials to run
         seed: Base random seed (None for random)
         mode_2d: If True, use 2D mode
-        fully_connected: If True, connect to all adjacent modules (more branches).
-                        If False (default), connect to only one (chain-like).
+        fully_connected: If True (default), connect to all adjacent modules (more branches).
+                        If False, connect to only one (chain-like). Only for 'random' mode.
         verbose: If True, print progress
+        config_mode: Configuration generation mode ('random' or 'tree')
 
     Returns:
         MonteCarloResults with aggregated statistics
@@ -266,7 +280,8 @@ def run_monte_carlo(
             seed=trial_seed,
             trial_id=i,
             mode_2d=mode_2d,
-            fully_connected=fully_connected
+            fully_connected=fully_connected,
+            config_mode=config_mode
         )
         trials.append(result)
 
@@ -336,21 +351,25 @@ def run_parameter_sweep(
     n_trials: int = 100,
     seed: Optional[int] = None,
     mode_2d: bool = False,
-    fully_connected: bool = False,
-    verbose: bool = False
+    fully_connected: bool = True,
+    verbose: bool = False,
+    config_mode: str = CONFIG_MODE_RANDOM,
+    dynamic_faults: bool = False
 ) -> Dict[Tuple[int, int], MonteCarloResults]:
     """
     Run Monte Carlo simulations across parameter ranges.
 
     Args:
         n_range: (min_n, max_n) inclusive range for module count
-        f_range: (min_f, max_f) inclusive range for fault count
+        f_range: (min_f, max_f) inclusive range for fault count (ignored if dynamic_faults=True)
         n_trials: Number of trials per configuration
         seed: Base random seed
         mode_2d: If True, use 2D mode
-        fully_connected: If True, connect to all adjacent modules (more branches).
-                        If False (default), connect to only one (chain-like).
+        fully_connected: If True (default), connect to all adjacent modules (more branches).
+                        If False, connect to only one (chain-like). Only for 'random' mode.
         verbose: If True, print progress
+        config_mode: Configuration generation mode ('random' or 'tree')
+        dynamic_faults: If True, faults = floor(n/10) for each n (ignores f_range)
 
     Returns:
         Dictionary mapping (n, f) tuples to MonteCarloResults
@@ -362,9 +381,11 @@ def run_parameter_sweep(
     config_seed = seed
 
     for n in range(n_range[0], n_range[1] + 1):
-        for f in range(f_range[0], min(f_range[1] + 1, n)):  # f < n
+        if dynamic_faults:
+            # Dynamic faults: f = floor(n/10), minimum 1
+            f = max(1, n // 10)
             if verbose:
-                print(f"Running configuration (n={n}, f={f})...")
+                print(f"Running configuration (n={n}, f={f} [dynamic])...")
 
             result = run_monte_carlo(
                 n_modules=n,
@@ -373,10 +394,28 @@ def run_parameter_sweep(
                 seed=config_seed,
                 mode_2d=mode_2d,
                 fully_connected=fully_connected,
-                verbose=False
+                verbose=False,
+                config_mode=config_mode
             )
             results[(n, f)] = result
             config_seed += n_trials
+        else:
+            for f in range(f_range[0], min(f_range[1] + 1, n)):  # f < n
+                if verbose:
+                    print(f"Running configuration (n={n}, f={f})...")
+
+                result = run_monte_carlo(
+                    n_modules=n,
+                    n_faults=f,
+                    n_trials=n_trials,
+                    seed=config_seed,
+                    mode_2d=mode_2d,
+                    fully_connected=fully_connected,
+                    verbose=False,
+                    config_mode=config_mode
+                )
+                results[(n, f)] = result
+                config_seed += n_trials
 
     return results
 
