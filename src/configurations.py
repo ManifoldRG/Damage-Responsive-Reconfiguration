@@ -651,3 +651,116 @@ def create_random_configuration(
         module_count += 1
 
     return system
+
+
+def create_random_tree_configuration(
+    n_modules: int,
+    seed: Optional[int] = None,
+    mode_2d: bool = False,
+    balanced: bool = False
+) -> UDQDGSystem:
+    """
+    Create a random tree-structured configuration (spanning tree, no cycles).
+
+    Unlike fully-connected random walk, this method guarantees a tree structure
+    where each module (except root) has exactly one parent connection.
+
+    Algorithm:
+    1. Start with a single module at the origin
+    2. Maintain a frontier of (position, parent_module_id) pairs
+    3. Select from frontier (random or FIFO for balanced) and add modules
+    4. Each new module connects to exactly ONE parent (tree property)
+
+    Args:
+        n_modules: Number of modules to create (must be >= 1)
+        seed: Random seed for reproducibility
+        mode_2d: If True, only grow in XY plane (Z=0)
+        balanced: If True, use FIFO selection (BFS-like, more balanced tree).
+                 If False (default), use random selection (more varied shapes).
+
+    Returns:
+        UDQDGSystem with n_modules in a tree configuration (no cycles)
+
+    Raises:
+        ValueError: If n_modules < 1
+    """
+    if n_modules < 1:
+        raise ValueError("n_modules must be at least 1")
+
+    if seed is not None:
+        random.seed(seed)
+
+    system = UDQDGSystem(mode_2d=mode_2d)
+
+    # Define growth directions based on mode
+    if mode_2d:
+        directions = [
+            np.array([1, 0, 0]),   # +X
+            np.array([-1, 0, 0]),  # -X
+            np.array([0, 1, 0]),   # +Y
+            np.array([0, -1, 0]),  # -Y
+        ]
+    else:
+        directions = [
+            np.array([1, 0, 0]),   # +X
+            np.array([-1, 0, 0]),  # -X
+            np.array([0, 1, 0]),   # +Y
+            np.array([0, -1, 0]),  # -Y
+            np.array([0, 0, 1]),   # +Z
+            np.array([0, 0, -1]),  # -Z
+        ]
+
+    # Track occupied positions
+    occupied: Set[Tuple[int, int, int]] = set()
+
+    # Start with first module at origin
+    origin = np.array([0, 0, 0], dtype=float)
+    system.add_module("M0", origin)
+    occupied.add((0, 0, 0))
+
+    # Frontier: list of (position_tuple, parent_module_id)
+    # Using list to support both FIFO (balanced) and random selection
+    frontier: list[Tuple[Tuple[int, int, int], str]] = []
+
+    # Initialize frontier with positions adjacent to origin
+    for direction in directions:
+        pos = tuple(int(x) for x in direction)
+        frontier.append((pos, "M0"))
+
+    # Grow until we have n_modules
+    module_count = 1
+    while module_count < n_modules:
+        if not frontier:
+            break
+
+        # Select from frontier based on mode
+        if balanced:
+            # FIFO selection (BFS-like growth for balanced tree)
+            chosen_pos, parent_id = frontier.pop(0)
+        else:
+            # Random selection (more varied tree shapes)
+            idx = random.randint(0, len(frontier) - 1)
+            chosen_pos, parent_id = frontier.pop(idx)
+
+        # Skip if position is now occupied (could happen with multiple frontier entries)
+        if chosen_pos in occupied:
+            continue
+
+        # Create new module
+        module_id = f"M{module_count}"
+        position = np.array(chosen_pos, dtype=float)
+        system.add_module(module_id, position)
+        occupied.add(chosen_pos)
+
+        # Connect to exactly ONE parent (tree property)
+        system.connect_modules(parent_id, module_id)
+
+        # Add new frontier positions (child candidates for this module)
+        for direction in directions:
+            new_pos = tuple(int(chosen_pos[i] + direction[i]) for i in range(3))
+            if new_pos not in occupied:
+                frontier.append((new_pos, module_id))
+
+        module_count += 1
+
+    return system
