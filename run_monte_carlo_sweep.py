@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 
-from src.monte_carlo import run_parameter_sweep
+from src.monte_carlo import run_parameter_sweep, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE
 
 
 def main():
@@ -65,10 +65,30 @@ def main():
     parser.add_argument(
         "--fully-connected", action="store_true",
         help="Connect new modules to ALL adjacent modules (more branches, fewer moves). "
-             "Default: connect to only ONE adjacent module (chain-like, more moves)."
+             "This is now the default behavior."
+    )
+    parser.add_argument(
+        "--chain-like", action="store_true",
+        help="Connect new modules to only ONE adjacent module (chain-like, more moves). "
+             "Overrides the default fully-connected behavior."
+    )
+    parser.add_argument(
+        "--tree", action="store_true",
+        help="Use tree-based configuration generation (no cycles, each module has one parent)."
+    )
+    parser.add_argument(
+        "--dynamic-faults", action="store_true",
+        help="Use dynamic fault count: faults = floor(n/10) for each n. "
+             "Ignores --faults when enabled."
     )
 
     args = parser.parse_args()
+
+    # Determine fully_connected setting (default is True now)
+    fully_connected = not args.chain_like
+
+    # Determine config mode
+    config_mode = CONFIG_MODE_TREE if args.tree else CONFIG_MODE_RANDOM
 
     # Generate timestamp and create timestamped output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -80,26 +100,40 @@ def main():
         "timestamp": timestamp,
         "n_min": args.n_min,
         "n_max": args.n_max,
-        "n_faults": args.faults,
+        "n_faults": args.faults if not args.dynamic_faults else "dynamic (n/10)",
+        "dynamic_faults": args.dynamic_faults,
         "n_trials": args.trials,
         "seed": args.seed,
         "mode_2d": args.mode_2d,
-        "fully_connected": args.fully_connected,
+        "fully_connected": fully_connected,
+        "config_mode": config_mode,
     }
     with open(os.path.join(output_dir, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
 
+    # Determine connectivity description
+    if config_mode == CONFIG_MODE_TREE:
+        connectivity_desc = "tree (no cycles)"
+    elif fully_connected:
+        connectivity_desc = "fully-connected (default)"
+    else:
+        connectivity_desc = "chain-like"
+
     print("=" * 70)
     print("MONTE CARLO SIMULATION SWEEP")
     print("=" * 70)
-    print(f"Parameters:")
+    print("Parameters:")
     print(f"  Module range: n = {args.n_min} to {args.n_max}")
-    print(f"  Faults per trial: f = {args.faults}")
+    if args.dynamic_faults:
+        print(f"  Faults per trial: f = floor(n/10) [dynamic]")
+    else:
+        print(f"  Faults per trial: f = {args.faults}")
     print(f"  Trials per config: {args.trials}")
     print(f"  Random seed: {args.seed}")
     print(f"  Output directory: {output_dir}")
     print(f"  Mode: {'2D' if args.mode_2d else '3D'}")
-    print(f"  Connectivity: {'fully-connected (more branches)' if args.fully_connected else 'chain-like (default)'}")
+    print(f"  Config type: {config_mode}")
+    print(f"  Connectivity: {connectivity_desc}")
     print("=" * 70)
     print()
 
@@ -115,19 +149,30 @@ def main():
         n_trials=args.trials,
         seed=args.seed,
         mode_2d=args.mode_2d,
-        fully_connected=args.fully_connected,
-        verbose=True
+        fully_connected=fully_connected,
+        verbose=True,
+        config_mode=config_mode,
+        dynamic_faults=args.dynamic_faults
     )
 
     print("\nSweep complete! Saving results...")
 
-    # Extract data
-    n_values = sorted([n for (n, f) in sweep_results.keys()])
-    reconnection_rates = [sweep_results[(n, args.faults)].reconnection_rate for n in n_values]
-    total_diffs_mean = [sweep_results[(n, args.faults)].mean_total_difference for n in n_values]
-    total_diffs_std = [sweep_results[(n, args.faults)].std_total_difference for n in n_values]
-    missing_mean = [sweep_results[(n, args.faults)].mean_missing_portions for n in n_values]
-    missing_std = [sweep_results[(n, args.faults)].std_missing_portions for n in n_values]
+    # Extract data - handle both fixed and dynamic faults
+    n_values = sorted(set(n for (n, f) in sweep_results.keys()))
+
+    # Build lookup for results (handles dynamic faults where f varies with n)
+    def get_result(n):
+        """Get result for n, finding the matching (n, f) key."""
+        for (n_key, f_key), res in sweep_results.items():
+            if n_key == n:
+                return res
+        return None
+
+    reconnection_rates = [get_result(n).reconnection_rate for n in n_values]
+    total_diffs_mean = [get_result(n).mean_total_difference for n in n_values]
+    total_diffs_std = [get_result(n).std_total_difference for n in n_values]
+    missing_mean = [get_result(n).mean_missing_portions for n in n_values]
+    missing_std = [get_result(n).std_missing_portions for n in n_values]
 
     # Save aggregated results to CSV
     csv_filename = os.path.join(output_dir, "sweep_summary.csv")
@@ -141,7 +186,7 @@ def main():
             'mean_phase1_moves', 'mean_phase2_moves'
         ])
         for n in n_values:
-            res = sweep_results[(n, args.faults)]
+            res = get_result(n)
             writer.writerow([
                 res.n_modules, res.n_faults, res.n_trials, res.n_meaningful_trials,
                 f'{res.mean_total_difference:.6f}', f'{res.std_total_difference:.6f}',
@@ -161,7 +206,7 @@ def main():
             'total_difference', 'missing_portions'
         ])
         for n in n_values:
-            res = sweep_results[(n, args.faults)]
+            res = get_result(n)
             for trial in res.trials:
                 writer.writerow([
                     trial.trial_id, trial.n_modules, trial.n_faults, trial.seed,
@@ -177,18 +222,19 @@ def main():
             n_values, reconnection_rates,
             total_diffs_mean, total_diffs_std,
             missing_mean, missing_std,
-            args, output_dir
+            args, output_dir,
+            dynamic_faults=args.dynamic_faults
         )
 
     # Print summary table
-    print_summary_table(n_values, sweep_results, args.faults)
+    print_summary_table(n_values, sweep_results, args.faults, args.dynamic_faults, get_result)
 
     print(f"\nTotal trials run: {total_trials:,}")
     print(f"All results saved to: {output_dir}/")
 
 
 def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_std,
-                    missing_mean, missing_std, args, output_dir):
+                    missing_mean, missing_std, args, output_dir, dynamic_faults=False):
     """Generate and save visualization graphs."""
 
     # Smooth the data
@@ -199,10 +245,16 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
 
     x_max = max(n_values) + 5
 
+    # Determine fault description for titles
+    if dynamic_faults:
+        fault_desc = "f=n/10"
+    else:
+        fault_desc = f"f={args.faults}"
+
     # Create combined figure with 3 subplots
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(
-        f'Monte Carlo Simulation Results (f={args.faults} fault, {args.trials} trials per n)',
+        f'Monte Carlo Simulation Results ({fault_desc} faults, {args.trials} trials per n)',
         fontsize=14, fontweight='bold'
     )
 
@@ -278,7 +330,7 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
         ax.set_ylabel(metric_name.replace('_', ' ').title(), fontsize=13)
         ax.set_title(
             f'{metric_name.replace("_", " ").title()} vs Structure Size\n'
-            f'(f={args.faults} fault, {args.trials} trials per n)',
+            f'({fault_desc} faults, {args.trials} trials per n)',
             fontsize=14
         )
         ax.set_xlim(0, x_max)
@@ -296,25 +348,31 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
     plt.close('all')
 
 
-def print_summary_table(n_values, sweep_results, n_faults):
+def print_summary_table(n_values, sweep_results, n_faults, dynamic_faults=False, get_result=None):
     """Print a summary table of results."""
-    print("\n" + "=" * 100)
-    print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f={n_faults})")
-    print("=" * 100)
-    print(f"{'n':>4} {'Meaningful':>10} {'Reconn%':>8} {'TotalDiff (mean±std)':>22} {'Missing (mean±std)':>22}")
-    print("-" * 100)
+    print("\n" + "=" * 110)
+    if dynamic_faults:
+        print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f=n/10 dynamic)")
+    else:
+        print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f={n_faults})")
+    print("=" * 110)
+    print(f"{'n':>4} {'f':>3} {'Meaningful':>10} {'Reconn%':>8} {'TotalDiff (mean±std)':>22} {'Missing (mean±std)':>22}")
+    print("-" * 110)
 
     # Print every 5th value (or adjust based on range)
     step = max(1, len(n_values) // 20)
     for i, n in enumerate(n_values):
         if i % step == 0 or n == n_values[-1]:
-            res = sweep_results[(n, n_faults)]
+            if get_result:
+                res = get_result(n)
+            else:
+                res = sweep_results[(n, n_faults)]
             print(
-                f"{n:>4} {res.n_meaningful_trials:>10} {res.reconnection_rate*100:>7.1f}% "
+                f"{n:>4} {res.n_faults:>3} {res.n_meaningful_trials:>10} {res.reconnection_rate*100:>7.1f}% "
                 f"{res.mean_total_difference:>10.4f} ± {res.std_total_difference:<8.4f} "
                 f"{res.mean_missing_portions:>10.4f} ± {res.std_missing_portions:<8.4f}"
             )
-    print("=" * 100)
+    print("=" * 110)
 
 
 if __name__ == "__main__":
