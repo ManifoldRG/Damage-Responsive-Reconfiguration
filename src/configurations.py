@@ -541,7 +541,7 @@ def create_random_configuration(
     n_modules: int,
     seed: Optional[int] = None,
     mode_2d: bool = False,
-    fully_connected: bool = False
+    fully_connected: bool = True
 ) -> UDQDGSystem:
     """
     Create a random connected structure using random walk growth.
@@ -550,15 +550,15 @@ def create_random_configuration(
     1. Start with a single module at the origin
     2. Maintain a frontier of unoccupied adjacent positions
     3. Randomly select from frontier and add modules until n_modules reached
-    4. Connect new modules to ONE adjacent module (chain-like, default)
-       OR all adjacent modules (fully connected, if fully_connected=True)
+    4. Connect new modules to ALL adjacent modules (fully connected, default)
+       OR only one adjacent module (chain-like, if fully_connected=False)
 
     Args:
         n_modules: Number of modules to create (must be >= 1)
         seed: Random seed for reproducibility
         mode_2d: If True, only grow in XY plane (Z=0)
-        fully_connected: If True, connect to all adjacent modules (more branches).
-                        If False (default), connect to only one adjacent module
+        fully_connected: If True (default), connect to all adjacent modules (more branches).
+                        If False, connect to only one adjacent module
                         (more chain-like, requires more moves to restore).
 
     Returns:
