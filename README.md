@@ -1,7 +1,7 @@
 # Damage-Responsive Reconfiguration
 > **Project Type:** Research
 
-![An example gif from the simulation framework](gifs/ego_dual_star_3.gif)
+![An example gif from the simulation framework](gifs/full_damage_response_dual_star.gif)
 
 ## About • Goal • Vision
 Implementation of a Unit Dual Quaternion Directed Graph (UDQDG) framework for modular spacecraft reconfiguration. The system models modular structures as spherical modules connected by pure translation transformations, enabling damage-responsive reconfiguration through pivot operations.
@@ -9,17 +9,6 @@ Implementation of a Unit Dual Quaternion Directed Graph (UDQDG) framework for mo
 **Goal:** Develop algorithms to restore connectivity in modular systems after damage events through minimal pivot sequences.
 
 **Vision:** Provide a mathematical foundation and computational framework for autonomous reconfiguration of modular spacecraft and robotic systems.
-
-## Project Roadmap
-- Phase 1: Core UDQDG framework with dual quaternion mathematics
-- Phase 2: PyVista-based 3D visualization with interactive pivot animations
-- Phase 3: Reconfiguration algorithms for connectivity restoration
-- Phase 4: Optimization and path planning for minimal pivot sequences
-
-## Updates
-Recent significant changes:
-- 2025-10-04: Implemented corner and lateral pivot operations with validation
-- 2025-10-04: Added interactive visualization with PyVista and GIF export capabilities
 
 ## Getting Started
 
@@ -66,12 +55,14 @@ Key directories explained:
 ├── src/                # Core Python package
 │   ├── dual_quaternion.py    # Unit dual quaternion mathematics
 │   ├── udqdg_system.py       # UDQDG system and pivot operations
-│   ├── configurations.py     # Pre-defined test configurations
+│   ├── configurations.py     # Pre-defined and random test configurations
+│   ├── monte_carlo.py        # Monte Carlo simulation framework
 │   └── visualizer.py         # PyVista 3D visualization
 ├── examples/           # Demonstration scripts
 │   └── visualize_pivots.py   # Interactive demos and GIF export
+├── run_monte_carlo_sweep.py  # CLI for running Monte Carlo simulations
 ├── gifs/               # Exported animation files
-└── test_results/       # Test outputs and validation data
+└── monte_carlo_results/      # Simulation output data and graphs
 ```
 
 ## Core Components
@@ -92,13 +83,25 @@ The `udqdg_system.py` module provides:
 - Port exclusivity: each module face supports at most one connection
 
 ### Configuration Library
-The `configurations.py` module includes pre-built test configurations:
+The `configurations.py` module includes pre-built and random test configurations:
+
+**Predefined Structures:**
 - Star: central module with 6 radial arms
 - Tree: hierarchical branching structure
 - Line: straight sequence along specified axis
 - Cross: 3D plus shape with XY plane and Z extension
 - Helix: spiral staircase configuration
 - L-shape: simple L configuration for testing corner pivots
+- Grid: 3D cubic grid configuration
+- Lattice Plane: 2D flat grid in XY plane
+- Ring: loop/square ring structure
+- Snake: winding path through 3D space
+- T-shape: T-shaped structure with central junction
+- Dual Star Bridge: two stars connected by a bridge
+
+**Random Generators (for Monte Carlo):**
+- `create_random_configuration`: random walk growth with configurable connectivity (fully-connected or chain-like)
+- `create_random_tree_configuration`: random spanning tree (no cycles, n-1 edges)
 
 ### Interactive Visualizer
 The `visualizer.py` module provides PyVista-based 3D visualization:
@@ -120,7 +123,7 @@ The `examples/visualize_pivots.py` script offers:
 - `general`: Comprehensive demonstration of all pivot types and directions
 
 **Interactive Configurations:**
-- `star`, `tree`, `line`, `cross`, `helix`, `l_shape`: explore predefined configurations
+- `star`, `tree`, `line`, `cross`, `helix`, `l_shape`, `grid`, `ring`, `snake`, `t_shape`: explore predefined configurations
 
 **Creating Custom Animations:**
 ```python
@@ -239,6 +242,136 @@ viz.plotter.close()
 - Configurable pause durations between operations
 - Initial and final configuration pauses for clarity
 
+## Monte Carlo Simulation
+
+The framework includes a Monte Carlo simulation system for evaluating damage response algorithms across varying structure sizes and fault conditions.
+
+### Running Simulations
+
+```bash
+# Basic sweep: n=5-50 modules, 1 fault, 100 trials each
+uv run python run_monte_carlo_sweep.py
+
+# Custom range with more trials
+uv run python run_monte_carlo_sweep.py --n-min 10 --n-max 100 --trials 500
+
+# Dynamic faults: f = floor(n/10)
+uv run python run_monte_carlo_sweep.py --dynamic-faults
+
+# Tree-based configurations
+uv run python run_monte_carlo_sweep.py --tree
+```
+
+### Random Configuration Generation
+
+The simulation supports two methods for generating random test configurations:
+
+#### Fully-Connected (Default)
+```bash
+uv run python run_monte_carlo_sweep.py  # default behavior
+```
+
+**Algorithm:**
+1. Start with a single module at the origin
+2. Maintain a frontier of unoccupied adjacent positions
+3. Randomly select from frontier and add new modules
+4. Connect new modules to **all** adjacent existing modules
+
+**Characteristics:**
+- Creates dense, highly-connected structures
+- Multiple redundant paths between modules
+- More resilient to single faults (fewer cause disconnection)
+- Fewer "meaningful" trials where faults actually disconnect the structure
+
+#### Tree-Based (`--tree`)
+```bash
+uv run python run_monte_carlo_sweep.py --tree
+```
+
+**Algorithm:**
+1. Start with a single module at the origin
+2. Maintain a frontier of (position, parent) pairs
+3. Randomly select from frontier and add new modules
+4. Connect each new module to **exactly one** parent (tree property)
+
+**Characteristics:**
+- Creates spanning tree structures with no cycles
+- Exactly n-1 edges for n modules
+- Every fault causes disconnection (100% meaningful trials)
+- Lower restoration error due to simpler topology
+
+#### Chain-Like (`--chain-like`)
+```bash
+uv run python run_monte_carlo_sweep.py --chain-like
+```
+
+**Algorithm:**
+- Same as fully-connected but connects to only **one** random adjacent module
+- Creates more linear, chain-like structures
+- Requires more moves to restore after damage
+
+### Fault Injection Modes
+
+#### Fixed Faults (Default)
+```bash
+uv run python run_monte_carlo_sweep.py --faults 3  # Always inject 3 faults
+```
+Injects a constant number of faults regardless of structure size.
+
+#### Dynamic Faults (`--dynamic-faults`)
+```bash
+uv run python run_monte_carlo_sweep.py --dynamic-faults
+```
+Fault count scales with structure size: **f = floor(n/10)**
+
+| Modules (n) | Faults (f) |
+|-------------|------------|
+| 10-19 | 1 |
+| 20-29 | 2 |
+| 30-39 | 3 |
+| ... | ... |
+| 100 | 10 |
+
+This mode tests how the algorithm handles proportionally increasing damage.
+
+### Output Files
+
+Results are saved to timestamped directories:
+```
+monte_carlo_results/
+└── 20260119_113254/
+    ├── config.json              # Simulation parameters
+    ├── sweep_summary.csv        # Aggregated results per (n, f)
+    ├── trials.csv               # Individual trial data
+    ├── graphs_combined.png      # All 3 metrics in one figure
+    ├── graph_reconnection_rate.png
+    ├── graph_total_difference.png
+    └── graph_missing_portions.png
+```
+
+### Metrics
+
+- **Reconnection Rate**: Percentage of meaningful trials where the structure was successfully reconnected
+- **Total Difference**: Symmetric difference between original and final positions, normalized by n
+- **Missing Portions**: Positions that existed originally but are missing after restoration, normalized by n
+
+### CLI Options Reference
+
+| Option | Description |
+|--------|-------------|
+| `--n-min N` | Minimum modules (default: 5) |
+| `--n-max N` | Maximum modules (default: 50) |
+| `--faults F` | Fixed fault count (default: 1) |
+| `--trials T` | Trials per configuration (default: 100) |
+| `--seed S` | Random seed (default: 42) |
+| `--output-dir DIR` | Output directory |
+| `--no-graphs` | Skip graph generation |
+| `--mode-2d` | Use 2D mode (XY plane only) |
+| `--fully-connected` | Connect to all neighbors (default) |
+| `--chain-like` | Connect to one neighbor only |
+| `--tree` | Use tree-based generation |
+| `--dynamic-faults` | Use f=floor(n/10) |
+
 ## Problem Formulation
 The mathematical framework is detailed in `docs/problem_statement.md` covering:
 - Unit Dual Quaternion Directed Graph representation
@@ -251,7 +384,7 @@ The mathematical framework is detailed in `docs/problem_statement.md` covering:
 Known limitations and planned work:
 - Lateral pivot edge connections require validation after pivot
 - Path planning algorithms for optimal pivot sequences not yet implemented
-- Damage-responsive reconfiguration algorithms in development
+- Position restoration (Phase 2) algorithm optimization ongoing
 
 ## Extending to Cubic Modules
 
