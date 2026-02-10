@@ -876,7 +876,8 @@ def export_full_damage_response_gif(
     config_func,
     config_kwargs: dict,
     fault_module: str,
-    output_path: str = None
+    output_path: str = None,
+    rotate_camera: bool = True
 ):
     """
     Export a full damage response animation (Phase 1 + Phase 2) as a GIF.
@@ -886,6 +887,7 @@ def export_full_damage_response_gif(
         config_kwargs: Keyword arguments for the configuration function
         fault_module: ID of the module to fault
         output_path: Output file path (defaults to gifs/full_damage_response.gif)
+        rotate_camera: If True, slowly rotate camera during animation. If False, keep fixed.
     """
     import os
 
@@ -963,8 +965,8 @@ def export_full_damage_response_gif(
     frame_counter = 0
     initial_azimuth = viz.plotter.camera.azimuth
     initial_elevation = viz.plotter.camera.elevation
-    total_rotation_azimuth = 120.0  # More rotation for full response
-    total_rotation_elevation = 30.0
+    total_rotation_azimuth = 120.0 if rotate_camera else 0.0
+    total_rotation_elevation = 30.0 if rotate_camera else 0.0
 
     # ========== ADD GHOST MARKERS FOR ALL DISPLACED MODULES ==========
     # Show ghost markers at original positions before Phase 1 starts
@@ -1202,13 +1204,14 @@ def _export_restoration_pivot(viz, pivot_module, param1, param2, pivot_type, n_f
     viz.plotter.write_frame()
 
 
-def export_demo_gif(demo_name: str, output_path: str = None):
+def export_demo_gif(demo_name: str, output_path: str = None, rotate_camera: bool = True):
     """
     Export a demo animation as a GIF.
 
     Args:
         demo_name: Name of demo ('corner', 'lateral', 'spiral', 'parallel', 'general')
         output_path: Optional custom output path. Defaults to 'output/{demo_name}.gif'
+        rotate_camera: If True, slowly rotate camera during animation. If False, keep fixed.
     """
     import os
 
@@ -1483,12 +1486,14 @@ def export_demo_gif(demo_name: str, output_path: str = None):
     elif demo_name == 'full':
         # Full damage response (Phase 1 + Phase 2) - star size=2
         return export_full_damage_response_gif(
-            create_star_configuration, {'size': 2}, 'C', output_path
+            create_star_configuration, {'size': 2}, 'C', output_path,
+            rotate_camera=rotate_camera
         )
     elif demo_name == 'full-large':
         # Full damage response - large star size=3
         return export_full_damage_response_gif(
-            create_star_configuration, {'size': 3}, 'C', output_path
+            create_star_configuration, {'size': 3}, 'C', output_path,
+            rotate_camera=rotate_camera
         )
     elif demo_name == 'full-dual-star':
         # Full damage response - dual star bridge
@@ -1498,7 +1503,8 @@ def export_demo_gif(demo_name: str, output_path: str = None):
             create_dual_star_bridge_configuration,
             {'star_size': 3, 'bridge_length': bridge_length},
             center_module,
-            output_path
+            output_path,
+            rotate_camera=rotate_camera
         )
     else:
         print(f"Unknown demo: {demo_name}")
@@ -2332,13 +2338,16 @@ def main():
         elif command == 'full-dual-star':
             demo_full_dual_star()
         elif command == 'export':
-            # Export mode: python examples/visualize_pivots.py export <demo_name> [output_path]
+            # Export mode: python examples/visualize_pivots.py export <demo_name> [output_path] [--no-rotate]
             if len(sys.argv) > 2:
                 demo_name = sys.argv[2].lower()
-                output_path = sys.argv[3] if len(sys.argv) > 3 else None
-                export_demo_gif(demo_name, output_path)
+                remaining_args = sys.argv[3:]
+                no_rotate = '--no-rotate' in remaining_args
+                positional = [a for a in remaining_args if not a.startswith('--')]
+                output_path = positional[0] if positional else None
+                export_demo_gif(demo_name, output_path, rotate_camera=not no_rotate)
             else:
-                print("Usage: python examples/visualize_pivots.py export <demo_name> [output_path]")
+                print("Usage: python examples/visualize_pivots.py export <demo_name> [output_path] [--no-rotate]")
                 print("Available demos: corner, lateral, spiral, parallel, general, ego, ego-large, ego-t, ego-cross, ego-line, ego-grid, ego-ring")
         else:
             # Interactive mode with specified configuration
