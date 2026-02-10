@@ -14,6 +14,8 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 try:
     from .configurations import create_random_configuration, create_random_tree_configuration
@@ -245,7 +247,8 @@ def run_monte_carlo(
     mode_2d: bool = False,
     fully_connected: bool = True,
     verbose: bool = False,
-    config_mode: str = CONFIG_MODE_RANDOM
+    config_mode: str = CONFIG_MODE_RANDOM,
+    n_jobs: int = 1
 ) -> MonteCarloResults:
     """
     Run Monte Carlo simulation with given parameters.
@@ -260,6 +263,7 @@ def run_monte_carlo(
                         If False, connect to only one (chain-like). Only for 'random' mode.
         verbose: If True, print progress
         config_mode: Configuration generation mode ('random' or 'tree')
+        n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
 
     Returns:
         MonteCarloResults with aggregated statistics
@@ -267,23 +271,24 @@ def run_monte_carlo(
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
 
-    trials: List[TrialResult] = []
+    trial_args = [
+        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode)
+        for i in range(n_trials)
+    ]
 
-    for i in range(n_trials):
-        trial_seed = seed + i
-        if verbose and i % 10 == 0:
-            print(f"Running trial {i}/{n_trials}...")
-
-        result = run_single_trial(
-            n_modules=n_modules,
-            n_faults=n_faults,
-            seed=trial_seed,
-            trial_id=i,
-            mode_2d=mode_2d,
-            fully_connected=fully_connected,
-            config_mode=config_mode
+    if n_jobs == 1:
+        # Sequential execution
+        trials: List[TrialResult] = []
+        iterator = tqdm(trial_args, desc=f"n={n_modules}", disable=not verbose)
+        for args in iterator:
+            result = run_single_trial(*args)
+            trials.append(result)
+    else:
+        # Parallel execution
+        trials = Parallel(n_jobs=n_jobs)(
+            delayed(run_single_trial)(*args)
+            for args in tqdm(trial_args, desc=f"n={n_modules}", disable=not verbose)
         )
-        trials.append(result)
 
     # Filter out trials where fault didn't cause disconnection (phase1_moves = 0)
     # These are not meaningful tests of the reconnection algorithm
@@ -354,7 +359,8 @@ def run_parameter_sweep(
     fully_connected: bool = True,
     verbose: bool = False,
     config_mode: str = CONFIG_MODE_RANDOM,
-    dynamic_faults: bool = False
+    dynamic_faults: bool = False,
+    n_jobs: int = 1
 ) -> Dict[Tuple[int, int], MonteCarloResults]:
     """
     Run Monte Carlo simulations across parameter ranges.
@@ -370,6 +376,7 @@ def run_parameter_sweep(
         verbose: If True, print progress
         config_mode: Configuration generation mode ('random' or 'tree')
         dynamic_faults: If True, faults = floor(n/10) for each n (ignores f_range)
+        n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
 
     Returns:
         Dictionary mapping (n, f) tuples to MonteCarloResults
@@ -380,12 +387,14 @@ def run_parameter_sweep(
     results: Dict[Tuple[int, int], MonteCarloResults] = {}
     config_seed = seed
 
-    for n in range(n_range[0], n_range[1] + 1):
+    n_values = list(range(n_range[0], n_range[1] + 1))
+    n_iterator = tqdm(n_values, desc="Parameter sweep", disable=not verbose)
+
+    for n in n_iterator:
         if dynamic_faults:
             # Dynamic faults: f = floor(n/10), minimum 1
             f = max(1, n // 10)
-            if verbose:
-                print(f"Running configuration (n={n}, f={f} [dynamic])...")
+            n_iterator.set_postfix(n=n, f=f)
 
             result = run_monte_carlo(
                 n_modules=n,
@@ -395,14 +404,14 @@ def run_parameter_sweep(
                 mode_2d=mode_2d,
                 fully_connected=fully_connected,
                 verbose=False,
-                config_mode=config_mode
+                config_mode=config_mode,
+                n_jobs=n_jobs
             )
             results[(n, f)] = result
             config_seed += n_trials
         else:
             for f in range(f_range[0], min(f_range[1] + 1, n)):  # f < n
-                if verbose:
-                    print(f"Running configuration (n={n}, f={f})...")
+                n_iterator.set_postfix(n=n, f=f)
 
                 result = run_monte_carlo(
                     n_modules=n,
@@ -412,7 +421,8 @@ def run_parameter_sweep(
                     mode_2d=mode_2d,
                     fully_connected=fully_connected,
                     verbose=False,
-                    config_mode=config_mode
+                    config_mode=config_mode,
+                    n_jobs=n_jobs
                 )
                 results[(n, f)] = result
                 config_seed += n_trials

@@ -81,6 +81,10 @@ def main():
         help="Use dynamic fault count: faults = floor(n/10) for each n. "
              "Ignores --faults when enabled."
     )
+    parser.add_argument(
+        "--jobs", "-j", type=int, default=-1,
+        help="Number of parallel jobs (-1 for all cores, 1 for sequential). Default: -1"
+    )
 
     args = parser.parse_args()
 
@@ -107,6 +111,7 @@ def main():
         "mode_2d": args.mode_2d,
         "fully_connected": fully_connected,
         "config_mode": config_mode,
+        "n_jobs": args.jobs,
     }
     with open(os.path.join(output_dir, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
@@ -134,6 +139,7 @@ def main():
     print(f"  Mode: {'2D' if args.mode_2d else '3D'}")
     print(f"  Config type: {config_mode}")
     print(f"  Connectivity: {connectivity_desc}")
+    print(f"  Parallel jobs: {args.jobs} {'(all cores)' if args.jobs == -1 else ''}")
     print("=" * 70)
     print()
 
@@ -152,7 +158,8 @@ def main():
         fully_connected=fully_connected,
         verbose=True,
         config_mode=config_mode,
-        dynamic_faults=args.dynamic_faults
+        dynamic_faults=args.dynamic_faults,
+        n_jobs=args.jobs
     )
 
     print("\nSweep complete! Saving results...")
