@@ -17,5 +17,6 @@ dependencies = [
     "pyprojroot>=0.3.0",
     "pyvista>=0.46.3",
     "scipy>=1.17.0",
+    "statsmodels>=0.14.6",
     "tqdm>=4.67.3",
 ]
