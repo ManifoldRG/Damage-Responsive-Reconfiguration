@@ -5,9 +5,7 @@ from .udqdg_system import (
     UDQDGSystem,
     SphericalModule,
     PivotStep,
-    MovementHistory,
     RestorationStep,
-    RestorationMetrics,
 )
 
 # Optional visualization imports (Manim-based, may not be available)
@@ -45,9 +43,7 @@ __all__ = [
     "UDQDGSystem",
     "SphericalModule",
     "PivotStep",
-    "MovementHistory",
     "RestorationStep",
-    "RestorationMetrics",
 ]
 
 # Add visualization exports if available
