@@ -97,7 +97,10 @@ def calculate_similarity_metrics(
     faulty_modules: Set[str]
 ) -> Tuple[float, float]:
     """
-    Calculate similarity metrics between original and final positions.
+    Calculate shape similarity using pairwise inter-module distances.
+
+    Per the paper's metric: diff(P, Q) = (|P| - |P ∩ Q|) / |P|
+    where P and Q are multisets of pairwise distances before/after damage.
 
     Args:
         original_positions: Positions of ALL modules before fault
@@ -105,30 +108,37 @@ def calculate_similarity_metrics(
         faulty_modules: Set of module IDs that were marked as faulty
 
     Returns:
-        Tuple of (total_difference, missing_portions):
-        - total_difference: |P_start Δ P_end| / n (symmetric difference)
-        - missing_portions: |P_start - P_end| / n (missing only)
+        Tuple of (total_difference, missing_portions) — both use the same
+        pairwise distance metric diff(P, Q).
     """
-    n = len(original_positions)  # Original total
-    if n == 0:
-        return 0.0, 0.0
-
-    # Get position sets (excluding faulty modules from start)
-    start_positions = {
-        tuple(pos.astype(int)) for mid, pos in original_positions.items()
+    # Build P: pairwise distances of active (non-faulty) modules before damage
+    active_orig = {
+        mid: pos for mid, pos in original_positions.items()
         if mid not in faulty_modules
     }
-    end_positions = {
-        tuple(pos.astype(int)) for pos in final_positions.values()
-    }
 
-    # Metric 1: Symmetric difference (both missing AND excess)
-    symmetric_diff = start_positions.symmetric_difference(end_positions)
-    total_difference = len(symmetric_diff) / n
+    P = set()
+    orig_ids = list(active_orig.keys())
+    for i, u in enumerate(orig_ids):
+        for v in orig_ids[i + 1:]:
+            d = round(float(np.linalg.norm(active_orig[u] - active_orig[v])), 6)
+            P.add(d)
 
-    # Metric 2: Missing only (in start but not in end)
-    missing = start_positions - end_positions
-    missing_portions = len(missing) / n
+    # Build Q: pairwise distances of modules after algorithm
+    Q = set()
+    final_ids = list(final_positions.keys())
+    for i, u in enumerate(final_ids):
+        for v in final_ids[i + 1:]:
+            d = round(float(np.linalg.norm(final_positions[u] - final_positions[v])), 6)
+            Q.add(d)
+
+    if len(P) == 0:
+        return 0.0, 0.0
+
+    # diff(P, Q) = (|P| - |P ∩ Q|) / |P|
+    intersection = P & Q
+    total_difference = (len(P) - len(intersection)) / len(P)
+    missing_portions = total_difference  # Same metric (anchored to P)
 
     return total_difference, missing_portions
 
@@ -194,8 +204,8 @@ def run_single_trial(
         result = system.full_damage_response(
             fault_module_id=fault_id,
             restore_positions=True,
-            max_phase1_iterations=100,
-            max_phase2_iterations=100
+            max_phase1_iterations=1000,
+            max_phase2_iterations=1000
         )
 
         # Accumulate stats
