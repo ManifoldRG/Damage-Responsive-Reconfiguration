@@ -430,13 +430,15 @@ class UDQDGSystem:
 
     def is_movable(self, module_id: str) -> bool:
         """
-        2-hop criticality test per paper Section III-C.
+        2-hop criticality test per paper Section III-C (universal variant).
 
         u is movable if:
-        - Leaf: |N̄_t(u)| = 1
-        - Or: one of u's neighbor's 2-hop neighbors overlaps with another
-          of u's neighbors. Equivalently:
-          exists v in N_t(u) such that N_t_2hop(u) minus {u,v} intersects N_t(v)
+        - Leaf: |N_t(u)| = 1
+        - Or: FOR ALL v in N_t(u), a 2-hop neighbor of u reachable
+          WITHOUT going through v is also a neighbor of v. This detects
+          2x2 lattice squares (local alternative paths) for every neighbor,
+          equivalent to the 3-hop path reachability test. The universal
+          quantifier guarantees no neighbor is stranded by u's departure.
         """
         if module_id not in self.modules:
             return False
@@ -450,21 +452,22 @@ class UDQDGSystem:
         if len(neighbors) == 1:
             return True  # leaf
 
-        # Compute N̄_t^{(2)}(u) excluding u: all active modules within 2 hops
-        two_hop = set()
-        for w in neighbors:
-            for x in self.get_active_neighbors(w):
-                if x != module_id:
-                    two_hop.add(x)
-
-        # Check condition: ∃ v ∈ N̄(u) s.t. (two_hop \ {v}) ∩ N̄(v) ≠ ∅
+        # For each neighbor v, compute 2-hop neighbors of u through paths
+        # that do NOT go through v, then check intersection with N(v).
+        # ALL neighbors must have an alternative path (universal quantifier).
         for v in neighbors:
-            remaining = two_hop - {v}
+            two_hop_without_v = set()
+            for w in neighbors:
+                if w == v:
+                    continue  # skip paths through v
+                for x in self.get_active_neighbors(w):
+                    if x != module_id and x != v:
+                        two_hop_without_v.add(x)
             v_neighbors = set(self.get_active_neighbors(v))
-            if remaining & v_neighbors:
-                return True
+            if not (two_hop_without_v & v_neighbors):
+                return False  # this neighbor has no alternative path
 
-        return False
+        return True
 
     def get_all_admissible_pivots(
         self,
@@ -791,16 +794,6 @@ class UDQDGSystem:
 
                 # Collision check: skip if destination already occupied
                 if self._position_is_occupied(dest_pos, exclude_module=u):
-                    continue
-
-                # Stranding prevention: skip if move would isolate a leaf neighbor
-                would_strand = False
-                for n in self.get_active_neighbors(u):
-                    n_nbrs = self.get_active_neighbors(n)
-                    if len(n_nbrs) == 1 and n_nbrs[0] == u:
-                        would_strand = True
-                        break
-                if would_strand:
                     continue
 
                 pivot_type, mid, param1, param2, delta_p = pivot
