@@ -50,7 +50,7 @@ LINESTYLES = {
 LOWESS_FRAC = {
     'FC Single': 0.25,
     'FC Dynamic': 0.3,
-    'Tree Single': 0.25,
+    'Tree Single': 0.4,
     'Tree Dynamic': 0.3,
 }
 
@@ -126,7 +126,7 @@ def load_data(data_paths):
     return data
 
 
-def create_quad_plot(data, metric, ylabel, title, filename, output_dir):
+def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_loc='upper right'):
     """Create a 2x2 quad plot comparing all configurations."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
@@ -139,15 +139,6 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir):
     ]
 
     configs = ['FC Single', 'FC Dynamic', 'Tree Single', 'Tree Dynamic']
-
-    all_vals = []
-    for name in configs:
-        df = data[name]
-        vals = df[metric].dropna()
-        all_vals.extend(vals.tolist())
-
-    y_max = max(all_vals) * 1.1 if all_vals else 1.0
-    y_min = 0
 
     for idx, (ax, config, subplot_title) in enumerate(zip(axes.flat, configs, subplot_titles)):
         df = data[config]
@@ -182,9 +173,9 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir):
         ax.set_xlabel('Number of Modules (n)', fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
         ax.set_xlim(0, 105)
-        ax.set_ylim(y_min, min(y_max, 1.05) if 'rate' in metric else y_max)
+        ax.set_ylim(0, 1.0)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc=legend_loc, fontsize=8)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_dir / filename, dpi=150, bbox_inches='tight')
@@ -221,6 +212,7 @@ def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
     ax.set_xlabel('Number of Modules (n)', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xlim(0, 105)
+    ax.set_ylim(0, 1.0)
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best', fontsize=10)
 
@@ -332,7 +324,7 @@ def main():
     create_quad_plot(
         data, 'reconnection_rate', 'Reconnection Rate',
         'Reconnection Rate Comparison: FC vs Tree, Single vs Dynamic Faults',
-        'quad_reconnection_rate.png', output_dir
+        'quad_reconnection_rate.png', output_dir, legend_loc='lower right'
     )
 
     create_quad_plot(
@@ -351,7 +343,7 @@ def main():
 
     create_overlay_quad_plot(
         data, 'mean_shape_difference', 'Shape Difference',
-        'Shape Difference diff(P, Q): All Configurations',
+        'Shape Difference: All Configurations',
         'overlay_shape_difference.png', output_dir
     )
 

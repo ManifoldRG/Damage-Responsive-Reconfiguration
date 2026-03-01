@@ -3,7 +3,8 @@
 Monte Carlo Simulation Sweep Runner
 
 Runs parameter sweeps for damage response algorithms and generates
-CSV results and visualization graphs.
+CSV results and visualization graphs. Results are saved incrementally
+after each n-value completes, enabling crash recovery via --resume.
 
 Usage:
     python run_monte_carlo_sweep.py [options]
@@ -12,18 +13,80 @@ Examples:
     python run_monte_carlo_sweep.py                          # Default: n=5-50, 100 trials
     python run_monte_carlo_sweep.py --n-max 100 --trials 1000
     python run_monte_carlo_sweep.py --n-min 10 --n-max 30 --trials 500
+    python run_monte_carlo_sweep.py --resume monte_carlo_results/20260301_143000/
 """
 
 import argparse
 import csv
 import json
 import os
+import sys
 from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
+from tqdm import tqdm
 
-from src.monte_carlo import run_parameter_sweep, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE
+from src.monte_carlo import run_monte_carlo, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE
+
+
+SUMMARY_HEADERS = [
+    'n_modules', 'n_faults', 'n_trials', 'n_meaningful_trials',
+    'mean_shape_difference', 'std_shape_difference',
+    'reconnection_rate', 'full_restoration_rate',
+    'mean_phase1_moves', 'mean_phase2_moves'
+]
+
+TRIALS_HEADERS = [
+    'trial_id', 'n_modules', 'n_faults', 'seed',
+    'restored', 'phase1_moves', 'phase2_moves',
+    'shape_difference'
+]
+
+
+def load_completed_n_values(output_dir):
+    """Read sweep_summary.csv and return set of completed n values."""
+    csv_path = os.path.join(output_dir, "sweep_summary.csv")
+    completed = set()
+    if not os.path.exists(csv_path):
+        return completed
+    with open(csv_path, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                completed.add(int(row['n_modules']))
+            except (ValueError, KeyError):
+                continue
+    return completed
+
+
+def load_resume_config(resume_dir):
+    """Load config.json from a previous run directory."""
+    config_path = os.path.join(resume_dir, "config.json")
+    if not os.path.exists(config_path):
+        print(f"Error: No config.json found in {resume_dir}", file=sys.stderr)
+        sys.exit(1)
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+def warn_arg_conflicts(args, config):
+    """Print warnings if non-default CLI args differ from resumed config."""
+    checks = [
+        ('n_min', '--n-min', args.n_min, config['n_min'], 5),
+        ('n_max', '--n-max', args.n_max, config['n_max'], 50),
+        ('n_trials', '--trials', args.trials, config['n_trials'], 100),
+        ('seed', '--seed', args.seed, config['seed'], 42),
+    ]
+    conflicts = []
+    for key, flag, cli_val, cfg_val, default in checks:
+        if cli_val != default and cli_val != cfg_val:
+            conflicts.append(f"  {flag}: CLI={cli_val}, config={cfg_val}")
+    if conflicts:
+        print("Warning: CLI args differ from resumed config (using config values):")
+        for c in conflicts:
+            print(c)
+        print()
 
 
 def main():
@@ -85,36 +148,81 @@ def main():
         "--jobs", "-j", type=int, default=-1,
         help="Number of parallel jobs (-1 for all cores, 1 for sequential). Default: -1"
     )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        metavar="PATH",
+        help="Resume from an existing output directory, skipping n values "
+             "already present in sweep_summary.csv"
+    )
 
     args = parser.parse_args()
 
-    # Determine fully_connected setting (default is True now)
-    fully_connected = not args.chain_like
+    # --- Resume mode: load config from previous run ---
+    if args.resume:
+        resume_dir = args.resume
+        if not os.path.isdir(resume_dir):
+            print(f"Error: Resume directory does not exist: {resume_dir}", file=sys.stderr)
+            sys.exit(1)
 
-    # Determine config mode
-    config_mode = CONFIG_MODE_TREE if args.tree else CONFIG_MODE_RANDOM
+        config = load_resume_config(resume_dir)
+        warn_arg_conflicts(args, config)
 
-    # Generate timestamp and create timestamped output directory
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(args.output_dir, timestamp)
-    os.makedirs(output_dir, exist_ok=True)
+        n_min = config['n_min']
+        n_max = config['n_max']
+        n_trials = config['n_trials']
+        base_seed = config['seed']
+        mode_2d = config.get('mode_2d', False)
+        fully_connected = config.get('fully_connected', True)
+        config_mode = config.get('config_mode', CONFIG_MODE_RANDOM)
+        dynamic_faults = config.get('dynamic_faults', False)
+        n_faults_cfg = config.get('n_faults', 1)
+        n_faults = n_faults_cfg if isinstance(n_faults_cfg, int) else 1
+        n_jobs = config.get('n_jobs', -1)
+        output_dir = resume_dir
 
-    # Save configuration for reproducibility
-    config = {
-        "timestamp": timestamp,
-        "n_min": args.n_min,
-        "n_max": args.n_max,
-        "n_faults": args.faults if not args.dynamic_faults else "dynamic (n/10)",
-        "dynamic_faults": args.dynamic_faults,
-        "n_trials": args.trials,
-        "seed": args.seed,
-        "mode_2d": args.mode_2d,
-        "fully_connected": fully_connected,
-        "config_mode": config_mode,
-        "n_jobs": args.jobs,
-    }
-    with open(os.path.join(output_dir, "config.json"), 'w') as f:
-        json.dump(config, f, indent=2)
+        completed = load_completed_n_values(output_dir)
+        print(f"Resuming from: {output_dir}")
+        if completed:
+            sorted_done = sorted(completed)
+            preview = sorted_done[:5]
+            suffix = f"...{sorted_done[-1]}" if len(sorted_done) > 5 else ""
+            print(f"Already completed: {len(completed)} n-values "
+                  f"({', '.join(map(str, preview))}{suffix})")
+        print()
+    else:
+        # --- Fresh run ---
+        n_min = args.n_min
+        n_max = args.n_max
+        n_trials = args.trials
+        base_seed = args.seed
+        mode_2d = args.mode_2d
+        fully_connected = not args.chain_like
+        config_mode = CONFIG_MODE_TREE if args.tree else CONFIG_MODE_RANDOM
+        dynamic_faults = args.dynamic_faults
+        n_faults = args.faults
+        n_jobs = args.jobs
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join(args.output_dir, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+
+        config = {
+            "timestamp": timestamp,
+            "n_min": n_min,
+            "n_max": n_max,
+            "n_faults": n_faults if not dynamic_faults else "dynamic (n/10)",
+            "dynamic_faults": dynamic_faults,
+            "n_trials": n_trials,
+            "seed": base_seed,
+            "mode_2d": mode_2d,
+            "fully_connected": fully_connected,
+            "config_mode": config_mode,
+            "n_jobs": n_jobs,
+        }
+        with open(os.path.join(output_dir, "config.json"), 'w') as f:
+            json.dump(config, f, indent=2)
+
+        completed = set()
 
     # Determine connectivity description
     if config_mode == CONFIG_MODE_TREE:
@@ -124,137 +232,196 @@ def main():
     else:
         connectivity_desc = "chain-like"
 
+    no_graphs = args.no_graphs
+    all_n_values = list(range(n_min, n_max + 1))
+    remaining = [n for n in all_n_values if n not in completed]
+
     print("=" * 70)
     print("MONTE CARLO SIMULATION SWEEP")
     print("=" * 70)
     print("Parameters:")
-    print(f"  Module range: n = {args.n_min} to {args.n_max}")
-    if args.dynamic_faults:
+    print(f"  Module range: n = {n_min} to {n_max}")
+    if dynamic_faults:
         print(f"  Faults per trial: f = floor(n/10) [dynamic]")
     else:
-        print(f"  Faults per trial: f = {args.faults}")
-    print(f"  Trials per config: {args.trials}")
-    print(f"  Random seed: {args.seed}")
+        print(f"  Faults per trial: f = {n_faults}")
+    print(f"  Trials per config: {n_trials}")
+    print(f"  Random seed: {base_seed}")
     print(f"  Output directory: {output_dir}")
-    print(f"  Mode: {'2D' if args.mode_2d else '3D'}")
+    print(f"  Mode: {'2D' if mode_2d else '3D'}")
     print(f"  Config type: {config_mode}")
     print(f"  Connectivity: {connectivity_desc}")
-    print(f"  Parallel jobs: {args.jobs} {'(all cores)' if args.jobs == -1 else ''}")
+    print(f"  Parallel jobs: {n_jobs} {'(all cores)' if n_jobs == -1 else ''}")
+    if completed:
+        print(f"  Resuming: {len(completed)}/{len(all_n_values)} n-values already done")
     print("=" * 70)
     print()
 
-    # Run parameter sweep
-    total_configs = args.n_max - args.n_min + 1
-    total_trials = total_configs * args.trials
-    print(f"Running {total_configs} configurations × {args.trials} trials = {total_trials:,} total trials")
+    total_remaining = len(remaining) * n_trials
+    print(f"Running {len(remaining)} configurations x {n_trials} trials = {total_remaining:,} total trials")
+    if completed:
+        print(f"  (skipping {len(completed)} already-completed configurations)")
     print("This may take a while...\n")
 
-    sweep_results = run_parameter_sweep(
-        n_range=(args.n_min, args.n_max),
-        f_range=(args.faults, args.faults),
-        n_trials=args.trials,
-        seed=args.seed,
-        mode_2d=args.mode_2d,
-        fully_connected=fully_connected,
-        verbose=True,
-        config_mode=config_mode,
-        dynamic_faults=args.dynamic_faults,
-        n_jobs=args.jobs
-    )
+    # --- Streaming sweep loop ---
+    if remaining:
+        summary_csv_path = os.path.join(output_dir, "sweep_summary.csv")
+        trials_csv_path = os.path.join(output_dir, "trials.csv")
 
-    print("\nSweep complete! Saving results...")
+        # Append if resuming, write fresh otherwise
+        if completed:
+            summary_mode = 'a'
+            trials_mode = 'a'
+        else:
+            summary_mode = 'w'
+            trials_mode = 'w'
 
-    # Extract data - handle both fixed and dynamic faults
-    n_values = sorted(set(n for (n, f) in sweep_results.keys()))
+        summary_file = open(summary_csv_path, summary_mode, newline='')
+        trials_file = open(trials_csv_path, trials_mode, newline='')
 
-    # Build lookup for results (handles dynamic faults where f varies with n)
-    def get_result(n):
-        """Get result for n, finding the matching (n, f) key."""
-        for (n_key, f_key), res in sweep_results.items():
-            if n_key == n:
-                return res
-        return None
+        try:
+            summary_writer = csv.writer(summary_file)
+            trials_writer = csv.writer(trials_file)
 
-    reconnection_rates = [get_result(n).reconnection_rate for n in n_values]
-    shape_diffs_mean = [get_result(n).mean_shape_difference for n in n_values]
-    shape_diffs_std = [get_result(n).std_shape_difference for n in n_values]
+            if not completed:
+                summary_writer.writerow(SUMMARY_HEADERS)
+                trials_writer.writerow(TRIALS_HEADERS)
 
-    # Save aggregated results to CSV
-    csv_filename = os.path.join(output_dir, "sweep_summary.csv")
-    with open(csv_filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'n_modules', 'n_faults', 'n_trials', 'n_meaningful_trials',
-            'mean_shape_difference', 'std_shape_difference',
-            'reconnection_rate', 'full_restoration_rate',
-            'mean_phase1_moves', 'mean_phase2_moves'
-        ])
-        for n in n_values:
-            res = get_result(n)
-            writer.writerow([
-                res.n_modules, res.n_faults, res.n_trials, res.n_meaningful_trials,
-                f'{res.mean_shape_difference:.6f}', f'{res.std_shape_difference:.6f}',
-                f'{res.reconnection_rate:.4f}', f'{res.full_restoration_rate:.4f}',
-                f'{res.mean_phase1_moves:.2f}', f'{res.mean_phase2_moves:.2f}'
-            ])
-    print(f"Saved: {csv_filename}")
+            n_iterator = tqdm(remaining, desc="Parameter sweep")
+            for n in n_iterator:
+                f = max(1, n // 10) if dynamic_faults else n_faults
+                n_iterator.set_postfix(n=n, f=f)
 
-    # Save full trial results to CSV for detailed analysis
-    trials_csv_filename = os.path.join(output_dir, "trials.csv")
-    with open(trials_csv_filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            'trial_id', 'n_modules', 'n_faults', 'seed',
-            'restored', 'phase1_moves', 'phase2_moves',
-            'shape_difference'
-        ])
-        for n in n_values:
-            res = get_result(n)
-            for trial in res.trials:
-                writer.writerow([
-                    trial.trial_id, trial.n_modules, trial.n_faults, trial.seed,
-                    trial.restored, trial.phase1_moves, trial.phase2_moves,
-                    trial.shape_difference if trial.shape_difference is not None else ''
+                # Deterministic seed: same for a given n regardless of resume
+                config_seed = base_seed + (n - n_min) * n_trials
+
+                result = run_monte_carlo(
+                    n_modules=n,
+                    n_faults=f,
+                    n_trials=n_trials,
+                    seed=config_seed,
+                    mode_2d=mode_2d,
+                    fully_connected=fully_connected,
+                    verbose=False,
+                    config_mode=config_mode,
+                    n_jobs=n_jobs
+                )
+
+                # Stream summary row
+                summary_writer.writerow([
+                    result.n_modules, result.n_faults, result.n_trials,
+                    result.n_meaningful_trials,
+                    f'{result.mean_shape_difference:.6f}',
+                    f'{result.std_shape_difference:.6f}',
+                    f'{result.reconnection_rate:.4f}',
+                    f'{result.full_restoration_rate:.4f}',
+                    f'{result.mean_phase1_moves:.2f}',
+                    f'{result.mean_phase2_moves:.2f}'
                 ])
-    print(f"Saved: {trials_csv_filename}")
+                summary_file.flush()
 
-    # Generate graphs unless disabled
-    if not args.no_graphs:
+                # Stream trial rows
+                for trial in result.trials:
+                    trials_writer.writerow([
+                        trial.trial_id, trial.n_modules, trial.n_faults,
+                        trial.seed, trial.restored, trial.phase1_moves,
+                        trial.phase2_moves,
+                        trial.shape_difference if trial.shape_difference is not None else ''
+                    ])
+                trials_file.flush()
+
+        finally:
+            summary_file.close()
+            trials_file.close()
+
+        print(f"\nSweep complete!")
+        print(f"Saved: {summary_csv_path}")
+        print(f"Saved: {trials_csv_path}")
+    else:
+        print("All n-values already completed! Regenerating graphs...\n")
+
+    # --- Read back full CSV for graphs and summary ---
+    summary_csv_path = os.path.join(output_dir, "sweep_summary.csv")
+    if not os.path.exists(summary_csv_path):
+        print("No sweep_summary.csv found, skipping graphs and summary.")
+        return
+
+    csv_n = []
+    csv_f = []
+    csv_trials = []
+    csv_meaningful = []
+    csv_reconn = []
+    csv_shape_mean = []
+    csv_shape_std = []
+    csv_full_restore = []
+    csv_p1_moves = []
+    csv_p2_moves = []
+
+    with open(summary_csv_path, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                csv_n.append(int(row['n_modules']))
+                csv_f.append(int(row['n_faults']))
+                csv_trials.append(int(row['n_trials']))
+                csv_meaningful.append(int(row['n_meaningful_trials']))
+                csv_reconn.append(float(row['reconnection_rate']))
+                csv_shape_mean.append(float(row['mean_shape_difference']))
+                csv_shape_std.append(float(row['std_shape_difference']))
+                csv_full_restore.append(float(row['full_restoration_rate']))
+                csv_p1_moves.append(float(row['mean_phase1_moves']))
+                csv_p2_moves.append(float(row['mean_phase2_moves']))
+            except (ValueError, KeyError):
+                continue
+
+    if not csv_n:
+        print("No valid data in sweep_summary.csv, skipping graphs and summary.")
+        return
+
+    # Sort by n
+    order = sorted(range(len(csv_n)), key=lambda i: csv_n[i])
+    csv_n = [csv_n[i] for i in order]
+    csv_f = [csv_f[i] for i in order]
+    csv_trials = [csv_trials[i] for i in order]
+    csv_meaningful = [csv_meaningful[i] for i in order]
+    csv_reconn = [csv_reconn[i] for i in order]
+    csv_shape_mean = [csv_shape_mean[i] for i in order]
+    csv_shape_std = [csv_shape_std[i] for i in order]
+
+    if not no_graphs:
         generate_graphs(
-            n_values, reconnection_rates,
-            shape_diffs_mean, shape_diffs_std,
-            args, output_dir,
-            dynamic_faults=args.dynamic_faults
+            csv_n, csv_reconn, csv_shape_mean, csv_shape_std,
+            n_faults=n_faults, n_trials=n_trials,
+            output_dir=output_dir,
+            dynamic_faults=dynamic_faults
         )
 
-    # Print summary table
-    print_summary_table(n_values, sweep_results, args.faults, args.dynamic_faults, get_result)
+    print_summary_table(csv_n, csv_f, csv_meaningful, csv_reconn,
+                        csv_shape_mean, csv_shape_std, dynamic_faults)
 
-    print(f"\nTotal trials run: {total_trials:,}")
+    print(f"\nTotal configurations: {len(csv_n)}")
     print(f"All results saved to: {output_dir}/")
 
 
 def generate_graphs(n_values, reconnection_rates, shape_diffs_mean, shape_diffs_std,
-                    args, output_dir, dynamic_faults=False):
+                    n_faults, n_trials, output_dir, dynamic_faults=False):
     """Generate and save visualization graphs."""
 
-    # Smooth the data
     sigma = 2
     reconnection_smooth = gaussian_filter1d(reconnection_rates, sigma=sigma)
     shape_diff_smooth = gaussian_filter1d(shape_diffs_mean, sigma=sigma)
 
     x_max = max(n_values) + 5
 
-    # Determine fault description for titles
     if dynamic_faults:
         fault_desc = "f=n/10"
     else:
-        fault_desc = f"f={args.faults}"
+        fault_desc = f"f={n_faults}"
 
     # Create combined figure with 2 subplots
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(
-        f'Monte Carlo Simulation Results ({fault_desc} faults, {args.trials} trials per n)',
+        f'Monte Carlo Simulation Results ({fault_desc} faults, {n_trials} trials per n)',
         fontsize=14, fontweight='bold'
     )
 
@@ -313,7 +480,7 @@ def generate_graphs(n_values, reconnection_rates, shape_diffs_mean, shape_diffs_
         ax.set_ylabel(metric_name.replace('_', ' ').title(), fontsize=13)
         ax.set_title(
             f'{metric_name.replace("_", " ").title()} vs Structure Size\n'
-            f'({fault_desc} faults, {args.trials} trials per n)',
+            f'({fault_desc} faults, {n_trials} trials per n)',
             fontsize=14
         )
         ax.set_xlim(0, x_max)
@@ -331,28 +498,26 @@ def generate_graphs(n_values, reconnection_rates, shape_diffs_mean, shape_diffs_
     plt.close('all')
 
 
-def print_summary_table(n_values, sweep_results, n_faults, dynamic_faults=False, get_result=None):
+def print_summary_table(n_values, f_values, meaningful_values,
+                        reconn_values, shape_mean_values, shape_std_values,
+                        dynamic_faults=False):
     """Print a summary table of results."""
     print("\n" + "=" * 90)
     if dynamic_faults:
         print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f=n/10 dynamic)")
     else:
-        print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f={n_faults})")
+        print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f={f_values[0]})")
     print("=" * 90)
-    print(f"{'n':>4} {'f':>3} {'Meaningful':>10} {'Reconn%':>8} {'ShapeDiff (mean±std)':>22}")
+    print(f"{'n':>4} {'f':>3} {'Meaningful':>10} {'Reconn%':>8} {'ShapeDiff (mean+/-std)':>22}")
     print("-" * 90)
 
-    # Print every 5th value (or adjust based on range)
     step = max(1, len(n_values) // 20)
-    for i, n in enumerate(n_values):
-        if i % step == 0 or n == n_values[-1]:
-            if get_result:
-                res = get_result(n)
-            else:
-                res = sweep_results[(n, n_faults)]
+    for i in range(len(n_values)):
+        if i % step == 0 or i == len(n_values) - 1:
             print(
-                f"{n:>4} {res.n_faults:>3} {res.n_meaningful_trials:>10} {res.reconnection_rate*100:>7.1f}% "
-                f"{res.mean_shape_difference:>10.4f} ± {res.std_shape_difference:<8.4f}"
+                f"{n_values[i]:>4} {f_values[i]:>3} {meaningful_values[i]:>10} "
+                f"{reconn_values[i]*100:>7.1f}% "
+                f"{shape_mean_values[i]:>10.4f} +/- {shape_std_values[i]:<8.4f}"
             )
     print("=" * 90)
 
