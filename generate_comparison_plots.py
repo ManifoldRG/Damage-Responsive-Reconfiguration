@@ -237,8 +237,7 @@ def generate_summary_table(data, output_file):
 
     metrics = [
         ('reconnection_rate', 'Reconn. Rate', '{:.1%}'),
-        ('mean_total_difference', 'Total Diff.', '{:.3f}'),
-        ('mean_missing_portions', 'Missing Port.', '{:.3f}'),
+        ('mean_shape_difference', 'Shape Diff.', '{:.3f}'),
         ('mean_phase1_moves', 'Phase 1 Moves', '{:.1f}'),
         ('mean_phase2_moves', 'Phase 2 Moves', '{:.1f}'),
         ('n_meaningful_trials', 'Meaningful Trials', '{:.0f}'),
@@ -281,19 +280,6 @@ def generate_summary_table(data, output_file):
                     else:
                         vals.append(fmt.format(val))
                 f.write(f"| {n} | {' | '.join(vals)} |\n")
-
-        f.write("\n## Key Observations\n\n")
-        f.write("### Reconnection Rate\n")
-        f.write("- **Tree topology** achieves higher reconnection rates (often 100%) at larger n\n")
-        f.write("- **Dynamic faults** reduce reconnection success, especially for fully-connected\n\n")
-
-        f.write("### Position Restoration (Total Difference)\n")
-        f.write("- **Tree topology** shows significantly better position restoration (lower total difference)\n")
-        f.write("- Values decrease as n increases for all configurations\n\n")
-
-        f.write("### Meaningful Trials\n")
-        f.write("- **Dynamic faults** create more meaningful trials (more disconnections)\n")
-        f.write("- Tree structures have similar meaningful trial rates to FC with single fault\n")
 
     print(f"Saved: {output_file}")
 
@@ -350,15 +336,9 @@ def main():
     )
 
     create_quad_plot(
-        data, 'mean_total_difference', 'Total Difference (Symmetric)',
-        'Total Difference Comparison: FC vs Tree, Single vs Dynamic Faults',
-        'quad_total_difference.png', output_dir
-    )
-
-    create_quad_plot(
-        data, 'mean_missing_portions', 'Missing Portions (Asymmetric)',
-        'Missing Portions Comparison: FC vs Tree, Single vs Dynamic Faults',
-        'quad_missing_portions.png', output_dir
+        data, 'mean_shape_difference', 'Shape Difference',
+        'Shape Difference Comparison: FC vs Tree, Single vs Dynamic Faults',
+        'quad_shape_difference.png', output_dir
     )
 
     print("\nGenerating overlay plots...")
@@ -370,15 +350,9 @@ def main():
     )
 
     create_overlay_quad_plot(
-        data, 'mean_total_difference', 'Total Difference',
-        'Total Difference: All Configurations',
-        'overlay_total_difference.png', output_dir
-    )
-
-    create_overlay_quad_plot(
-        data, 'mean_missing_portions', 'Missing Portions',
-        'Missing Portions: All Configurations',
-        'overlay_missing_portions.png', output_dir
+        data, 'mean_shape_difference', 'Shape Difference',
+        'Shape Difference diff(P, Q): All Configurations',
+        'overlay_shape_difference.png', output_dir
     )
 
     print("\nGenerating summary table...")

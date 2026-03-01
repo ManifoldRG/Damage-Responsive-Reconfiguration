@@ -5,9 +5,9 @@ This module provides tools for running Monte Carlo simulations to evaluate
 the performance of coagulation/encapsulation and reconstruction algorithms
 across varying parameters (n modules, f faults).
 
-Key metrics:
-- Total Difference (symmetric): |P_start Δ P_end| / n
-- Missing Portions (asymmetric): |P_start - P_end| / n
+Key metric:
+- Shape Difference: diff(P, Q) = (|P| - |P ∩ Q|) / |P|
+  where P, Q are sets of pairwise inter-module distances before/after damage.
 """
 
 import random
@@ -43,9 +43,8 @@ class TrialResult:
     phase1_moves: int
     phase2_moves: int
 
-    # Similarity metrics (None if not restored)
-    total_difference: Optional[float]     # Metric 1 (symmetric) - None if failed
-    missing_portions: Optional[float]     # Metric 2 (asymmetric) - None if failed
+    # Similarity metric (None if not restored)
+    shape_difference: Optional[float]     # diff(P, Q) - None if failed
 
 
 @dataclass
@@ -57,10 +56,8 @@ class MonteCarloResults:
     n_meaningful_trials: int    # Trials where fault caused disconnection (phase1_moves > 0)
 
     # Aggregated metrics (only from meaningful, successful trials)
-    mean_total_difference: float
-    std_total_difference: float
-    mean_missing_portions: float
-    std_missing_portions: float
+    mean_shape_difference: float
+    std_shape_difference: float
 
     # Success rates (relative to meaningful trials only)
     reconnection_rate: float    # % of meaningful trials that reconnected
@@ -80,10 +77,8 @@ class MonteCarloResults:
             "n_faults": self.n_faults,
             "n_trials": self.n_trials,
             "n_meaningful_trials": self.n_meaningful_trials,
-            "mean_total_difference": self.mean_total_difference,
-            "std_total_difference": self.std_total_difference,
-            "mean_missing_portions": self.mean_missing_portions,
-            "std_missing_portions": self.std_missing_portions,
+            "mean_shape_difference": self.mean_shape_difference,
+            "std_shape_difference": self.std_shape_difference,
             "reconnection_rate": self.reconnection_rate,
             "full_restoration_rate": self.full_restoration_rate,
             "mean_phase1_moves": self.mean_phase1_moves,
@@ -91,16 +86,16 @@ class MonteCarloResults:
         }
 
 
-def calculate_similarity_metrics(
+def calculate_shape_difference(
     original_positions: Dict[str, np.ndarray],
     final_positions: Dict[str, np.ndarray],
     faulty_modules: Set[str]
-) -> Tuple[float, float]:
+) -> float:
     """
-    Calculate shape similarity using pairwise inter-module distances.
+    Calculate shape difference using pairwise inter-module distances.
 
     Per the paper's metric: diff(P, Q) = (|P| - |P ∩ Q|) / |P|
-    where P and Q are multisets of pairwise distances before/after damage.
+    where P and Q are sets of pairwise distances before/after damage.
 
     Args:
         original_positions: Positions of ALL modules before fault
@@ -108,8 +103,7 @@ def calculate_similarity_metrics(
         faulty_modules: Set of module IDs that were marked as faulty
 
     Returns:
-        Tuple of (total_difference, missing_portions) — both use the same
-        pairwise distance metric diff(P, Q).
+        Shape difference diff(P, Q), anchored to pre-damage shape P.
     """
     # Build P: pairwise distances of active (non-faulty) modules before damage
     active_orig = {
@@ -133,14 +127,11 @@ def calculate_similarity_metrics(
             Q.add(d)
 
     if len(P) == 0:
-        return 0.0, 0.0
+        return 0.0
 
     # diff(P, Q) = (|P| - |P ∩ Q|) / |P|
     intersection = P & Q
-    total_difference = (len(P) - len(intersection)) / len(P)
-    missing_portions = total_difference  # Same metric (anchored to P)
-
-    return total_difference, missing_portions
+    return (len(P) - len(intersection)) / len(P)
 
 
 def run_single_trial(
@@ -227,14 +218,13 @@ def run_single_trial(
             if module.is_active
         }
 
-        # Calculate similarity metrics
-        total_diff, missing = calculate_similarity_metrics(
+        # Calculate shape difference
+        shape_diff = calculate_shape_difference(
             original_positions, final_positions, faulty_modules_set
         )
     else:
-        # Failed trial - metrics are None
-        total_diff = None
-        missing = None
+        # Failed trial - metric is None
+        shape_diff = None
 
     return TrialResult(
         trial_id=trial_id,
@@ -244,8 +234,7 @@ def run_single_trial(
         restored=restored,
         phase1_moves=phase1_moves,
         phase2_moves=phase2_moves,
-        total_difference=total_diff,
-        missing_portions=missing,
+        shape_difference=shape_diff,
     )
 
 
@@ -306,30 +295,25 @@ def run_monte_carlo(
 
     # Aggregate results - only include successful meaningful trials for metrics
     successful_trials = [t for t in meaningful_trials if t.restored]
-    total_diffs = [t.total_difference for t in successful_trials]
-    missing_portions = [t.missing_portions for t in successful_trials]
+    shape_diffs = [t.shape_difference for t in successful_trials]
 
     # Rates are calculated relative to meaningful trials only
     n_meaningful = len(meaningful_trials)
     restored_count = len(successful_trials)
 
-    # Full restoration = restored with zero total difference
+    # Full restoration = restored with zero shape difference
     full_restored_count = sum(
         1 for t in successful_trials
-        if t.total_difference is not None and t.total_difference == 0.0
+        if t.shape_difference is not None and t.shape_difference == 0.0
     )
 
     # Handle case with no successful trials
     if successful_trials:
-        mean_total_diff = float(np.mean(total_diffs))
-        std_total_diff = float(np.std(total_diffs))
-        mean_missing = float(np.mean(missing_portions))
-        std_missing = float(np.std(missing_portions))
+        mean_shape_diff = float(np.mean(shape_diffs))
+        std_shape_diff = float(np.std(shape_diffs))
     else:
-        mean_total_diff = float('nan')
-        std_total_diff = float('nan')
-        mean_missing = float('nan')
-        std_missing = float('nan')
+        mean_shape_diff = float('nan')
+        std_shape_diff = float('nan')
 
     # Calculate rates relative to meaningful trials (avoid division by zero)
     if n_meaningful > 0:
@@ -348,10 +332,8 @@ def run_monte_carlo(
         n_faults=n_faults,
         n_trials=n_trials,
         n_meaningful_trials=n_meaningful,
-        mean_total_difference=mean_total_diff,
-        std_total_difference=std_total_diff,
-        mean_missing_portions=mean_missing,
-        std_missing_portions=std_missing,
+        mean_shape_difference=mean_shape_diff,
+        std_shape_difference=std_shape_diff,
         reconnection_rate=reconnection_rate,
         full_restoration_rate=full_restoration_rate,
         mean_phase1_moves=mean_p1_moves,
@@ -446,11 +428,9 @@ def print_results_summary(results: MonteCarloResults) -> None:
     print(f"Monte Carlo Results: n={results.n_modules}, f={results.n_faults}")
     print(f"{'='*60}")
     print(f"Trials: {results.n_trials}")
-    print(f"\nSimilarity Metrics:")
-    print(f"  Total Difference (symmetric): {results.mean_total_difference:.4f} "
-          f"± {results.std_total_difference:.4f}")
-    print(f"  Missing Portions (asymmetric): {results.mean_missing_portions:.4f} "
-          f"± {results.std_missing_portions:.4f}")
+    print(f"\nShape Difference:")
+    print(f"  diff(P, Q): {results.mean_shape_difference:.4f} "
+          f"± {results.std_shape_difference:.4f}")
     print(f"\nSuccess Rates:")
     print(f"  Reconnection Rate: {results.reconnection_rate:.1%}")
     print(f"  Full Restoration Rate: {results.full_restoration_rate:.1%}")

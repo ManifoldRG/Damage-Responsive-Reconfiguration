@@ -176,10 +176,8 @@ def main():
         return None
 
     reconnection_rates = [get_result(n).reconnection_rate for n in n_values]
-    total_diffs_mean = [get_result(n).mean_total_difference for n in n_values]
-    total_diffs_std = [get_result(n).std_total_difference for n in n_values]
-    missing_mean = [get_result(n).mean_missing_portions for n in n_values]
-    missing_std = [get_result(n).std_missing_portions for n in n_values]
+    shape_diffs_mean = [get_result(n).mean_shape_difference for n in n_values]
+    shape_diffs_std = [get_result(n).std_shape_difference for n in n_values]
 
     # Save aggregated results to CSV
     csv_filename = os.path.join(output_dir, "sweep_summary.csv")
@@ -187,8 +185,7 @@ def main():
         writer = csv.writer(f)
         writer.writerow([
             'n_modules', 'n_faults', 'n_trials', 'n_meaningful_trials',
-            'mean_total_difference', 'std_total_difference',
-            'mean_missing_portions', 'std_missing_portions',
+            'mean_shape_difference', 'std_shape_difference',
             'reconnection_rate', 'full_restoration_rate',
             'mean_phase1_moves', 'mean_phase2_moves'
         ])
@@ -196,8 +193,7 @@ def main():
             res = get_result(n)
             writer.writerow([
                 res.n_modules, res.n_faults, res.n_trials, res.n_meaningful_trials,
-                f'{res.mean_total_difference:.6f}', f'{res.std_total_difference:.6f}',
-                f'{res.mean_missing_portions:.6f}', f'{res.std_missing_portions:.6f}',
+                f'{res.mean_shape_difference:.6f}', f'{res.std_shape_difference:.6f}',
                 f'{res.reconnection_rate:.4f}', f'{res.full_restoration_rate:.4f}',
                 f'{res.mean_phase1_moves:.2f}', f'{res.mean_phase2_moves:.2f}'
             ])
@@ -210,7 +206,7 @@ def main():
         writer.writerow([
             'trial_id', 'n_modules', 'n_faults', 'seed',
             'restored', 'phase1_moves', 'phase2_moves',
-            'total_difference', 'missing_portions'
+            'shape_difference'
         ])
         for n in n_values:
             res = get_result(n)
@@ -218,8 +214,7 @@ def main():
                 writer.writerow([
                     trial.trial_id, trial.n_modules, trial.n_faults, trial.seed,
                     trial.restored, trial.phase1_moves, trial.phase2_moves,
-                    trial.total_difference if trial.total_difference is not None else '',
-                    trial.missing_portions if trial.missing_portions is not None else ''
+                    trial.shape_difference if trial.shape_difference is not None else ''
                 ])
     print(f"Saved: {trials_csv_filename}")
 
@@ -227,8 +222,7 @@ def main():
     if not args.no_graphs:
         generate_graphs(
             n_values, reconnection_rates,
-            total_diffs_mean, total_diffs_std,
-            missing_mean, missing_std,
+            shape_diffs_mean, shape_diffs_std,
             args, output_dir,
             dynamic_faults=args.dynamic_faults
         )
@@ -240,15 +234,14 @@ def main():
     print(f"All results saved to: {output_dir}/")
 
 
-def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_std,
-                    missing_mean, missing_std, args, output_dir, dynamic_faults=False):
+def generate_graphs(n_values, reconnection_rates, shape_diffs_mean, shape_diffs_std,
+                    args, output_dir, dynamic_faults=False):
     """Generate and save visualization graphs."""
 
     # Smooth the data
     sigma = 2
     reconnection_smooth = gaussian_filter1d(reconnection_rates, sigma=sigma)
-    total_diff_smooth = gaussian_filter1d(total_diffs_mean, sigma=sigma)
-    missing_smooth = gaussian_filter1d(missing_mean, sigma=sigma)
+    shape_diff_smooth = gaussian_filter1d(shape_diffs_mean, sigma=sigma)
 
     x_max = max(n_values) + 5
 
@@ -258,8 +251,8 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
     else:
         fault_desc = f"f={args.faults}"
 
-    # Create combined figure with 3 subplots
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    # Create combined figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(
         f'Monte Carlo Simulation Results ({fault_desc} faults, {args.trials} trials per n)',
         fontsize=14, fontweight='bold'
@@ -278,37 +271,21 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc='lower right')
 
-    # Plot 2: Total Difference
+    # Plot 2: Shape Difference
     ax2 = axes[1]
     ax2.fill_between(n_values,
-                     np.maximum(0, np.array(total_diffs_mean) - np.array(total_diffs_std)),
-                     np.minimum(1, np.array(total_diffs_mean) + np.array(total_diffs_std)),
+                     np.maximum(0, np.array(shape_diffs_mean) - np.array(shape_diffs_std)),
+                     np.minimum(1, np.array(shape_diffs_mean) + np.array(shape_diffs_std)),
                      alpha=0.2, color='orange')
-    ax2.scatter(n_values, total_diffs_mean, alpha=0.4, color='orange', s=20, label='Raw data')
-    ax2.plot(n_values, total_diff_smooth, color='darkorange', linewidth=2.5, label='Smoothed')
+    ax2.scatter(n_values, shape_diffs_mean, alpha=0.4, color='orange', s=20, label='Raw data')
+    ax2.plot(n_values, shape_diff_smooth, color='darkorange', linewidth=2.5, label='Smoothed')
     ax2.set_xlabel('Number of Modules (n)', fontsize=11)
-    ax2.set_ylabel('Total Difference', fontsize=11)
-    ax2.set_title('Total Difference (Symmetric) vs Structure Size', fontsize=12)
+    ax2.set_ylabel('Shape Difference', fontsize=11)
+    ax2.set_title('Shape Difference diff(P, Q) vs Structure Size', fontsize=12)
     ax2.set_xlim(0, x_max)
     ax2.set_ylim(0, 1.0)
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc='upper right')
-
-    # Plot 3: Missing Portions
-    ax3 = axes[2]
-    ax3.fill_between(n_values,
-                     np.maximum(0, np.array(missing_mean) - np.array(missing_std)),
-                     np.minimum(1, np.array(missing_mean) + np.array(missing_std)),
-                     alpha=0.2, color='red')
-    ax3.scatter(n_values, missing_mean, alpha=0.4, color='red', s=20, label='Raw data')
-    ax3.plot(n_values, missing_smooth, color='darkred', linewidth=2.5, label='Smoothed')
-    ax3.set_xlabel('Number of Modules (n)', fontsize=11)
-    ax3.set_ylabel('Missing Portions', fontsize=11)
-    ax3.set_title('Missing Portions (Asymmetric) vs Structure Size', fontsize=12)
-    ax3.set_xlim(0, x_max)
-    ax3.set_ylim(0, 1.0)
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc='upper right')
 
     plt.tight_layout()
 
@@ -320,8 +297,7 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
     # Save individual graphs
     metrics = [
         ('reconnection_rate', reconnection_rates, reconnection_smooth, None, 'blue', 'blue'),
-        ('total_difference', total_diffs_mean, total_diff_smooth, total_diffs_std, 'orange', 'darkorange'),
-        ('missing_portions', missing_mean, missing_smooth, missing_std, 'red', 'darkred')
+        ('shape_difference', shape_diffs_mean, shape_diff_smooth, shape_diffs_std, 'orange', 'darkorange'),
     ]
 
     for metric_name, data, smooth_data, std_data, color, dark_color in metrics:
@@ -357,14 +333,14 @@ def generate_graphs(n_values, reconnection_rates, total_diffs_mean, total_diffs_
 
 def print_summary_table(n_values, sweep_results, n_faults, dynamic_faults=False, get_result=None):
     """Print a summary table of results."""
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 90)
     if dynamic_faults:
         print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f=n/10 dynamic)")
     else:
         print(f"SUMMARY TABLE (n={n_values[0]} to n={n_values[-1]}, f={n_faults})")
-    print("=" * 110)
-    print(f"{'n':>4} {'f':>3} {'Meaningful':>10} {'Reconn%':>8} {'TotalDiff (mean±std)':>22} {'Missing (mean±std)':>22}")
-    print("-" * 110)
+    print("=" * 90)
+    print(f"{'n':>4} {'f':>3} {'Meaningful':>10} {'Reconn%':>8} {'ShapeDiff (mean±std)':>22}")
+    print("-" * 90)
 
     # Print every 5th value (or adjust based on range)
     step = max(1, len(n_values) // 20)
@@ -376,10 +352,9 @@ def print_summary_table(n_values, sweep_results, n_faults, dynamic_faults=False,
                 res = sweep_results[(n, n_faults)]
             print(
                 f"{n:>4} {res.n_faults:>3} {res.n_meaningful_trials:>10} {res.reconnection_rate*100:>7.1f}% "
-                f"{res.mean_total_difference:>10.4f} ± {res.std_total_difference:<8.4f} "
-                f"{res.mean_missing_portions:>10.4f} ± {res.std_missing_portions:<8.4f}"
+                f"{res.mean_shape_difference:>10.4f} ± {res.std_shape_difference:<8.4f}"
             )
-    print("=" * 110)
+    print("=" * 90)
 
 
 if __name__ == "__main__":
