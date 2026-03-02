@@ -140,6 +140,8 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_l
 
     configs = ['FC Single', 'FC Dynamic', 'Tree Single', 'Tree Dynamic']
 
+    x_max = max(data[c]['n_modules'].max() for c in configs) + 5
+
     for idx, (ax, config, subplot_title) in enumerate(zip(axes.flat, configs, subplot_titles)):
         df = data[config]
         x = df['n_modules'].values
@@ -172,7 +174,7 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_l
         ax.set_title(subplot_title, fontsize=12, fontweight='bold')
         ax.set_xlabel('Number of Modules (n)', fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
-        ax.set_xlim(0, 105)
+        ax.set_xlim(0, x_max)
         ax.set_ylim(0, 1.0)
         ax.grid(True, alpha=0.3)
         ax.legend(loc=legend_loc, fontsize=8)
@@ -188,6 +190,8 @@ def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
     fig, ax = plt.subplots(figsize=(12, 8))
 
     configs = ['FC Single', 'FC Dynamic', 'Tree Single', 'Tree Dynamic']
+
+    x_max = max(data[c]['n_modules'].max() for c in configs) + 5
 
     for config in configs:
         df = data[config]
@@ -211,7 +215,7 @@ def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel('Number of Modules (n)', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_xlim(0, 105)
+    ax.set_xlim(0, x_max)
     ax.set_ylim(0, 1.0)
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best', fontsize=10)
@@ -224,8 +228,9 @@ def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
 
 def generate_summary_table(data, output_file):
     """Generate summary table for every 10 modules."""
-    n_values = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     configs = ['FC Single', 'FC Dynamic', 'Tree Single', 'Tree Dynamic']
+    max_n = max(data[c]['n_modules'].max() for c in configs)
+    n_values = list(range(10, int(max_n) + 1, 10))
 
     metrics = [
         ('reconnection_rate', 'Reconn. Rate', '{:.1%}'),
