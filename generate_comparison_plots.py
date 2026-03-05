@@ -126,7 +126,7 @@ def load_data(data_paths):
     return data
 
 
-def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_loc='upper right'):
+def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_loc='upper right', ylim=(0, 1.0)):
     """Create a 2x2 quad plot comparing all configurations."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
@@ -175,7 +175,7 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_l
         ax.set_xlabel('Number of Modules (n)', fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
         ax.set_xlim(0, x_max)
-        ax.set_ylim(0, 1.0)
+        ax.set_ylim(*ylim)
         ax.grid(True, alpha=0.3)
         ax.legend(loc=legend_loc, fontsize=8)
 
@@ -185,7 +185,7 @@ def create_quad_plot(data, metric, ylabel, title, filename, output_dir, legend_l
     print(f"Saved: {output_dir / filename}")
 
 
-def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
+def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir, ylim=(0, 1.0)):
     """Create a single plot with all 4 configurations overlaid."""
     fig, ax = plt.subplots(figsize=(12, 8))
 
@@ -216,7 +216,7 @@ def create_overlay_quad_plot(data, metric, ylabel, title, filename, output_dir):
     ax.set_xlabel('Number of Modules (n)', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xlim(0, x_max)
-    ax.set_ylim(0, 1.0)
+    ax.set_ylim(*ylim)
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best', fontsize=10)
 
@@ -329,13 +329,15 @@ def main():
     create_quad_plot(
         data, 'reconnection_rate', 'Reconnection Rate',
         'Reconnection Rate Comparison: FC vs Tree, Single vs Dynamic Faults',
-        'quad_reconnection_rate.png', output_dir, legend_loc='lower right'
+        'quad_reconnection_rate.png', output_dir, legend_loc='lower right',
+        ylim=(0.9, 1.0)
     )
 
     create_quad_plot(
         data, 'mean_shape_difference', 'Shape Difference',
         'Shape Difference Comparison: FC vs Tree, Single vs Dynamic Faults',
-        'quad_shape_difference.png', output_dir
+        'quad_shape_difference.png', output_dir,
+        ylim=(0, 0.1)
     )
 
     print("\nGenerating overlay plots...")
@@ -343,13 +345,15 @@ def main():
     create_overlay_quad_plot(
         data, 'reconnection_rate', 'Reconnection Rate',
         'Reconnection Rate: All Configurations',
-        'overlay_reconnection_rate.png', output_dir
+        'overlay_reconnection_rate.png', output_dir,
+        ylim=(0.9, 1.0)
     )
 
     create_overlay_quad_plot(
         data, 'mean_shape_difference', 'Shape Difference',
         'Shape Difference: All Configurations',
-        'overlay_shape_difference.png', output_dir
+        'overlay_shape_difference.png', output_dir,
+        ylim=(0, 0.1)
     )
 
     print("\nGenerating summary table...")
