@@ -421,8 +421,6 @@ class UDQDGSystem:
         self.modules[module_id].is_active = False
         return True
 
-    # ─── New Token-Based Algorithm Helpers ───
-
     def get_active_neighbors(self, module_id: str) -> List[str]:
         """Get active, non-faulty neighbors of a module."""
         return [n for n in self.get_neighbors(module_id)
@@ -650,8 +648,6 @@ class UDQDGSystem:
         # Fallback: return current position
         return module_pos.copy()
 
-    # ─── Phase 1: Token-Based Coagulation (Algorithm 1) ───
-
     def coagulation(
         self,
         fault_id: str,
@@ -745,7 +741,7 @@ class UDQDGSystem:
 
             tokens = next_tokens
 
-            # ── Movement Phase ──
+            # Movement Phase
             # Build candidate list: modules with tokens that pass criticality
             candidates = []
             for u, u_tokens in tokens.items():
@@ -848,8 +844,6 @@ class UDQDGSystem:
         stats["modules_responded"] = list(stats["modules_responded"])
         return stats
 
-    # ─── Phase 2: Token-Based Restructuring (Algorithm 2) ───
-
     def restructuring(
         self,
         pre_damage_neighbors: Dict[str, Dict[str, np.ndarray]],
@@ -858,11 +852,18 @@ class UDQDGSystem:
         record_steps: bool = True
     ) -> Dict[str, Any]:
         """
-        Phase 2: Position restoration via displacement-guided movement.
+        Phase 2: Decentralized restructuring via rendezvous token propagation.
 
-        Each module tries to return to its pre-damage position.
-        Modules with largest displacement move first (greedy).
-        Movement uses alignment-based pivot selection toward original position.
+        Per paper Algorithm 2 (structurally parallel to Phase 1):
+        - Modules generate tokens for missing pre-damage neighbors (active but
+          not currently adjacent), with initial direction ζ = ρ_uv (stored
+          pre-damage edge translation)
+        - Tokens propagate hop-by-hop with direction composition: ζ ← ρ_wu + ζ
+        - Movable modules pivot toward the FURTHEST token using alignment selection
+        - Terminates when no progress (no moves, no new connections, no token changes)
+
+        Token: {target_id: direction_vector} where direction ζ points from
+        the module toward the missing neighbor's estimated location.
         """
         stats = {
             "iterations": 0,
@@ -872,62 +873,172 @@ class UDQDGSystem:
         if record_steps:
             stats["steps"] = []
 
-        if original_positions is None:
+        if not pre_damage_neighbors:
             stats["success"] = True
             return stats
+
+        # Token storage: {module_id: {target_id: direction_vector ζ}}
+        # ζ = approximate displacement from module toward missing neighbor
+        tokens: Dict[str, Dict[str, np.ndarray]] = {
+            mid: {} for mid, m in self.modules.items()
+            if m.is_active and not m.is_faulty
+        }
+
+        # Oscillation prevention: track recent positions per module (tabu list)
+        position_history: Dict[str, Set[Tuple]] = {}
+
+        # Helper: get current adjacency set for a module
+        def _current_neighbors(u: str) -> Set[str]:
+            return set(self.get_active_neighbors(u))
 
         for iteration in range(max_iterations):
             stats["iterations"] = iteration + 1
 
-            # Compute displacement for each active module
-            displacements = {}
-            for mid, orig_pos in original_positions.items():
-                if mid not in self.modules or not self.modules[mid].is_active:
+            # ── Check success: all active pre-damage pairs are now adjacent ──
+            all_restored = True
+            for u, pre_nbrs in pre_damage_neighbors.items():
+                if u not in self.modules or not self.modules[u].is_active:
                     continue
-                if self.modules[mid].is_faulty:
+                if self.modules[u].is_faulty:
                     continue
-                disp = orig_pos - self.modules[mid].position
-                dist = float(np.linalg.norm(disp))
-                if dist > 0.5:  # Only modules that have moved significantly
-                    displacements[mid] = (disp, dist)
-
-            if not displacements:
+                cur_nbrs = _current_neighbors(u)
+                for v in pre_nbrs:
+                    if v not in self.modules or not self.modules[v].is_active:
+                        continue  # skip faulty/inactive targets
+                    if self.modules[v].is_faulty:
+                        continue
+                    if v not in cur_nbrs:
+                        all_restored = False
+                        break
+                if not all_restored:
+                    break
+            if all_restored:
                 stats["success"] = True
                 break
 
-            # Sort by displacement (largest first)
-            sorted_modules = sorted(displacements.keys(),
-                                    key=lambda m: displacements[m][1],
-                                    reverse=True)
+            # ── Token Generation + Propagation (double-buffered) ──
+            next_tokens: Dict[str, Dict[str, np.ndarray]] = {
+                mid: dict(toks) for mid, toks in tokens.items()
+                if mid in self.modules and self.modules[mid].is_active
+            }
+            tokens_changed = False
 
-            moves_this_iteration = 0
-            occupied_destinations = set()
-
-            for mid in sorted_modules:
-                disp, dist = displacements[mid]
-
-                if not self.is_movable(mid):
+            for u in list(tokens.keys()):
+                if u not in self.modules or not self.modules[u].is_active:
+                    continue
+                if self.modules[u].is_faulty:
+                    continue
+                if u not in next_tokens:
                     continue
 
-                # Select pivot aligned with displacement direction
-                pivot = self.select_pivot_by_alignment(mid, disp)
+                # Generation: seed tokens for missing pre-damage neighbors
+                # Only seed when no token exists yet — propagation will
+                # update direction as modules move (correct dict translation
+                # of the paper's set-union semantics).
+                cur_nbrs = _current_neighbors(u)
+                if u in pre_damage_neighbors:
+                    for v, rho_uv in pre_damage_neighbors[u].items():
+                        if v not in self.modules or not self.modules[v].is_active:
+                            continue
+                        if self.modules[v].is_faulty:
+                            continue
+                        if v in cur_nbrs:
+                            continue  # already reconnected, no token needed
+                        v_key = v
+                        # Only seed if no token exists yet for this target
+                        if v_key not in next_tokens[u]:
+                            if v_key not in tokens.get(u, {}):
+                                tokens_changed = True
+                            next_tokens[u][v_key] = rho_uv.copy()
+
+                # Propagation: broadcast current tokens to active neighbors
+                for v_key, zeta in tokens[u].items():
+                    for w in self.get_active_neighbors(u):
+                        if w not in next_tokens:
+                            continue
+                        edge_wu = self.edges.get((w, u))
+                        if edge_wu:
+                            rho_wu = edge_wu.translation  # displacement w→u
+                            zeta_w = rho_wu + zeta
+                            # Keep shorter path per target (more accurate direction)
+                            if v_key not in next_tokens[w] or \
+                               np.linalg.norm(zeta_w) < np.linalg.norm(next_tokens[w][v_key]):
+                                if v_key not in tokens.get(w, {}):
+                                    tokens_changed = True
+                                next_tokens[w][v_key] = zeta_w
+
+            tokens = next_tokens
+
+            # ── Movement Phase ──
+            # Build candidate list: modules with tokens that pass criticality
+            # Only consider tokens for the module's own missing pre-damage
+            # neighbors — propagated tokens for other modules' targets are used
+            # for direction relay only, not for movement decisions.
+            candidates = []
+            for u, u_tokens in tokens.items():
+                if not u_tokens:
+                    continue
+                if u not in self.modules or not self.modules[u].is_active:
+                    continue
+                own_targets = pre_damage_neighbors.get(u, {})
+                cur_nbrs = _current_neighbors(u)
+                relevant_toks = {v: z for v, z in u_tokens.items()
+                                 if v in own_targets and v not in cur_nbrs}
+                if not relevant_toks:
+                    continue
+                # Furthest token distance for priority ordering
+                furthest_v = max(relevant_toks.keys(),
+                                 key=lambda v: np.linalg.norm(relevant_toks[v]))
+                dist = float(np.linalg.norm(relevant_toks[furthest_v]))
+                candidates.append((u, dist))
+
+            # Sort by distance to target (furthest first), tiebreak by ID
+            candidates.sort(key=lambda x: (-x[1], x[0]))
+
+            # Execute moves sequentially, re-checking movability each time
+            moves_this_iteration = 0
+            for u, _ in candidates:
+                if not self.modules[u].is_active:
+                    continue
+                if not self.is_movable(u):
+                    continue
+
+                u_tokens = tokens.get(u, {})
+                if not u_tokens:
+                    continue
+
+                # Only act on tokens for own missing pre-damage neighbors
+                own_targets = pre_damage_neighbors.get(u, {})
+                cur_nbrs = _current_neighbors(u)
+                relevant_toks = {v: z for v, z in u_tokens.items()
+                                 if v in own_targets and v not in cur_nbrs}
+                if not relevant_toks:
+                    continue
+
+                # Select furthest token: argmax ||ζ||
+                furthest_v = max(relevant_toks.keys(),
+                                 key=lambda v: np.linalg.norm(relevant_toks[v]))
+                zeta_star = relevant_toks[furthest_v]
+
+                # Select pivot by alignment with ζ*
+                pivot = self.select_pivot_by_alignment(u, zeta_star)
                 if pivot is None:
                     continue
 
-                # Check destination not already claimed
-                from_pos = self.modules[mid].position.copy()
+                from_pos = self.modules[u].position.copy()
                 dest_pos = from_pos + pivot[4]
                 dest_key = tuple(np.round(dest_pos).astype(int))
-                if dest_key in occupied_destinations:
+
+                # Oscillation prevention: skip if returning to any recent position
+                if dest_key in position_history.get(u, set()):
                     continue
 
-                # Verify move reduces displacement (prevent oscillation)
-                new_disp = np.linalg.norm(original_positions[mid] - dest_pos)
-                if new_disp >= dist - 0.01:
-                    continue  # Skip if not strictly improving
+                # Collision check: skip if destination already occupied
+                if self._position_is_occupied(dest_pos, exclude_module=u):
+                    continue
 
-                occupied_destinations.add(dest_key)
-                pivot_type, _, param1, param2, delta_p = pivot
+                pivot_type, mid, param1, param2, delta_p = pivot
+
                 success = False
                 if pivot_type == 'corner':
                     success = self.corner_pivot(mid, param1, param2)
@@ -937,9 +1048,23 @@ class UDQDGSystem:
                 if success:
                     moves_this_iteration += 1
                     stats["restoration_moves"] += 1
+
                     to_pos = self.modules[mid].position.copy()
+                    actual_delta = to_pos - from_pos
+
+                    # Track position history for oscillation prevention
+                    if mid not in position_history:
+                        position_history[mid] = set()
+                    position_history[mid].add(tuple(np.round(from_pos).astype(int)))
+
+                    # Update token directions after move: ζ ← ζ - Δp
+                    if mid in tokens:
+                        for v_key in tokens[mid]:
+                            tokens[mid][v_key] = tokens[mid][v_key] - actual_delta
 
                     if record_steps:
+                        token_dist_before = float(np.linalg.norm(zeta_star))
+                        token_dist_after = float(np.linalg.norm(zeta_star - actual_delta))
                         stats["steps"].append(RestorationStep(
                             iteration=iteration + 1,
                             pivot_type=pivot_type,
@@ -948,15 +1073,20 @@ class UDQDGSystem:
                             param2=param2,
                             from_pos=from_pos,
                             to_pos=to_pos,
-                            distance_before=dist,
-                            distance_after=float(np.linalg.norm(original_positions[mid] - to_pos)),
+                            distance_before=token_dist_before,
+                            distance_after=token_dist_after,
                             is_restoration_complete=False
                         ))
 
-            # Form new connections
-            self._form_new_connections()
+            # Form new connections between adjacent modules
+            new_conn = self._form_new_connections()
 
-            if moves_this_iteration == 0:
+            # Prune tokens for inactive modules
+            tokens = {mid: toks for mid, toks in tokens.items()
+                      if mid in self.modules and self.modules[mid].is_active}
+
+            # Stop if no progress (no moves, no new connections, no new tokens)
+            if moves_this_iteration == 0 and new_conn == 0 and not tokens_changed:
                 break
 
         return stats
