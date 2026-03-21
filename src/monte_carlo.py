@@ -11,6 +11,7 @@ Key metric:
 """
 
 import random
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
@@ -29,6 +30,88 @@ except ImportError:
 CONFIG_MODE_RANDOM = "random"  # Random walk with full connectivity (default)
 CONFIG_MODE_TREE = "tree"      # Tree structure (no cycles)
 
+# Fault selection modes
+FAULT_MODE_RANDOM = "random"             # existing behavior: uniform random sample
+FAULT_MODE_CLUSTER = "cluster"           # contiguous cluster of size n_faults
+FAULT_MODE_RANDOM_CLUSTERS = "random_clusters"  # multiple small random clusters
+FAULT_MODE_LOCALIZED = "localized"       # one big contiguous cluster (alias for cluster)
+
+
+def _bfs_grow(system, seed_module: str, target_size: int, excluded: Set[str]) -> List[str]:
+    """Grow a contiguous cluster from seed_module via BFS on system neighbors."""
+    selected = [seed_module]
+    selected_set = {seed_module}
+    queue = deque([seed_module])
+
+    while queue and len(selected) < target_size:
+        current = queue.popleft()
+        for neighbor in system.get_neighbors(current):
+            if neighbor not in selected_set and neighbor not in excluded:
+                selected.append(neighbor)
+                selected_set.add(neighbor)
+                queue.append(neighbor)
+                if len(selected) >= target_size:
+                    break
+
+    return selected
+
+
+def select_faulty_modules(
+    system, n_faults: int, seed: int, fault_mode: str = FAULT_MODE_RANDOM
+) -> List[str]:
+    """
+    Select modules to mark as faulty based on the fault mode.
+
+    Args:
+        system: UDQDGSystem instance
+        n_faults: Number of faults to select
+        seed: Random seed for fault selection
+        fault_mode: One of 'random', 'cluster', 'random_clusters', 'localized'
+
+    Returns:
+        List of module IDs to mark as faulty
+    """
+    random.seed(seed)
+    module_ids = list(system.modules.keys())
+    n_faults = min(n_faults, len(module_ids))
+
+    if n_faults <= 0:
+        return []
+
+    if fault_mode == FAULT_MODE_RANDOM:
+        return random.sample(module_ids, n_faults)
+
+    elif fault_mode in (FAULT_MODE_CLUSTER, FAULT_MODE_LOCALIZED):
+        # Single contiguous cluster grown from a random seed module
+        seed_module = random.choice(module_ids)
+        return _bfs_grow(system, seed_module, n_faults, excluded=set())
+
+    elif fault_mode == FAULT_MODE_RANDOM_CLUSTERS:
+        # Partition n_faults into small clusters of size 2-5
+        selected = []
+        selected_set = set()
+        remaining = n_faults
+
+        while remaining > 0:
+            # Pick cluster size 2-5, but don't exceed remaining
+            cluster_size = min(random.randint(2, 5), remaining)
+
+            # Pick a seed module not already selected
+            available = [m for m in module_ids if m not in selected_set]
+            if not available:
+                break
+
+            seed_module = random.choice(available)
+            cluster = _bfs_grow(system, seed_module, cluster_size, excluded=selected_set)
+            selected.extend(cluster)
+            selected_set.update(cluster)
+            remaining -= len(cluster)
+
+        return selected
+
+    else:
+        raise ValueError(f"Unknown fault_mode: {fault_mode}")
+
 
 @dataclass
 class TrialResult:
@@ -43,8 +126,23 @@ class TrialResult:
     phase1_moves: int
     phase2_moves: int
 
-    # Similarity metric (None if not restored)
-    shape_difference: Optional[float]     # diff(P, Q) - None if failed
+    # Similarity metrics (None if not restored)
+    shape_difference: Optional[float]     # diff(P, Q) after both phases - None if failed
+    shape_difference_phase1: Optional[float] = None  # diff(P, Q) after phase 1 only
+
+    # Additional metrics
+    phase1_iterations: int = 0       # steps (iterations) to reconnection
+    total_moves: int = 0             # phase1_moves + phase2_moves
+    token_transmissions: int = 0     # total token transmissions from both phases
+
+    # Fault mode metadata
+    fault_mode: str = FAULT_MODE_RANDOM
+
+    # Token selection strategy (ablation study)
+    token_strategy: str = "furthest"
+
+    # Safety radius for is_movable() hop check (ablation study)
+    safety_radius: int = 2
 
 
 @dataclass
@@ -67,6 +165,31 @@ class MonteCarloResults:
     mean_phase1_moves: float
     mean_phase2_moves: float
 
+    # Shape difference after phase 1 only (before restructuring)
+    mean_shape_difference_phase1: float = float('nan')
+    std_shape_difference_phase1: float = float('nan')
+
+    # Steps to reconnection
+    mean_steps_to_reconnection: float = float('nan')
+    std_steps_to_reconnection: float = float('nan')
+
+    # Total moves (combined)
+    mean_total_moves: float = float('nan')
+    std_total_moves: float = float('nan')
+
+    # Token transmissions
+    mean_token_transmissions: float = float('nan')
+    std_token_transmissions: float = float('nan')
+
+    # Reconnection rate std
+    std_reconnection_rate: float = float('nan')
+
+    # Token selection strategy (ablation study)
+    token_strategy: str = "furthest"
+
+    # Safety radius for is_movable() hop check (ablation study)
+    safety_radius: int = 2
+
     # Raw data
     trials: List[TrialResult] = field(default_factory=list)
 
@@ -79,10 +202,21 @@ class MonteCarloResults:
             "n_meaningful_trials": self.n_meaningful_trials,
             "mean_shape_difference": self.mean_shape_difference,
             "std_shape_difference": self.std_shape_difference,
+            "mean_shape_difference_phase1": self.mean_shape_difference_phase1,
+            "std_shape_difference_phase1": self.std_shape_difference_phase1,
             "reconnection_rate": self.reconnection_rate,
             "full_restoration_rate": self.full_restoration_rate,
             "mean_phase1_moves": self.mean_phase1_moves,
             "mean_phase2_moves": self.mean_phase2_moves,
+            "mean_steps_to_reconnection": self.mean_steps_to_reconnection,
+            "std_steps_to_reconnection": self.std_steps_to_reconnection,
+            "mean_total_moves": self.mean_total_moves,
+            "std_total_moves": self.std_total_moves,
+            "mean_token_transmissions": self.mean_token_transmissions,
+            "std_token_transmissions": self.std_token_transmissions,
+            "std_reconnection_rate": self.std_reconnection_rate,
+            "token_strategy": self.token_strategy,
+            "safety_radius": self.safety_radius,
         }
 
 
@@ -141,7 +275,10 @@ def run_single_trial(
     trial_id: int = 0,
     mode_2d: bool = False,
     fully_connected: bool = True,
-    config_mode: str = CONFIG_MODE_RANDOM
+    config_mode: str = CONFIG_MODE_RANDOM,
+    fault_mode: str = FAULT_MODE_RANDOM,
+    token_strategy: str = "furthest",
+    safety_radius: int = 2
 ) -> TrialResult:
     """
     Execute a single Monte Carlo trial.
@@ -155,6 +292,7 @@ def run_single_trial(
         fully_connected: If True (default), connect to all adjacent modules (more branches).
                         If False, connect to only one (chain-like). Only used for 'random' mode.
         config_mode: Configuration generation mode ('random' or 'tree')
+        fault_mode: Fault selection strategy ('random', 'cluster', 'random_clusters', 'localized')
 
     Returns:
         TrialResult with metrics and outcomes
@@ -175,16 +313,17 @@ def run_single_trial(
         for mid, module in system.modules.items()
     }
 
-    # Select random fault modules
-    random.seed(seed + 1000)  # Different seed for fault selection
-    module_ids = list(system.modules.keys())
-    faulty_module_ids = random.sample(module_ids, min(n_faults, len(module_ids)))
+    # Select fault modules based on fault mode
+    faulty_module_ids = select_faulty_modules(system, n_faults, seed + 1000, fault_mode)
     faulty_modules_set = set(faulty_module_ids)
 
     # Run full damage response for each fault
     phase1_moves = 0
     phase2_moves = 0
+    phase1_iterations = 0
+    token_transmissions = 0
     restored = True  # Assume success until a fault fails to reconnect
+    post_phase1_positions = None  # Snapshot after last fault's phase 1
 
     for fault_id in faulty_module_ids:
         # Skip if module is already inactive (from previous fault)
@@ -196,7 +335,9 @@ def run_single_trial(
             fault_module_id=fault_id,
             restore_positions=True,
             max_phase1_iterations=1000,
-            max_phase2_iterations=1000
+            max_phase2_iterations=1000,
+            token_strategy=token_strategy,
+            safety_radius=safety_radius
         )
 
         # Accumulate stats
@@ -204,10 +345,17 @@ def run_single_trial(
         phase2_stats = result.get('phase2', {})
 
         phase1_moves += phase1_stats.get('total_moves', 0)
+        phase1_iterations += phase1_stats.get('iterations', 0)
+        token_transmissions += phase1_stats.get('token_transmissions', 0)
         restored = restored and phase1_stats.get('reconnected', False)
+
+        # Keep the post-phase1 snapshot from the last fault processed
+        if result.get('post_phase1_positions'):
+            post_phase1_positions = result['post_phase1_positions']
 
         if phase2_stats:
             phase2_moves += phase2_stats.get('restoration_moves', 0)
+            token_transmissions += phase2_stats.get('token_transmissions', 0)
 
     # Only calculate metrics for successful trials
     if restored:
@@ -218,13 +366,22 @@ def run_single_trial(
             if module.is_active
         }
 
-        # Calculate shape difference
+        # Calculate shape difference (after both phases)
         shape_diff = calculate_shape_difference(
             original_positions, final_positions, faulty_modules_set
         )
+
+        # Calculate shape difference after phase 1 only (before restructuring)
+        if post_phase1_positions:
+            shape_diff_phase1 = calculate_shape_difference(
+                original_positions, post_phase1_positions, faulty_modules_set
+            )
+        else:
+            shape_diff_phase1 = shape_diff
     else:
-        # Failed trial - metric is None
+        # Failed trial - metrics are None
         shape_diff = None
+        shape_diff_phase1 = None
 
     return TrialResult(
         trial_id=trial_id,
@@ -235,6 +392,13 @@ def run_single_trial(
         phase1_moves=phase1_moves,
         phase2_moves=phase2_moves,
         shape_difference=shape_diff,
+        shape_difference_phase1=shape_diff_phase1,
+        phase1_iterations=phase1_iterations,
+        total_moves=phase1_moves + phase2_moves,
+        token_transmissions=token_transmissions,
+        fault_mode=fault_mode,
+        token_strategy=token_strategy,
+        safety_radius=safety_radius,
     )
 
 
@@ -247,7 +411,10 @@ def run_monte_carlo(
     fully_connected: bool = True,
     verbose: bool = False,
     config_mode: str = CONFIG_MODE_RANDOM,
-    n_jobs: int = 1
+    n_jobs: int = 1,
+    fault_mode: str = FAULT_MODE_RANDOM,
+    token_strategy: str = "furthest",
+    safety_radius: int = 2
 ) -> MonteCarloResults:
     """
     Run Monte Carlo simulation with given parameters.
@@ -263,6 +430,7 @@ def run_monte_carlo(
         verbose: If True, print progress
         config_mode: Configuration generation mode ('random' or 'tree')
         n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
+        fault_mode: Fault selection strategy ('random', 'cluster', 'random_clusters', 'localized')
 
     Returns:
         MonteCarloResults with aggregated statistics
@@ -271,7 +439,7 @@ def run_monte_carlo(
         seed = random.randint(0, 2**31 - 1)
 
     trial_args = [
-        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode)
+        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode, fault_mode, token_strategy, safety_radius)
         for i in range(n_trials)
     ]
 
@@ -311,9 +479,20 @@ def run_monte_carlo(
     if successful_trials:
         mean_shape_diff = float(np.mean(shape_diffs))
         std_shape_diff = float(np.std(shape_diffs))
+
+        shape_diffs_p1 = [t.shape_difference_phase1 for t in successful_trials
+                          if t.shape_difference_phase1 is not None]
+        if shape_diffs_p1:
+            mean_shape_diff_p1 = float(np.mean(shape_diffs_p1))
+            std_shape_diff_p1 = float(np.std(shape_diffs_p1))
+        else:
+            mean_shape_diff_p1 = float('nan')
+            std_shape_diff_p1 = float('nan')
     else:
         mean_shape_diff = float('nan')
         std_shape_diff = float('nan')
+        mean_shape_diff_p1 = float('nan')
+        std_shape_diff_p1 = float('nan')
 
     # Calculate rates relative to meaningful trials (avoid division by zero)
     if n_meaningful > 0:
@@ -321,11 +500,31 @@ def run_monte_carlo(
         full_restoration_rate = full_restored_count / n_meaningful
         mean_p1_moves = float(np.mean([t.phase1_moves for t in meaningful_trials]))
         mean_p2_moves = float(np.mean([t.phase2_moves for t in meaningful_trials]))
+
+        # New aggregated metrics
+        steps = [t.phase1_iterations for t in meaningful_trials]
+        total_moves_list = [t.total_moves for t in meaningful_trials]
+        tokens_list = [t.token_transmissions for t in meaningful_trials]
+
+        mean_steps = float(np.mean(steps))
+        std_steps = float(np.std(steps))
+        mean_total_moves = float(np.mean(total_moves_list))
+        std_total_moves = float(np.std(total_moves_list))
+        mean_tokens = float(np.mean(tokens_list))
+        std_tokens = float(np.std(tokens_list))
+        std_reconn = float(np.sqrt(reconnection_rate * (1 - reconnection_rate) / n_meaningful))
     else:
         reconnection_rate = float('nan')
         full_restoration_rate = float('nan')
         mean_p1_moves = float('nan')
         mean_p2_moves = float('nan')
+        mean_steps = float('nan')
+        std_steps = float('nan')
+        mean_total_moves = float('nan')
+        std_total_moves = float('nan')
+        mean_tokens = float('nan')
+        std_tokens = float('nan')
+        std_reconn = float('nan')
 
     return MonteCarloResults(
         n_modules=n_modules,
@@ -334,10 +533,21 @@ def run_monte_carlo(
         n_meaningful_trials=n_meaningful,
         mean_shape_difference=mean_shape_diff,
         std_shape_difference=std_shape_diff,
+        mean_shape_difference_phase1=mean_shape_diff_p1,
+        std_shape_difference_phase1=std_shape_diff_p1,
         reconnection_rate=reconnection_rate,
         full_restoration_rate=full_restoration_rate,
         mean_phase1_moves=mean_p1_moves,
         mean_phase2_moves=mean_p2_moves,
+        mean_steps_to_reconnection=mean_steps,
+        std_steps_to_reconnection=std_steps,
+        mean_total_moves=mean_total_moves,
+        std_total_moves=std_total_moves,
+        mean_token_transmissions=mean_tokens,
+        std_token_transmissions=std_tokens,
+        std_reconnection_rate=std_reconn,
+        token_strategy=token_strategy,
+        safety_radius=safety_radius,
         trials=meaningful_trials  # Only include meaningful trials in raw data
     )
 
@@ -352,7 +562,8 @@ def run_parameter_sweep(
     verbose: bool = False,
     config_mode: str = CONFIG_MODE_RANDOM,
     dynamic_faults: bool = False,
-    n_jobs: int = 1
+    n_jobs: int = 1,
+    fault_mode: str = FAULT_MODE_RANDOM
 ) -> Dict[Tuple[int, int], MonteCarloResults]:
     """
     Run Monte Carlo simulations across parameter ranges.
@@ -397,7 +608,8 @@ def run_parameter_sweep(
                 fully_connected=fully_connected,
                 verbose=False,
                 config_mode=config_mode,
-                n_jobs=n_jobs
+                n_jobs=n_jobs,
+                fault_mode=fault_mode
             )
             results[(n, f)] = result
             config_seed += n_trials
@@ -414,7 +626,8 @@ def run_parameter_sweep(
                     fully_connected=fully_connected,
                     verbose=False,
                     config_mode=config_mode,
-                    n_jobs=n_jobs
+                    n_jobs=n_jobs,
+                    fault_mode=fault_mode
                 )
                 results[(n, f)] = result
                 config_seed += n_trials
@@ -429,14 +642,25 @@ def print_results_summary(results: MonteCarloResults) -> None:
     print(f"{'='*60}")
     print(f"Trials: {results.n_trials}")
     print(f"\nShape Difference:")
-    print(f"  diff(P, Q): {results.mean_shape_difference:.4f} "
+    print(f"  After Phase 1 only: {results.mean_shape_difference_phase1:.4f} "
+          f"± {results.std_shape_difference_phase1:.4f}")
+    print(f"  After Phase 1 + 2:  {results.mean_shape_difference:.4f} "
           f"± {results.std_shape_difference:.4f}")
     print(f"\nSuccess Rates:")
-    print(f"  Reconnection Rate: {results.reconnection_rate:.1%}")
+    print(f"  Reconnection Rate: {results.reconnection_rate:.1%}"
+          f" ± {results.std_reconnection_rate:.4f}")
     print(f"  Full Restoration Rate: {results.full_restoration_rate:.1%}")
+    print(f"\nSteps to Reconnection:")
+    print(f"  Mean: {results.mean_steps_to_reconnection:.1f}"
+          f" ± {results.std_steps_to_reconnection:.1f}")
     print(f"\nMove Statistics:")
     print(f"  Mean Phase 1 Moves: {results.mean_phase1_moves:.1f}")
     print(f"  Mean Phase 2 Moves: {results.mean_phase2_moves:.1f}")
+    print(f"  Mean Total Moves: {results.mean_total_moves:.1f}"
+          f" ± {results.std_total_moves:.1f}")
+    print(f"\nToken Transmissions:")
+    print(f"  Mean: {results.mean_token_transmissions:.1f}"
+          f" ± {results.std_token_transmissions:.1f}")
     print(f"{'='*60}\n")
 
 

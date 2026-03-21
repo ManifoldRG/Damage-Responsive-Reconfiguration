@@ -19,6 +19,7 @@ Examples:
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 from datetime import datetime
@@ -27,21 +28,35 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 
-from src.monte_carlo import run_monte_carlo, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE
+from src.monte_carlo import (
+    run_monte_carlo, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE,
+    FAULT_MODE_RANDOM, FAULT_MODE_CLUSTER, FAULT_MODE_RANDOM_CLUSTERS, FAULT_MODE_LOCALIZED
+)
 
 
 SUMMARY_HEADERS = [
     'n_modules', 'n_faults', 'n_trials', 'n_meaningful_trials',
     'mean_shape_difference', 'std_shape_difference',
-    'reconnection_rate', 'full_restoration_rate',
-    'mean_phase1_moves', 'mean_phase2_moves'
+    'mean_shape_difference_phase1', 'std_shape_difference_phase1',
+    'reconnection_rate', 'std_reconnection_rate',
+    'full_restoration_rate',
+    'mean_phase1_moves', 'mean_phase2_moves',
+    'mean_steps_to_reconnection', 'std_steps_to_reconnection',
+    'mean_total_moves', 'std_total_moves',
+    'mean_token_transmissions', 'std_token_transmissions',
+    'fault_mode', 'fault_pct', 'token_strategy', 'safety_radius'
 ]
 
 TRIALS_HEADERS = [
     'trial_id', 'n_modules', 'n_faults', 'seed',
     'restored', 'phase1_moves', 'phase2_moves',
-    'shape_difference'
+    'shape_difference', 'shape_difference_phase1',
+    'phase1_iterations', 'total_moves',
+    'token_transmissions', 'fault_mode', 'token_strategy', 'safety_radius'
 ]
+
+TOKEN_STRATEGIES = ["furthest", "nearest", "random"]
+SAFETY_RADII = [2, 3, 4]
 
 
 def load_completed_n_values(output_dir):
@@ -102,6 +117,10 @@ def main():
         help="Maximum number of modules (default: 50)"
     )
     parser.add_argument(
+        "--n-step", type=int, default=1,
+        help="Step size between n values (default: 1)"
+    )
+    parser.add_argument(
         "--faults", type=int, default=1,
         help="Number of faults per trial (default: 1)"
     )
@@ -154,6 +173,22 @@ def main():
         help="Resume from an existing output directory, skipping n values "
              "already present in sweep_summary.csv"
     )
+    parser.add_argument(
+        "--cluster-faults", action="store_true",
+        help="Run cluster failure sweep: for each n, test cluster sizes 2,3,4,5"
+    )
+    parser.add_argument(
+        "--dynamic-pct", action="store_true",
+        help="Run dynamic percentage fault sweep: 10%%, 20%%, 30%% x 3 spatial patterns"
+    )
+    parser.add_argument(
+        "--ablation", action="store_true",
+        help="Run token selection strategy ablation: sweep furthest, nearest, random for each config"
+    )
+    parser.add_argument(
+        "--ablation-hops", action="store_true",
+        help="Run safety radius ablation: sweep hop radii 2, 3, 4 for is_movable() check"
+    )
 
     args = parser.parse_args()
 
@@ -178,6 +213,11 @@ def main():
         n_faults_cfg = config.get('n_faults', 1)
         n_faults = n_faults_cfg if isinstance(n_faults_cfg, int) else 1
         n_jobs = config.get('n_jobs', -1)
+        cluster_faults = config.get('cluster_faults', False)
+        dynamic_pct = config.get('dynamic_pct', False)
+        ablation = config.get('ablation', False)
+        ablation_hops = config.get('ablation_hops', False)
+        n_step = config.get('n_step', 1)
         output_dir = resume_dir
 
         completed = load_completed_n_values(output_dir)
@@ -201,6 +241,11 @@ def main():
         dynamic_faults = args.dynamic_faults
         n_faults = args.faults
         n_jobs = args.jobs
+        cluster_faults = args.cluster_faults
+        dynamic_pct = args.dynamic_pct
+        ablation = args.ablation
+        ablation_hops = args.ablation_hops
+        n_step = args.n_step
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_dir = os.path.join(args.output_dir, timestamp)
@@ -218,6 +263,11 @@ def main():
             "fully_connected": fully_connected,
             "config_mode": config_mode,
             "n_jobs": n_jobs,
+            "cluster_faults": cluster_faults,
+            "dynamic_pct": dynamic_pct,
+            "ablation": ablation,
+            "ablation_hops": ablation_hops,
+            "n_step": n_step,
         }
         with open(os.path.join(output_dir, "config.json"), 'w') as f:
             json.dump(config, f, indent=2)
@@ -233,7 +283,7 @@ def main():
         connectivity_desc = "chain-like"
 
     no_graphs = args.no_graphs
-    all_n_values = list(range(n_min, n_max + 1))
+    all_n_values = list(range(n_min, n_max + 1, n_step))
     remaining = [n for n in all_n_values if n not in completed]
 
     print("=" * 70)
@@ -252,19 +302,61 @@ def main():
     print(f"  Config type: {config_mode}")
     print(f"  Connectivity: {connectivity_desc}")
     print(f"  Parallel jobs: {n_jobs} {'(all cores)' if n_jobs == -1 else ''}")
+    if cluster_faults:
+        print(f"  Cluster faults: enabled (cluster sizes 2,3,4,5)")
+    if dynamic_pct:
+        print(f"  Dynamic pct: enabled (10%,20%,30% x random,random_clusters,localized)")
+    if ablation:
+        print(f"  Ablation: enabled (token strategies: furthest, nearest, random)")
+    if ablation_hops:
+        print(f"  Ablation-hops: enabled (safety radii: {SAFETY_RADII})")
     if completed:
         print(f"  Resuming: {len(completed)}/{len(all_n_values)} n-values already done")
     print("=" * 70)
     print()
 
-    total_remaining = len(remaining) * n_trials
-    print(f"Running {len(remaining)} configurations x {n_trials} trials = {total_remaining:,} total trials")
+    # Calculate multiplier for new modes
+    configs_per_n = 1
+    if cluster_faults:
+        configs_per_n = 4  # cluster sizes 2,3,4,5
+    elif dynamic_pct:
+        configs_per_n = 9  # 3 pcts x 3 patterns
+    if ablation:
+        configs_per_n *= len(TOKEN_STRATEGIES)  # multiply by 3 strategies
+    if ablation_hops:
+        configs_per_n *= len(SAFETY_RADII)  # multiply by 3 radii
+    total_remaining = len(remaining) * n_trials * configs_per_n
+    print(f"Running {len(remaining)} n-values x {configs_per_n} configs x {n_trials} trials = {total_remaining:,} total trials")
     if completed:
         print(f"  (skipping {len(completed)} already-completed configurations)")
     print("This may take a while...\n")
 
+    # --- Build list of (n, f, fault_mode, fault_pct_label, token_strategy, safety_radius) sweep jobs ---
+    strategies = TOKEN_STRATEGIES if ablation else ["furthest"]
+    radii = SAFETY_RADII if ablation_hops else [2]
+    sweep_jobs = []
+    for n in remaining:
+        if cluster_faults:
+            for cluster_size in [2, 3, 4, 5]:
+                for strat in strategies:
+                    for radius in radii:
+                        sweep_jobs.append((n, cluster_size, FAULT_MODE_CLUSTER, '', strat, radius))
+        elif dynamic_pct:
+            for pct in [0.10, 0.20, 0.30]:
+                f = max(1, math.ceil(n * pct))
+                pct_label = f'{int(pct*100)}%'
+                for fm in [FAULT_MODE_RANDOM, FAULT_MODE_RANDOM_CLUSTERS, FAULT_MODE_LOCALIZED]:
+                    for strat in strategies:
+                        for radius in radii:
+                            sweep_jobs.append((n, f, fm, pct_label, strat, radius))
+        else:
+            f = max(1, n // 10) if dynamic_faults else n_faults
+            for strat in strategies:
+                for radius in radii:
+                    sweep_jobs.append((n, f, FAULT_MODE_RANDOM, '', strat, radius))
+
     # --- Streaming sweep loop ---
-    if remaining:
+    if sweep_jobs:
         summary_csv_path = os.path.join(output_dir, "sweep_summary.csv")
         trials_csv_path = os.path.join(output_dir, "trials.csv")
 
@@ -287,13 +379,12 @@ def main():
                 summary_writer.writerow(SUMMARY_HEADERS)
                 trials_writer.writerow(TRIALS_HEADERS)
 
-            n_iterator = tqdm(remaining, desc="Parameter sweep")
-            for n in n_iterator:
-                f = max(1, n // 10) if dynamic_faults else n_faults
-                n_iterator.set_postfix(n=n, f=f)
+            job_iterator = tqdm(sweep_jobs, desc="Parameter sweep")
+            for job_idx, (n, f, fault_mode, fault_pct_label, tok_strat, radius) in enumerate(job_iterator):
+                job_iterator.set_postfix(n=n, f=f, mode=fault_mode, strat=tok_strat, radius=radius)
 
-                # Deterministic seed: same for a given n regardless of resume
-                config_seed = base_seed + (n - n_min) * n_trials
+                # Deterministic seed: offset by n position and job sub-index within that n
+                config_seed = base_seed + (n - n_min) * n_trials * configs_per_n + job_idx * 7
 
                 result = run_monte_carlo(
                     n_modules=n,
@@ -304,7 +395,10 @@ def main():
                     fully_connected=fully_connected,
                     verbose=False,
                     config_mode=config_mode,
-                    n_jobs=n_jobs
+                    n_jobs=n_jobs,
+                    fault_mode=fault_mode,
+                    token_strategy=tok_strat,
+                    safety_radius=radius
                 )
 
                 # Stream summary row
@@ -313,10 +407,23 @@ def main():
                     result.n_meaningful_trials,
                     f'{result.mean_shape_difference:.6f}',
                     f'{result.std_shape_difference:.6f}',
+                    f'{result.mean_shape_difference_phase1:.6f}',
+                    f'{result.std_shape_difference_phase1:.6f}',
                     f'{result.reconnection_rate:.4f}',
+                    f'{result.std_reconnection_rate:.4f}',
                     f'{result.full_restoration_rate:.4f}',
                     f'{result.mean_phase1_moves:.2f}',
-                    f'{result.mean_phase2_moves:.2f}'
+                    f'{result.mean_phase2_moves:.2f}',
+                    f'{result.mean_steps_to_reconnection:.2f}',
+                    f'{result.std_steps_to_reconnection:.2f}',
+                    f'{result.mean_total_moves:.2f}',
+                    f'{result.std_total_moves:.2f}',
+                    f'{result.mean_token_transmissions:.2f}',
+                    f'{result.std_token_transmissions:.2f}',
+                    fault_mode,
+                    fault_pct_label,
+                    tok_strat,
+                    radius
                 ])
                 summary_file.flush()
 
@@ -326,7 +433,13 @@ def main():
                         trial.trial_id, trial.n_modules, trial.n_faults,
                         trial.seed, trial.restored, trial.phase1_moves,
                         trial.phase2_moves,
-                        trial.shape_difference if trial.shape_difference is not None else ''
+                        trial.shape_difference if trial.shape_difference is not None else '',
+                        trial.shape_difference_phase1 if trial.shape_difference_phase1 is not None else '',
+                        trial.phase1_iterations, trial.total_moves,
+                        trial.token_transmissions,
+                        trial.fault_mode,
+                        trial.token_strategy,
+                        trial.safety_radius
                     ])
                 trials_file.flush()
 
