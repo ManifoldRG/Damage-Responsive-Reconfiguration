@@ -10,6 +10,7 @@ Key metric:
   where P, Q are sets of pairwise inter-module distances before/after damage.
 """
 
+import copy
 import random
 from collections import deque
 from dataclasses import dataclass, field
@@ -144,6 +145,9 @@ class TrialResult:
     # Safety radius for is_movable() hop check (ablation study)
     safety_radius: int = 2
 
+    # Reconstruction method
+    reconstruction_method: str = "token"
+
 
 @dataclass
 class MonteCarloResults:
@@ -190,6 +194,9 @@ class MonteCarloResults:
     # Safety radius for is_movable() hop check (ablation study)
     safety_radius: int = 2
 
+    # Reconstruction method
+    reconstruction_method: str = "token"
+
     # Raw data
     trials: List[TrialResult] = field(default_factory=list)
 
@@ -217,6 +224,7 @@ class MonteCarloResults:
             "std_reconnection_rate": self.std_reconnection_rate,
             "token_strategy": self.token_strategy,
             "safety_radius": self.safety_radius,
+            "reconstruction_method": self.reconstruction_method,
         }
 
 
@@ -278,7 +286,8 @@ def run_single_trial(
     config_mode: str = CONFIG_MODE_RANDOM,
     fault_mode: str = FAULT_MODE_RANDOM,
     token_strategy: str = "furthest",
-    safety_radius: int = 2
+    safety_radius: int = 2,
+    reconstruction_method: str = "token"
 ) -> TrialResult:
     """
     Execute a single Monte Carlo trial.
@@ -337,7 +346,8 @@ def run_single_trial(
             max_phase1_iterations=1000,
             max_phase2_iterations=1000,
             token_strategy=token_strategy,
-            safety_radius=safety_radius
+            safety_radius=safety_radius,
+            reconstruction_method=reconstruction_method
         )
 
         # Accumulate stats
@@ -399,7 +409,188 @@ def run_single_trial(
         fault_mode=fault_mode,
         token_strategy=token_strategy,
         safety_radius=safety_radius,
+        reconstruction_method=reconstruction_method,
     )
+
+
+def run_comparison_trial(
+    n_modules: int,
+    n_faults: int,
+    seed: int,
+    trial_id: int = 0,
+    mode_2d: bool = False,
+    fully_connected: bool = True,
+    config_mode: str = CONFIG_MODE_RANDOM,
+    fault_mode: str = FAULT_MODE_RANDOM,
+    token_strategy: str = "furthest",
+    safety_radius: int = 2
+) -> Tuple[TrialResult, TrialResult]:
+    """
+    Run a single trial comparing token-based vs displacement-based reconstruction.
+
+    Shares the exact same Phase 1 state between both methods via deepcopy.
+    Returns (token_result, displacement_result).
+    """
+    # Generate structure
+    if config_mode == CONFIG_MODE_TREE:
+        system = create_random_tree_configuration(
+            n_modules, seed=seed, mode_2d=mode_2d, balanced=False
+        )
+    else:
+        system = create_random_configuration(
+            n_modules, seed=seed, mode_2d=mode_2d, fully_connected=fully_connected
+        )
+
+    original_positions = {
+        mid: module.position.copy()
+        for mid, module in system.modules.items()
+    }
+
+    faulty_module_ids = select_faulty_modules(system, n_faults, seed + 1000, fault_mode)
+    faulty_modules_set = set(faulty_module_ids)
+
+    # Capture pre-damage neighbor sets BEFORE any faults are injected.
+    # This is critical: restructuring tokens are generated from these
+    # original neighbor directions (ρ_uv). Building them after Phase 1
+    # would just reflect the current state and produce zero tokens.
+    pre_damage_neighbors: Dict[str, Dict[str, np.ndarray]] = {}
+    for mid, module in system.modules.items():
+        if module.is_active and not module.is_faulty:
+            neighbors_info = {}
+            for n in system.get_neighbors(mid):
+                edge = system.edges.get((mid, n))
+                if edge:
+                    neighbors_info[n] = edge.translation.copy()
+            pre_damage_neighbors[mid] = neighbors_info
+
+    # --- Run Phase 1 only (no Phase 2) ---
+    phase1_moves = 0
+    phase1_iterations = 0
+    phase1_token_transmissions = 0
+    restored = True
+    post_phase1_positions = None
+
+    for fault_id in faulty_module_ids:
+        if not system.modules[fault_id].is_active:
+            continue
+
+        result = system.full_damage_response(
+            fault_module_id=fault_id,
+            restore_positions=False,  # Skip Phase 2
+            max_phase1_iterations=1000,
+            safety_radius=safety_radius
+        )
+
+        phase1_stats = result.get('phase1', {})
+        phase1_moves += phase1_stats.get('total_moves', 0)
+        phase1_iterations += phase1_stats.get('iterations', 0)
+        phase1_token_transmissions += phase1_stats.get('token_transmissions', 0)
+        restored = restored and phase1_stats.get('reconnected', False)
+
+        if result.get('post_phase1_positions'):
+            post_phase1_positions = result['post_phase1_positions']
+
+    # Calculate shape difference after phase 1
+    if restored and post_phase1_positions:
+        shape_diff_phase1 = calculate_shape_difference(
+            original_positions, post_phase1_positions, faulty_modules_set
+        )
+    elif restored:
+        shape_diff_phase1 = 0.0
+    else:
+        shape_diff_phase1 = None
+
+    # If Phase 1 failed, return failed results for both methods
+    if not restored:
+        base = TrialResult(
+            trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
+            seed=seed, restored=False, phase1_moves=phase1_moves,
+            phase2_moves=0, shape_difference=None,
+            shape_difference_phase1=shape_diff_phase1,
+            phase1_iterations=phase1_iterations,
+            total_moves=phase1_moves,
+            token_transmissions=phase1_token_transmissions,
+            fault_mode=fault_mode, token_strategy=token_strategy,
+            safety_radius=safety_radius,
+        )
+        from dataclasses import replace
+        token_res = replace(base, reconstruction_method="token")
+        disp_res = replace(base, reconstruction_method="displacement")
+        return token_res, disp_res
+
+    # --- Deep-copy system state after Phase 1, run each Phase 2 independently ---
+    system_token = copy.deepcopy(system)
+    system_disp = copy.deepcopy(system)
+
+    def _run_phase2(sys, method):
+        """Run Phase 2 on a system copy and return (phase2_moves, phase2_tokens, shape_diff)."""
+        if method == "displacement":
+            phase2_stats = sys.restructuring_displacement(
+                original_positions=original_positions,
+                max_iterations=1000,
+                record_steps=False
+            )
+        else:
+            # Find which modules moved during coagulation
+            # (any module not at its original position)
+            coag_moved = set()
+            for mid, orig_pos in original_positions.items():
+                if mid not in sys.modules or not sys.modules[mid].is_active:
+                    continue
+                if sys.modules[mid].is_faulty:
+                    continue
+                if np.linalg.norm(sys.modules[mid].position - orig_pos) > 0.5:
+                    coag_moved.add(mid)
+
+            phase2_stats = sys.restructuring(
+                pre_damage_neighbors=pre_damage_neighbors,
+                original_positions=original_positions,
+                max_iterations=1000,
+                record_steps=False,
+                token_strategy=token_strategy,
+                safety_radius=safety_radius,
+                coag_moved=coag_moved
+            )
+
+        p2_moves = phase2_stats.get('restoration_moves', 0)
+        p2_tokens = phase2_stats.get('token_transmissions', 0)
+
+        final_positions = {
+            mid: module.position.copy()
+            for mid, module in sys.modules.items()
+            if module.is_active
+        }
+        shape_diff = calculate_shape_difference(
+            original_positions, final_positions, faulty_modules_set
+        )
+        return p2_moves, p2_tokens, shape_diff
+
+    tok_p2_moves, tok_p2_tokens, tok_shape = _run_phase2(system_token, "token")
+    disp_p2_moves, disp_p2_tokens, disp_shape = _run_phase2(system_disp, "displacement")
+
+    token_result = TrialResult(
+        trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
+        seed=seed, restored=True, phase1_moves=phase1_moves,
+        phase2_moves=tok_p2_moves, shape_difference=tok_shape,
+        shape_difference_phase1=shape_diff_phase1,
+        phase1_iterations=phase1_iterations,
+        total_moves=phase1_moves + tok_p2_moves,
+        token_transmissions=phase1_token_transmissions + tok_p2_tokens,
+        fault_mode=fault_mode, token_strategy=token_strategy,
+        safety_radius=safety_radius, reconstruction_method="token",
+    )
+    disp_result = TrialResult(
+        trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
+        seed=seed, restored=True, phase1_moves=phase1_moves,
+        phase2_moves=disp_p2_moves, shape_difference=disp_shape,
+        shape_difference_phase1=shape_diff_phase1,
+        phase1_iterations=phase1_iterations,
+        total_moves=phase1_moves + disp_p2_moves,
+        token_transmissions=phase1_token_transmissions + disp_p2_tokens,
+        fault_mode=fault_mode, token_strategy=token_strategy,
+        safety_radius=safety_radius, reconstruction_method="displacement",
+    )
+    return token_result, disp_result
 
 
 def run_monte_carlo(
@@ -414,7 +605,8 @@ def run_monte_carlo(
     n_jobs: int = 1,
     fault_mode: str = FAULT_MODE_RANDOM,
     token_strategy: str = "furthest",
-    safety_radius: int = 2
+    safety_radius: int = 2,
+    reconstruction_method: str = "token"
 ) -> MonteCarloResults:
     """
     Run Monte Carlo simulation with given parameters.
@@ -439,7 +631,7 @@ def run_monte_carlo(
         seed = random.randint(0, 2**31 - 1)
 
     trial_args = [
-        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode, fault_mode, token_strategy, safety_radius)
+        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode, fault_mode, token_strategy, safety_radius, reconstruction_method)
         for i in range(n_trials)
     ]
 
@@ -548,6 +740,7 @@ def run_monte_carlo(
         std_reconnection_rate=std_reconn,
         token_strategy=token_strategy,
         safety_radius=safety_radius,
+        reconstruction_method=reconstruction_method,
         trials=meaningful_trials  # Only include meaningful trials in raw data
     )
 

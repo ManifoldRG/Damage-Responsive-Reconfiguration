@@ -1183,6 +1183,120 @@ class UDQDGSystem:
 
         return stats
 
+    def restructuring_displacement(
+        self,
+        original_positions: Dict[str, np.ndarray],
+        max_iterations: int = 100,
+        record_steps: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Phase 2 (displacement-guided): Position restoration via displacement vectors.
+
+        Each module computes its displacement from its original position and
+        moves toward it. Modules with largest displacement move first (greedy).
+        Uses alignment-based pivot selection toward original position.
+
+        This is the paper-code baseline for comparison with token-based restructuring.
+        """
+        stats = {
+            "iterations": 0,
+            "restoration_moves": 0,
+            "success": False,
+            "token_transmissions": 0
+        }
+        if record_steps:
+            stats["steps"] = []
+            stats["parallel_steps"] = []
+
+        if original_positions is None:
+            stats["success"] = True
+            return stats
+
+        for iteration in range(max_iterations):
+            stats["iterations"] = iteration + 1
+
+            # Compute displacement for each active module
+            displacements = {}
+            for mid, orig_pos in original_positions.items():
+                if mid not in self.modules or not self.modules[mid].is_active:
+                    continue
+                if self.modules[mid].is_faulty:
+                    continue
+                disp = orig_pos - self.modules[mid].position
+                dist = float(np.linalg.norm(disp))
+                if dist > 0.5:  # Only modules that have moved significantly
+                    displacements[mid] = (disp, dist)
+
+            if not displacements:
+                stats["success"] = True
+                break
+
+            # Sort by displacement (largest first)
+            sorted_modules = sorted(displacements.keys(),
+                                    key=lambda m: displacements[m][1],
+                                    reverse=True)
+
+            moves_this_iteration = 0
+            occupied_destinations = set()
+
+            for mid in sorted_modules:
+                disp, dist = displacements[mid]
+
+                if not self.is_movable(mid):
+                    continue
+
+                # Select pivot aligned with displacement direction
+                pivot = self.select_pivot_by_alignment(mid, disp)
+                if pivot is None:
+                    continue
+
+                # Check destination not already claimed
+                from_pos = self.modules[mid].position.copy()
+                dest_pos = from_pos + pivot[4]
+                dest_key = tuple(np.round(dest_pos).astype(int))
+                if dest_key in occupied_destinations:
+                    continue
+
+                # Verify move reduces displacement (prevent oscillation)
+                new_disp = np.linalg.norm(original_positions[mid] - dest_pos)
+                if new_disp >= dist - 0.01:
+                    continue  # Skip if not strictly improving
+
+                occupied_destinations.add(dest_key)
+                pivot_type, _, param1, param2, delta_p = pivot
+                success = False
+                if pivot_type == 'corner':
+                    success = self.corner_pivot(mid, param1, param2)
+                elif pivot_type == 'lateral':
+                    success = self.lateral_pivot(mid, param1, param2)
+
+                if success:
+                    moves_this_iteration += 1
+                    stats["restoration_moves"] += 1
+                    to_pos = self.modules[mid].position.copy()
+
+                    if record_steps:
+                        stats["steps"].append(RestorationStep(
+                            iteration=iteration + 1,
+                            pivot_type=pivot_type,
+                            module_id=mid,
+                            param1=param1,
+                            param2=param2,
+                            from_pos=from_pos,
+                            to_pos=to_pos,
+                            distance_before=dist,
+                            distance_after=float(np.linalg.norm(original_positions[mid] - to_pos)),
+                            is_restoration_complete=False
+                        ))
+
+            # Form new connections
+            self._form_new_connections()
+
+            if moves_this_iteration == 0:
+                break
+
+        return stats
+
     def is_connected(self, active_only: bool = True) -> bool:
         """
         Check if the graph is connected.
@@ -1293,6 +1407,7 @@ class UDQDGSystem:
         record_steps: bool = True,
         token_strategy: str = "furthest",
         safety_radius: int = 2,
+        reconstruction_method: str = "displacement",
         # Legacy params (ignored, kept for API compat)
         one_per_subgraph: bool = True,
         parallel_subgraphs: bool = True
@@ -1306,7 +1421,7 @@ class UDQDGSystem:
         3. Runs coagulation (distress tokens) to restore connectivity
         4. Runs restructuring (rendezvous tokens) to recover shape
         """
-        result = {
+        result: Dict[str, Any] = {
             "phase1": None,
             "phase2": None,
             "overall_success": False,
@@ -1363,16 +1478,23 @@ class UDQDGSystem:
 
         # Phase 2: Restructuring
         if restore_positions:
-            coag_moved = phase1_stats.get("modules_moved", set())
-            phase2_stats = self.restructuring(
-                pre_damage_neighbors=pre_damage_neighbors,
-                original_positions=original_positions,
-                max_iterations=max_phase2_iterations,
-                record_steps=record_steps,
-                token_strategy=token_strategy,
-                safety_radius=safety_radius,
-                coag_moved=coag_moved
-            )
+            if reconstruction_method == "displacement":
+                phase2_stats = self.restructuring_displacement(
+                    original_positions=original_positions,
+                    max_iterations=max_phase2_iterations,
+                    record_steps=record_steps
+                )
+            else:
+                coag_moved = phase1_stats.get("modules_moved", set())
+                phase2_stats = self.restructuring(
+                    pre_damage_neighbors=pre_damage_neighbors,
+                    original_positions=original_positions,
+                    max_iterations=max_phase2_iterations,
+                    record_steps=record_steps,
+                    token_strategy=token_strategy,
+                    safety_radius=safety_radius,
+                    coag_moved=coag_moved
+                )
             result["phase2"] = phase2_stats
             result["total_moves"] += phase2_stats.get("restoration_moves", 0)
             result["overall_success"] = True  # Phase 1 reconnected
