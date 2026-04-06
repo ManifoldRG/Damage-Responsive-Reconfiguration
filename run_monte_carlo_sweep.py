@@ -121,6 +121,10 @@ def main():
         help="Step size between n values (default: 1)"
     )
     parser.add_argument(
+        "--n-values", type=int, nargs="+", default=None,
+        help="Explicit list of n values to sweep (overrides --n-min/--n-max/--n-step)"
+    )
+    parser.add_argument(
         "--faults", type=int, default=1,
         help="Number of faults per trial (default: 1)"
     )
@@ -291,7 +295,10 @@ def main():
         connectivity_desc = "chain-like"
 
     no_graphs = args.no_graphs
-    all_n_values = list(range(n_min, n_max + 1, n_step))
+    if args.n_values:
+        all_n_values = sorted(args.n_values)
+    else:
+        all_n_values = list(range(n_min, n_max + 1, n_step))
     remaining = [n for n in all_n_values if n not in completed]
 
     print("=" * 70)
