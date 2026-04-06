@@ -189,6 +189,11 @@ def main():
         "--ablation-hops", action="store_true",
         help="Run safety radius ablation: sweep hop radii 2, 3, 4 for is_movable() check"
     )
+    parser.add_argument(
+        "--reconstruction", type=str, default="displacement",
+        choices=["token", "displacement"],
+        help="Phase 2 reconstruction method (default: displacement)"
+    )
 
     args = parser.parse_args()
 
@@ -218,6 +223,7 @@ def main():
         ablation = config.get('ablation', False)
         ablation_hops = config.get('ablation_hops', False)
         n_step = config.get('n_step', 1)
+        reconstruction_method = config.get('reconstruction_method', 'displacement')
         output_dir = resume_dir
 
         completed = load_completed_n_values(output_dir)
@@ -246,6 +252,7 @@ def main():
         ablation = args.ablation
         ablation_hops = args.ablation_hops
         n_step = args.n_step
+        reconstruction_method = args.reconstruction
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_dir = os.path.join(args.output_dir, timestamp)
@@ -268,6 +275,7 @@ def main():
             "ablation": ablation,
             "ablation_hops": ablation_hops,
             "n_step": n_step,
+            "reconstruction_method": reconstruction_method,
         }
         with open(os.path.join(output_dir, "config.json"), 'w') as f:
             json.dump(config, f, indent=2)
@@ -302,6 +310,7 @@ def main():
     print(f"  Config type: {config_mode}")
     print(f"  Connectivity: {connectivity_desc}")
     print(f"  Parallel jobs: {n_jobs} {'(all cores)' if n_jobs == -1 else ''}")
+    print(f"  Reconstruction: {reconstruction_method}")
     if cluster_faults:
         print(f"  Cluster faults: enabled (cluster sizes 2,3,4,5)")
     if dynamic_pct:
@@ -398,7 +407,8 @@ def main():
                     n_jobs=n_jobs,
                     fault_mode=fault_mode,
                     token_strategy=tok_strat,
-                    safety_radius=radius
+                    safety_radius=radius,
+                    reconstruction_method=reconstruction_method
                 )
 
                 # Stream summary row
