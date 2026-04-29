@@ -16,6 +16,14 @@ try:
 except ImportError:
     _HAS_VISUALIZATION = False
 
+# Optional physics simulation imports (PyBullet-based)
+try:
+    from .physics_sim import PhysicsSimulator
+    from .physics_bridge import PhysicsBridge
+    _HAS_PHYSICS = True
+except ImportError:
+    _HAS_PHYSICS = False
+
 # Legacy imports for compatibility (may be in archive/)
 _HAS_LEGACY = False
 try:
@@ -53,6 +61,13 @@ if _HAS_VISUALIZATION:
         "AnimationEngine",
         "PivotAnimation",
         "PivotType",
+    ])
+
+# Add physics exports if available
+if _HAS_PHYSICS:
+    __all__.extend([
+        "PhysicsSimulator",
+        "PhysicsBridge",
     ])
 
 # Add legacy exports if available
