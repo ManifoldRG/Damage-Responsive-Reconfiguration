@@ -1,0 +1,41 @@
+N=5..50 step 5, 10 trials, dynamic-pct + ablation-hops, seed=42
+
+============================================================
+GRAPH SWEEPS (run_monte_carlo_sweep.py)
+Run all 4 sequentially in one terminal — each uses all cores
+via --jobs -1, so parallel terminals would oversubscribe.
+============================================================
+
+python run_monte_carlo_sweep.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --jobs -1 --fully-connected --reconstruction displacement --output-dir mc_results/sweep5to50_fc_displacement && \
+python run_monte_carlo_sweep.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --jobs -1 --fully-connected --reconstruction token        --output-dir mc_results/sweep5to50_fc_token && \
+python run_monte_carlo_sweep.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --jobs -1 --tree            --reconstruction displacement --output-dir mc_results/sweep5to50_tree_displacement && \
+python run_monte_carlo_sweep.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --jobs -1 --tree            --reconstruction token        --output-dir mc_results/sweep5to50_tree_token
+
+
+============================================================
+PYBULLET SWEEPS (run_bullet_monte_carlo.py)
+Each command is single-threaded. Run all 4 IN PARALLEL across
+4 terminals (or tmux sessions). Output dirs are distinct.
+============================================================
+
+# Terminal 1 — FC + displacement
+python run_bullet_monte_carlo.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --fully-connected --restructuring-method displacement --output-dir bullet_mc_results/sweep5to50_fc_displacement
+
+# Terminal 2 — FC + rendezvous
+python run_bullet_monte_carlo.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --fully-connected --restructuring-method rendezvous   --output-dir bullet_mc_results/sweep5to50_fc_rendezvous
+
+# Terminal 3 — Tree + displacement
+python run_bullet_monte_carlo.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --tree            --restructuring-method displacement --output-dir bullet_mc_results/sweep5to50_tree_displacement
+
+# Terminal 4 — Tree + rendezvous
+python run_bullet_monte_carlo.py --n-min 5 --n-max 50 --n-step 5 --trials 10 --seed 42 --dynamic-pct --ablation-hops --tree            --restructuring-method rendezvous   --output-dir bullet_mc_results/sweep5to50_tree_rendezvous
+
+
+============================================================
+NOTES
+============================================================
+- --dynamic-pct covers fault percentages 10/20/30% × 3 spatial patterns
+- --ablation-hops covers safety radii 2, 3, 4
+- Total trials per command: 10 n-values × 10 trials × 3 pcts × 3 patterns × 3 radii = 2,700
+- PyBullet phase timeout was removed 2026-05-01; stall timer (10s × 4 patience) is the only no-progress guard
+- If a bullet run hangs, Ctrl-C and resume with: --resume bullet_mc_results/<dir>/<timestamp>
