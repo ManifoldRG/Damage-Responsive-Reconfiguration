@@ -53,6 +53,7 @@ from examples.render_five_module_pivot_chain import (
 from src.agent_policy import (
     DecentralizedCoagulation,
     DecentralizedRestructuring,
+    DisplacementRestructuring,
     ModuleAgent,
     ModuleState,
 )
@@ -206,6 +207,11 @@ class LineFaultRestructuring(DecentralizedRestructuring):
         return pos[agent.body_idx] + R @ agent.token.direction
 
 
+class LineFaultDisplacementRestructuring(DisplacementRestructuring):
+    """Displacement-guided restructuring for the line-fault scenario."""
+    pass
+
+
 def _first_pivoting_body_idx(policy) -> Optional[int]:
     for a in policy.agents.values():
         if a.state in (ModuleState.PIVOTING, ModuleState.REVERSING):
@@ -285,6 +291,11 @@ def main():
     parser.add_argument(
         "--no-viewer", action="store_true",
         help="Skip the interactive 3D viewer after the simulation.",
+    )
+    parser.add_argument(
+        "--restructuring-method", type=str, default="rendezvous",
+        choices=["rendezvous", "displacement"],
+        help="Phase 2 method: rendezvous tokens or displacement-guided.",
     )
     args = parser.parse_args()
 
@@ -396,6 +407,11 @@ def main():
 
     module_radius = float(sim.MODULE_RADIUS)
 
+    original_positions: dict = {}
+    pos0 = sim.get_positions()
+    for mid in scenario.module_ids:
+        original_positions[mid] = pos0[scenario.body_indices[mid]].copy()
+
     try:
         # --- Phase 1: Coagulation ---
         run_phase("coag", coag)
@@ -407,20 +423,29 @@ def main():
 
         # --- Phase 2: Restructuring ---
         if phase1_connected:
-            restruct = LineFaultRestructuring(
-                sim=sim,
-                module_ids=scenario.module_ids,
-                body_indices=scenario.body_indices,
-                coag_moved=coag_moved,
-                pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
-            )
+            if args.restructuring_method == "displacement":
+                restruct = LineFaultDisplacementRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    original_positions=original_positions,
+                )
+            else:
+                restruct = LineFaultRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
+                )
             restruct.PIVOT_EXCLUSION_RADIUS = coag.PIVOT_EXCLUSION_RADIUS
             restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
             restruct.generate_initial_tokens()
             run_phase("restruct", restruct)
             phase2_done = coag.is_connected()
             print(
-                f"Phase 2: done={phase2_done}  "
+                f"Phase 2 ({args.restructuring_method}): done={phase2_done}  "
                 f"moves={restruct.total_moves}  "
                 f"movers={sorted({m['module'] for m in restruct.move_log})}")
 
@@ -428,7 +453,8 @@ def main():
         sim.disconnect()
         plt.close(fig)
 
-    out = args.output or media_path("line_fault_agent.mp4")
+    default_name = f"line_fault_agent_{args.restructuring_method}.mp4"
+    out = args.output or media_path(default_name)
     if frames:
         iio.imwrite(out, frames, fps=12, codec="libx264")
         print(f"Wrote {len(frames)} frames to {os.path.abspath(out)}")

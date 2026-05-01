@@ -40,6 +40,7 @@ from tqdm import tqdm
 from src.agent_policy import (
     DecentralizedCoagulation,
     DecentralizedRestructuring,
+    DisplacementRestructuring,
     ModuleAgent,
     ModuleState,
 )
@@ -57,6 +58,29 @@ from src.monte_carlo import (
     FAULT_MODE_RANDOM_CLUSTERS,
     FAULT_MODE_LOCALIZED,
 )
+
+
+TOKEN_STRATEGIES = ["furthest", "nearest", "random"]
+SAFETY_RADII = [2, 3, 4]
+
+
+def warn_arg_conflicts(args, config):
+    """Print warnings if non-default CLI args differ from resumed config."""
+    checks = [
+        ("n_min", "--n-min", args.n_min, config["n_min"], 5),
+        ("n_max", "--n-max", args.n_max, config["n_max"], 20),
+        ("n_trials", "--trials", args.trials, config["n_trials"], 100),
+        ("seed", "--seed", args.seed, config["seed"], 42),
+    ]
+    conflicts = []
+    for key, flag, cli_val, cfg_val, default in checks:
+        if cli_val != default and cli_val != cfg_val:
+            conflicts.append(f"  {flag}: CLI={cli_val}, config={cfg_val}")
+    if conflicts:
+        print("Warning: CLI args differ from resumed config (using config values):")
+        for c in conflicts:
+            print(c)
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +179,8 @@ def udqdg_to_bullet_scenario(
 class _MCCoagulation(DecentralizedCoagulation):
     """Token origin stored in holder's body frame (drift-invariant)."""
 
+    _safety_radius: int = 2
+
     def _origin_world_for_pick_target(
         self, agent: ModuleAgent, pos: np.ndarray
     ) -> Optional[np.ndarray]:
@@ -162,11 +188,16 @@ class _MCCoagulation(DecentralizedCoagulation):
             return None
         R = self.sim.body_rotation_matrix(agent.body_idx)
         return pos[agent.body_idx] + R @ agent.token.direction
+
+    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
+        return super().is_movable(body_idx, self._safety_radius)
 
 
 class _MCRestructuring(DecentralizedRestructuring):
     """Token origin stored in holder's body frame (drift-invariant)."""
 
+    _safety_radius: int = 2
+
     def _origin_world_for_pick_target(
         self, agent: ModuleAgent, pos: np.ndarray
     ) -> Optional[np.ndarray]:
@@ -174,6 +205,18 @@ class _MCRestructuring(DecentralizedRestructuring):
             return None
         R = self.sim.body_rotation_matrix(agent.body_idx)
         return pos[agent.body_idx] + R @ agent.token.direction
+
+    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
+        return super().is_movable(body_idx, self._safety_radius)
+
+
+class _MCDisplacementRestructuring(DisplacementRestructuring):
+    """Displacement-guided restructuring for MC trials."""
+
+    _safety_radius: int = 2
+
+    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
+        return super().is_movable(body_idx, self._safety_radius)
 
 
 # ---------------------------------------------------------------------------
@@ -248,10 +291,13 @@ def run_single_bullet_trial(
     *,
     temperature: float = 0.01,
     pivot_exclusion_radius: int = 4,
-    max_phase_time: float = 300.0,
-    stall_interval: float = 20.0,
-    stall_patience: int = 8,
+    max_phase_time: float = 180.0,
+    stall_interval: float = 10.0,
+    stall_patience: int = 4,
     dt: float = 0.1,
+    restructuring_method: str = "rendezvous",
+    token_strategy: str = "furthest",
+    safety_radius: int = 2,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -259,21 +305,28 @@ def run_single_bullet_trial(
     and restructuring through BulletSimulator + agent policies, and
     returns a TrialResult compatible with the existing MC framework.
     """
-    if config_mode == CONFIG_MODE_TREE:
-        system = create_random_tree_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d, balanced=False)
-    else:
-        system = create_random_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d,
-            fully_connected=fully_connected)
+    from src.monte_carlo import _causes_disconnection
+
+    for structure_attempt in range(50):
+        gen_seed = seed + structure_attempt * 9973
+        if config_mode == CONFIG_MODE_TREE:
+            system = create_random_tree_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d, balanced=False)
+        else:
+            system = create_random_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d,
+                fully_connected=fully_connected)
+
+        faulty_module_ids = select_faulty_modules(
+            system, n_faults, gen_seed + 1000, fault_mode)
+
+        if _causes_disconnection(system, faulty_module_ids):
+            break
 
     original_positions = {
         mid: module.position.copy()
         for mid, module in system.modules.items()
     }
-
-    faulty_module_ids = select_faulty_modules(
-        system, n_faults, seed + 1000, fault_mode)
     faulty_modules_set = set(faulty_module_ids)
 
     total_phase1_moves = 0
@@ -281,6 +334,7 @@ def run_single_bullet_trial(
     total_phase1_ticks = 0
     restored = True
     post_phase1_positions: Optional[Dict[str, np.ndarray]] = None
+    post_phase2_positions: Optional[Dict[str, np.ndarray]] = None
 
     for fault_id in faulty_module_ids:
         if not system.modules[fault_id].is_active:
@@ -289,7 +343,7 @@ def run_single_bullet_trial(
         scenario = udqdg_to_bullet_scenario(system, fault_id)
 
         BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
-        BulletSimulator.MAX_PIVOT_TIME = 30.0
+        BulletSimulator.MAX_PIVOT_TIME = 20.0
         sim = BulletSimulator(
             scenario.n_total, scenario.pos0, scenario.bonded0, gui=False)
 
@@ -301,6 +355,7 @@ def run_single_bullet_trial(
                 body_indices=scenario.body_indices,
             )
             coag.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+            coag._safety_radius = safety_radius
             coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
             coag.TEMPERATURE = temperature
             coag.TOKEN_GEN_INTERVAL = 1.0
@@ -326,14 +381,25 @@ def run_single_bullet_trial(
 
             if phase1_connected:
                 coag_moved: Set[str] = {m["module"] for m in coag.move_log}
-                restruct = _MCRestructuring(
-                    sim=sim,
-                    module_ids=scenario.module_ids,
-                    body_indices=scenario.body_indices,
-                    coag_moved=coag_moved,
-                    pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
-                )
+                if restructuring_method == "displacement":
+                    restruct = _MCDisplacementRestructuring(
+                        sim=sim,
+                        module_ids=scenario.module_ids,
+                        body_indices=scenario.body_indices,
+                        coag_moved=coag_moved,
+                        original_positions=scenario.original_positions,
+                    )
+                else:
+                    restruct = _MCRestructuring(
+                        sim=sim,
+                        module_ids=scenario.module_ids,
+                        body_indices=scenario.body_indices,
+                        coag_moved=coag_moved,
+                        pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
+                        token_strategy=token_strategy,
+                    )
                 restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+                restruct._safety_radius = safety_radius
                 restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
                 restruct.generate_initial_tokens()
 
@@ -342,6 +408,12 @@ def run_single_bullet_trial(
                     max_phase_time, stall_interval, stall_patience)
 
                 total_phase2_moves += restruct.total_moves
+
+                pos_snap2 = sim.get_positions()
+                post_phase2_positions = {
+                    mid: pos_snap2[scenario.body_indices[mid]].copy()
+                    for mid in scenario.module_ids
+                }
         finally:
             sim.disconnect()
 
@@ -351,7 +423,7 @@ def run_single_bullet_trial(
         shape_diff_phase1 = calculate_shape_difference(
             original_positions, post_phase1_positions, faulty_modules_set)
 
-        final_positions = post_phase1_positions
+        final_positions = post_phase2_positions if post_phase2_positions is not None else post_phase1_positions
         shape_diff = calculate_shape_difference(
             original_positions, final_positions, faulty_modules_set)
     else:
@@ -509,6 +581,7 @@ SUMMARY_HEADERS = [
     "mean_total_moves", "std_total_moves",
     "mean_token_transmissions", "std_token_transmissions",
     "fault_mode", "fault_pct",
+    "token_strategy", "safety_radius", "restructuring_method",
 ]
 
 TRIALS_HEADERS = [
@@ -517,6 +590,7 @@ TRIALS_HEADERS = [
     "shape_difference", "shape_difference_phase1",
     "phase1_iterations", "total_moves",
     "token_transmissions", "fault_mode",
+    "token_strategy", "safety_radius", "restructuring_method",
 ]
 
 
@@ -657,8 +731,12 @@ def main():
                         help="Skip graph generation")
     parser.add_argument("--mode-2d", action="store_true",
                         help="Use 2D mode")
+    parser.add_argument("--n-values", type=int, nargs="+", default=None,
+                        help="Explicit list of n values to sweep (overrides --n-min/--n-max/--n-step)")
+    parser.add_argument("--fully-connected", action="store_true",
+                        help="Connect to ALL adjacent modules (default behavior)")
     parser.add_argument("--chain-like", action="store_true",
-                        help="Chain-like connectivity (default: fully-connected)")
+                        help="Chain-like connectivity (overrides default fully-connected)")
     parser.add_argument("--tree", action="store_true",
                         help="Tree-based configuration (no cycles)")
     parser.add_argument("--dynamic-faults", action="store_true",
@@ -667,18 +745,28 @@ def main():
                         help="Cluster failure sweep: cluster sizes 2,3,4,5")
     parser.add_argument("--dynamic-pct", action="store_true",
                         help="Dynamic pct fault sweep: 10%%,20%%,30%% x 3 patterns")
+    parser.add_argument("--fault-modes", type=str, nargs="+", default=None,
+                        choices=["random", "cluster", "random_clusters", "localized"],
+                        help="Explicit fault modes to sweep (overrides --cluster-faults/--dynamic-pct)")
+    parser.add_argument("--ablation", action="store_true",
+                        help="Sweep token selection strategies: furthest, nearest, random")
+    parser.add_argument("--ablation-hops", action="store_true",
+                        help="Sweep safety radii: 2, 3, 4 for is_movable() check")
     parser.add_argument("--temperature", type=float, default=0.01,
                         help="Coagulation temperature (default: 0.01)")
     parser.add_argument("--pivot-radius", type=int, default=4,
                         help="Pivot exclusion radius (default: 4)")
-    parser.add_argument("--max-phase-time", type=float, default=300.0,
-                        help="Max sim-seconds per phase (default: 300)")
-    parser.add_argument("--stall-interval", type=float, default=20.0,
-                        help="Seconds between stall checks (default: 20)")
-    parser.add_argument("--stall-patience", type=int, default=8,
-                        help="Stall windows before phase exit (default: 8)")
+    parser.add_argument("--max-phase-time", type=float, default=180.0,
+                        help="Max sim-seconds per phase (default: 180)")
+    parser.add_argument("--stall-interval", type=float, default=10.0,
+                        help="Seconds between stall checks (default: 10)")
+    parser.add_argument("--stall-patience", type=int, default=4,
+                        help="Stall windows before phase exit (default: 4)")
     parser.add_argument("--resume", type=str, default=None, metavar="PATH",
                         help="Resume from existing output directory")
+    parser.add_argument("--restructuring-method", type=str, default="rendezvous",
+                        choices=["rendezvous", "displacement"],
+                        help="Phase 2 method: rendezvous tokens or displacement-guided (default: rendezvous)")
     args = parser.parse_args()
 
     # --- Resume mode ---
@@ -694,6 +782,9 @@ def main():
             sys.exit(1)
         with open(config_path, "r") as f:
             config = json.load(f)
+
+        warn_arg_conflicts(args, config)
+
         n_min = config["n_min"]
         n_max = config["n_max"]
         n_trials = config["n_trials"]
@@ -713,6 +804,11 @@ def main():
         max_phase_time = config.get("max_phase_time", 300.0)
         stall_interval = config.get("stall_interval", 20.0)
         stall_patience = config.get("stall_patience", 8)
+        restructuring_method = config.get("restructuring_method", "rendezvous")
+        ablation = config.get("ablation", False)
+        ablation_hops = config.get("ablation_hops", False)
+        n_values_explicit = config.get("n_values", None)
+        fault_modes_explicit = config.get("fault_modes", None)
         output_dir = resume_dir
 
         csv_path = os.path.join(output_dir, "sweep_summary.csv")
@@ -748,6 +844,11 @@ def main():
         max_phase_time = args.max_phase_time
         stall_interval = args.stall_interval
         stall_patience = args.stall_patience
+        restructuring_method = args.restructuring_method
+        ablation = args.ablation
+        ablation_hops = args.ablation_hops
+        n_values_explicit = args.n_values
+        fault_modes_explicit = args.fault_modes
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(args.output_dir, timestamp)
@@ -772,6 +873,11 @@ def main():
             "max_phase_time": max_phase_time,
             "stall_interval": stall_interval,
             "stall_patience": stall_patience,
+            "restructuring_method": restructuring_method,
+            "ablation": ablation,
+            "ablation_hops": ablation_hops,
+            "n_values": n_values_explicit,
+            "fault_modes": fault_modes_explicit,
         }
         with open(os.path.join(output_dir, "config.json"), "w") as f:
             json.dump(config, f, indent=2)
@@ -779,8 +885,15 @@ def main():
         completed = set()
 
     no_graphs = args.no_graphs
-    all_n_values = list(range(n_min, n_max + 1, n_step))
+
+    if n_values_explicit:
+        all_n_values = sorted(n_values_explicit)
+    else:
+        all_n_values = list(range(n_min, n_max + 1, n_step))
     remaining = [n for n in all_n_values if n not in completed]
+
+    strategies = TOKEN_STRATEGIES if ablation else ["furthest"]
+    radii = SAFETY_RADII if ablation_hops else [2]
 
     if config_mode == CONFIG_MODE_TREE:
         connectivity_desc = "tree (no cycles)"
@@ -790,16 +903,22 @@ def main():
         connectivity_desc = "chain-like"
 
     configs_per_n = 1
-    if cluster_faults:
+    if fault_modes_explicit:
+        configs_per_n = len(fault_modes_explicit)
+    elif cluster_faults:
         configs_per_n = 4
     elif dynamic_pct:
-        configs_per_n = 9
+        configs_per_n = 6  # 3 pcts x 2 patterns (random_clusters disabled)
+    configs_per_n *= len(strategies) * len(radii)
 
     print("=" * 70)
     print("PYBULLET MONTE CARLO SIMULATION SWEEP")
     print("=" * 70)
     print("Parameters:")
-    print(f"  Module range: n = {n_min} to {n_max} (step {n_step})")
+    if n_values_explicit:
+        print(f"  n values: {all_n_values}")
+    else:
+        print(f"  Module range: n = {n_min} to {n_max} (step {n_step})")
     if dynamic_faults:
         print(f"  Faults per trial: f = floor(n/10) [dynamic]")
     else:
@@ -813,11 +932,24 @@ def main():
     print(f"  Temperature: {temperature}")
     print(f"  Pivot exclusion radius: {pivot_radius}")
     print(f"  Max phase time: {max_phase_time}s")
+    print(f"  Restructuring: {restructuring_method}")
+    if ablation:
+        print(f"  Token strategy ablation: {strategies}")
+    else:
+        print(f"  Token strategy: furthest")
+    if ablation_hops:
+        print(f"  Safety radius ablation: {radii}")
+    else:
+        print(f"  Safety radius: 2")
     print(f"  Sequential (PyBullet not thread-safe)")
-    if cluster_faults:
+    if fault_modes_explicit:
+        print(f"  Fault modes: {fault_modes_explicit}")
+    elif cluster_faults:
         print(f"  Cluster faults: enabled (sizes 2,3,4,5)")
-    if dynamic_pct:
+    elif dynamic_pct:
         print(f"  Dynamic pct: enabled (10%,20%,30% x random,random_clusters,localized)")
+    else:
+        print(f"  Fault mode: random")
     if completed:
         print(f"  Resuming: {len(completed)}/{len(all_n_values)} n-values done")
     print("=" * 70)
@@ -828,21 +960,27 @@ def main():
         print(f"  (skipping {len(completed)} already-completed configurations)")
     print("This may take a while...\n")
 
-    # --- Build sweep jobs ---
+    # --- Build sweep jobs (6-tuples) ---
     sweep_jobs: List[Tuple] = []
     for n in remaining:
-        if cluster_faults:
-            for cluster_size in [2, 3, 4, 5]:
-                sweep_jobs.append((n, cluster_size, FAULT_MODE_CLUSTER, ""))
-        elif dynamic_pct:
-            for pct in [0.10, 0.20, 0.30]:
-                f = max(1, math.ceil(n * pct))
-                pct_label = f"{int(pct * 100)}%"
-                for fm in [FAULT_MODE_RANDOM, FAULT_MODE_RANDOM_CLUSTERS, FAULT_MODE_LOCALIZED]:
-                    sweep_jobs.append((n, f, fm, pct_label))
-        else:
-            f = max(1, n // 10) if dynamic_faults else n_faults
-            sweep_jobs.append((n, f, FAULT_MODE_RANDOM, ""))
+        for strat in strategies:
+            for rad in radii:
+                if fault_modes_explicit:
+                    for fm in fault_modes_explicit:
+                        f = max(1, n // 10) if dynamic_faults else n_faults
+                        sweep_jobs.append((n, f, fm, "", strat, rad))
+                elif cluster_faults:
+                    for cluster_size in [2, 3, 4, 5]:
+                        sweep_jobs.append((n, cluster_size, FAULT_MODE_CLUSTER, "", strat, rad))
+                elif dynamic_pct:
+                    for pct in [0.10, 0.20, 0.30]:
+                        f = max(1, math.ceil(n * pct))
+                        pct_label = f"{int(pct * 100)}%"
+                        for fm in [FAULT_MODE_RANDOM, FAULT_MODE_LOCALIZED]:  # FAULT_MODE_RANDOM_CLUSTERS disabled
+                            sweep_jobs.append((n, f, fm, pct_label, strat, rad))
+                else:
+                    f = max(1, n // 10) if dynamic_faults else n_faults
+                    sweep_jobs.append((n, f, FAULT_MODE_RANDOM, "", strat, rad))
 
     if sweep_jobs:
         summary_csv_path = os.path.join(output_dir, "sweep_summary.csv")
@@ -865,8 +1003,8 @@ def main():
                 trials_writer.writerow(TRIALS_HEADERS)
 
             job_iter = tqdm(sweep_jobs, desc="Parameter sweep")
-            for job_idx, (n, f, fault_mode, fault_pct_label) in enumerate(job_iter):
-                job_iter.set_postfix(n=n, f=f, mode=fault_mode)
+            for job_idx, (n, f, fault_mode, fault_pct_label, strat, rad) in enumerate(job_iter):
+                job_iter.set_postfix(n=n, f=f, mode=fault_mode, strat=strat, rad=rad)
 
                 config_seed = base_seed + (n - n_min) * n_trials * configs_per_n + job_idx * 7
 
@@ -885,6 +1023,9 @@ def main():
                     max_phase_time=max_phase_time,
                     stall_interval=stall_interval,
                     stall_patience=stall_patience,
+                    restructuring_method=restructuring_method,
+                    token_strategy=strat,
+                    safety_radius=rad,
                 )
 
                 summary_writer.writerow([
@@ -907,6 +1048,9 @@ def main():
                     f"{result.std_token_transmissions:.2f}",
                     fault_mode,
                     fault_pct_label,
+                    strat,
+                    rad,
+                    restructuring_method,
                 ])
                 summary_file.flush()
 
@@ -920,6 +1064,9 @@ def main():
                         trial.phase1_iterations, trial.total_moves,
                         trial.token_transmissions,
                         trial.fault_mode,
+                        strat,
+                        rad,
+                        restructuring_method,
                     ])
                 trials_file.flush()
 

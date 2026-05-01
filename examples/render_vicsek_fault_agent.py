@@ -1,13 +1,14 @@
 """
 Vicsek-fractal multi-fault demo.
 
-A level-2 4-arm 2D Vicsek fractal (25 modules, 5 fault centres) runs
-through the same coagulation + restructuring pipeline as the line/star
-demos.  This is the first multi-fault scenario for the async PyBullet
-agent system: all 5 sub-star centres are simultaneously passive fault
-bodies and the 20 remaining modules must reconnect around them.
+A level-2 4-arm 2D Vicsek fractal (25 modules) runs through the same
+coagulation + restructuring pipeline as the line/star demos.
 
-Output: ``Media/vicsek_fault_agent.mp4`` + optional 3D viewer.
+Fault modes:
+    ``--fault-mode centers`` — 5 faults at sub-star centres [0,5,10,15,20].
+    ``--fault-mode arms``    — 4 faults in the bridge arms [1,2,3,4] (default).
+
+Output: ``Media/vicsek_fault_agent_<fault_mode>_<method>.mp4`` + optional 3D viewer.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from examples.render_line_fault_agent import launch_3d_viewer
 from src.agent_policy import (
     DecentralizedCoagulation,
     DecentralizedRestructuring,
+    DisplacementRestructuring,
     ModuleAgent,
     ModuleState,
 )
@@ -66,6 +68,11 @@ class VicsekRestructuring(DecentralizedRestructuring):
             return None
         R = self.sim.body_rotation_matrix(agent.body_idx)
         return pos[agent.body_idx] + R @ agent.token.direction
+
+
+class VicsekDisplacementRestructuring(DisplacementRestructuring):
+    """Displacement-guided restructuring for the Vicsek-fractal scenario."""
+    pass
 
 
 def _first_pivoting_body_idx(policy) -> Optional[int]:
@@ -133,9 +140,20 @@ def main():
         "--no-viewer", action="store_true",
         help="Skip the interactive 3D viewer.",
     )
+    parser.add_argument(
+        "--restructuring-method", type=str, default="rendezvous",
+        choices=["rendezvous", "displacement"],
+        help="Phase 2 method: rendezvous tokens or displacement-guided.",
+    )
+    parser.add_argument(
+        "--fault-mode", type=str, default="arms",
+        choices=["centers", "arms"],
+        help="Fault placement: 'centers' (5 sub-star centres) or 'arms' "
+             "(4 bridge modules in the limbs).",
+    )
     args = parser.parse_args()
 
-    scenario = build_vicsek_fault_scenario()
+    scenario = build_vicsek_fault_scenario(fault_mode=args.fault_mode)
     print(f"Vicsek: {scenario.n} modules, "
           f"faults={scenario.fault_ids} (body {scenario.fault_body_idxs}), "
           f"active={len(scenario.module_ids)}")
@@ -255,6 +273,11 @@ def main():
 
     module_radius = float(sim.MODULE_RADIUS)
 
+    original_positions: dict = {}
+    pos0 = sim.get_positions()
+    for mid in scenario.module_ids:
+        original_positions[mid] = pos0[scenario.body_indices[mid]].copy()
+
     try:
         # Phase 1: Coagulation
         run_phase("coag", coag)
@@ -266,20 +289,29 @@ def main():
 
         # Phase 2: Restructuring
         if phase1_connected:
-            restruct = VicsekRestructuring(
-                sim=sim,
-                module_ids=scenario.module_ids,
-                body_indices=scenario.body_indices,
-                coag_moved=coag_moved,
-                pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
-            )
+            if args.restructuring_method == "displacement":
+                restruct = VicsekDisplacementRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    original_positions=original_positions,
+                )
+            else:
+                restruct = VicsekRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
+                )
             restruct.PIVOT_EXCLUSION_RADIUS = coag.PIVOT_EXCLUSION_RADIUS
             restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
             restruct.generate_initial_tokens()
             run_phase("restruct", restruct)
             phase2_done = coag.is_connected()
             print(
-                f"Phase 2: done={phase2_done}  "
+                f"Phase 2 ({args.restructuring_method}): done={phase2_done}  "
                 f"moves={restruct.total_moves}  "
                 f"movers={sorted({m['module'] for m in restruct.move_log})}")
 
@@ -287,7 +319,8 @@ def main():
         sim.disconnect()
         plt.close(fig)
 
-    out = args.output or media_path("vicsek_fault_agent.mp4")
+    default_name = f"vicsek_fault_agent_{args.fault_mode}_{args.restructuring_method}.mp4"
+    out = args.output or media_path(default_name)
     if frames:
         iio.imwrite(out, frames, fps=12, codec="libx264")
         print(f"Wrote {len(frames)} frames to {os.path.abspath(out)}")

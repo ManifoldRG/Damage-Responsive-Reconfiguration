@@ -6,8 +6,12 @@ A 2D 4-arm Vicsek fractal in the XY plane (Z = 0).  Built recursively:
     Level 1 (+ shape):  center + 4 arms (±X, ±Y), arm length 1 → 5 modules
     Level 2:            5 copies of the + shape at scale-3 positions → 25 modules
 
-Sub-star centers (the 5 motif centres) are all designated as **faults**,
-giving a 5-fault / 20-active-module multi-fault scenario.
+Two fault modes are supported:
+
+    ``"centers"`` (original, 5 faults): sub-star centres [0, 5, 10, 15, 20].
+    ``"arms"`` (easier, 4 faults): outer bridge modules in the 4 limbs
+        — indices [7, 11, 19, 23].  Each outer sub-star loses its inward
+        tip while the centre star stays fully intact (5 modules).
 
 Layout (25 modules, 0-indexed)::
 
@@ -69,8 +73,17 @@ def _build_substar(center: np.ndarray, start_idx: int):
     return positions, bonds
 
 
-def build_vicsek_fault_scenario() -> VicsekFaultScenario:
-    """Build a level-2 4-arm 2D Vicsek fractal (25 modules, 5 faults)."""
+def build_vicsek_fault_scenario(
+    fault_mode: str = "centers",
+) -> VicsekFaultScenario:
+    """Build a level-2 4-arm 2D Vicsek fractal.
+
+    Args:
+        fault_mode: ``"centers"`` places 5 faults at the sub-star centres
+            (indices 0, 5, 10, 15, 20).  ``"arms"`` places 4 faults at
+            the outer bridge modules in each limb (indices 7, 11, 19, 23
+            — the inward-facing tips of the outer sub-stars).
+    """
 
     scale = 3.0
     substar_offsets = [
@@ -113,7 +126,10 @@ def build_vicsek_fault_scenario() -> VicsekFaultScenario:
         bonded0[i, j] = True
         bonded0[j, i] = True
 
-    fault_body_idxs = substar_centers  # [0, 5, 10, 15, 20]
+    if fault_mode == "arms":
+        fault_body_idxs = [7, 11, 19, 23]
+    else:
+        fault_body_idxs = substar_centers  # [0, 5, 10, 15, 20]
     fault_ids = [f"M{i}" for i in fault_body_idxs]
     fault_set: Set[int] = set(fault_body_idxs)
 

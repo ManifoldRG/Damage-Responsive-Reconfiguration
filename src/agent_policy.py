@@ -16,7 +16,7 @@ Token forwarding has a 1-second processing delay.
 import random
 import numpy as np
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from loguru import logger
 
@@ -98,6 +98,33 @@ class Token:
 
 
 @dataclass
+class DiscoverMessage:
+    """Flood phase message for distributed connected-component discovery."""
+    flood_id: int
+    initiator_mid: str
+    sender_mid: str
+
+
+@dataclass
+class EchoMessage:
+    """Echo phase message carrying aggregated component IDs back to the root."""
+    flood_id: int
+    initiator_mid: str
+    sender_mid: str
+    component_ids: Set[str]
+
+
+@dataclass
+class FloodParticipation:
+    """Per-agent state for participating in one flood/echo round."""
+    flood_id: int
+    parent_mid: Optional[str]
+    children: Set[str] = field(default_factory=set)
+    pending_echoes: Set[str] = field(default_factory=set)
+    aggregated_component: Set[str] = field(default_factory=set)
+
+
+@dataclass
 class ModuleAgent:
     """
     Independent agent for one module.
@@ -128,6 +155,9 @@ class ModuleAgent:
     token_hold_until: float = 0.0                        # sim time: stay IDLE before acting on token
     moving_token_received_tick: int = -999               # tick when last "moving" token was received
     reversal_handoff_idx: Optional[int] = None           # original axis to bond-switch to during lateral reversal
+    discover_inbox: List["DiscoverMessage"] = field(default_factory=list)
+    echo_inbox: List["EchoMessage"] = field(default_factory=list)
+    flood_participations: Dict[int, "FloodParticipation"] = field(default_factory=dict)
 
 
 def _token_origin_world_pos(
@@ -228,6 +258,15 @@ class DecentralizedCoagulation:
         self.move_log: List[Dict] = []
         self._tick_count: int = 0
 
+        # Flood/echo protocol state
+        self._flood_counter: int = 0
+        self._known_components: Dict[str, FrozenSet[str]] = {}
+        self._fault_resolved_mids: Set[str] = set()
+        self._pending_floods: Dict[str, int] = {}
+        self.FLOOD_ECHO_INTERVAL: float = 5.0
+        self._last_flood_time: Dict[str, float] = {}
+        self._awaiting_first_flood: Set[str] = set()
+
     def _decision_graph_neighbors(self, body_idx: int) -> List[int]:
         """Bond neighbors for topology checks: frozen bond matrix at tick start, else live."""
         bm = getattr(self, "_decision_bond_matrix", None)
@@ -301,6 +340,7 @@ class DecentralizedCoagulation:
         self._adj_to_fault_idx: Dict[str, int] = {
             mid: fault_body_idx for mid in adjacent_mids}
         self._fidx_to_fid: Dict[int, str] = {fault_body_idx: self.fault_id}
+        self._seed_flood_echo_state(adjacent_mids)
 
     def set_multi_fault_adjacent(
         self,
@@ -322,6 +362,19 @@ class DecentralizedCoagulation:
         self._fault_adjacent = set(adjacent_map.keys())
         self._adj_to_fault_idx = dict(adjacent_map)
         self._fidx_to_fid = dict(zip(fault_body_idxs, fault_ids))
+        self._seed_flood_echo_state(list(adjacent_map.keys()))
+
+    def _seed_flood_echo_state(self, adjacent_mids: List[str]):
+        """Initialize flood/echo protocol for newly registered fault-adjacent modules.
+
+        Preserves resolved status for modules that were already resolved from
+        a prior call (e.g. stall-recovery re-registration in bullet_bridge).
+        """
+        for mid in adjacent_mids:
+            if mid in self._fault_resolved_mids:
+                continue
+            self._awaiting_first_flood.add(mid)
+            self._last_flood_time[mid] = -999.0
 
     def _get_fault_idxs(self) -> Set[int]:
         """Return the set of all fault body indices."""
@@ -350,6 +403,10 @@ class DecentralizedCoagulation:
         adj_map = getattr(self, "_adj_to_fault_idx", None)
 
         for mid in self._fault_adjacent:
+            if mid in self._fault_resolved_mids:
+                continue
+            if mid in self._awaiting_first_flood:
+                continue
             if mid not in self.agents:
                 continue
             agent = self.agents[mid]
@@ -366,6 +423,177 @@ class DecentralizedCoagulation:
             source = fidx_to_fid.get(f_idx, self.fault_id)
             agent.incoming_tokens.append(
                 Token(direction=direction.copy(), source_id=source))
+
+    # ------------------------------------------------------------------
+    # Flood / Echo distributed component-discovery protocol
+    # ------------------------------------------------------------------
+
+    def _initiate_flood(self, mid: str):
+        """Start a new flood/echo round from fault-adjacent module *mid*."""
+        if mid not in self.agents:
+            return
+        agent = self.agents[mid]
+
+        self._flood_counter += 1
+        fid = self._flood_counter
+        self._pending_floods[mid] = fid
+
+        bond_matrix = self.sim.get_bond_matrix()
+        fault_idxs = self._get_fault_idxs()
+        neighbors = [
+            j for j in range(self.sim.N)
+            if j != agent.body_idx
+            and bond_matrix[agent.body_idx, j]
+            and j not in fault_idxs
+        ]
+
+        children: Set[str] = set()
+        for j in neighbors:
+            n_mid = self._idx_to_mid.get(j)
+            if n_mid and n_mid in self.agents:
+                self.agents[n_mid].discover_inbox.append(
+                    DiscoverMessage(flood_id=fid, initiator_mid=mid,
+                                    sender_mid=mid))
+                children.add(n_mid)
+
+        participation = FloodParticipation(
+            flood_id=fid,
+            parent_mid=None,
+            children=set(children),
+            pending_echoes=set(children),
+            aggregated_component={mid},
+        )
+        agent.flood_participations[fid] = participation
+
+        if not children:
+            self._on_flood_complete(mid, frozenset({mid}))
+
+        self._last_flood_time[mid] = self.sim.sim_time
+
+    def _maybe_initiate_floods(self):
+        """Initiate flood/echo rounds for fault-adjacent modules on heartbeat."""
+        for mid in self._fault_adjacent:
+            if mid in self._fault_resolved_mids:
+                continue
+            if mid in self._pending_floods:
+                continue
+            last = self._last_flood_time.get(mid, -999.0)
+            if self.sim.sim_time - last < self.FLOOD_ECHO_INTERVAL:
+                continue
+            self._initiate_flood(mid)
+
+    def _process_discover_messages(self):
+        """Deliver one hop of the flood wave: each agent processes its discover inbox."""
+        fault_idxs = self._get_fault_idxs()
+        bond_matrix = self.sim.get_bond_matrix()
+
+        for mid, agent in self.agents.items():
+            if not agent.discover_inbox:
+                continue
+            messages = list(agent.discover_inbox)
+            agent.discover_inbox.clear()
+
+            for msg in messages:
+                if msg.flood_id in agent.flood_participations:
+                    continue
+
+                neighbors = [
+                    j for j in range(self.sim.N)
+                    if j != agent.body_idx
+                    and bond_matrix[agent.body_idx, j]
+                    and j not in fault_idxs
+                ]
+                children: Set[str] = set()
+                for j in neighbors:
+                    n_mid = self._idx_to_mid.get(j)
+                    if n_mid and n_mid in self.agents and n_mid != msg.sender_mid:
+                        if msg.flood_id not in self.agents[n_mid].flood_participations:
+                            self.agents[n_mid].discover_inbox.append(
+                                DiscoverMessage(
+                                    flood_id=msg.flood_id,
+                                    initiator_mid=msg.initiator_mid,
+                                    sender_mid=mid,
+                                ))
+                            children.add(n_mid)
+
+                participation = FloodParticipation(
+                    flood_id=msg.flood_id,
+                    parent_mid=msg.sender_mid,
+                    children=set(children),
+                    pending_echoes=set(children),
+                    aggregated_component={mid},
+                )
+                agent.flood_participations[msg.flood_id] = participation
+
+                if not children:
+                    parent_agent = self.agents.get(msg.sender_mid)
+                    if parent_agent is not None:
+                        parent_agent.echo_inbox.append(
+                            EchoMessage(
+                                flood_id=msg.flood_id,
+                                initiator_mid=msg.initiator_mid,
+                                sender_mid=mid,
+                                component_ids={mid},
+                            ))
+
+    def _process_echo_messages(self):
+        """Deliver one hop of the echo wave: aggregate component IDs toward root."""
+        for mid, agent in self.agents.items():
+            if not agent.echo_inbox:
+                continue
+            messages = list(agent.echo_inbox)
+            agent.echo_inbox.clear()
+
+            for msg in messages:
+                part = agent.flood_participations.get(msg.flood_id)
+                if part is None:
+                    continue
+
+                part.aggregated_component |= msg.component_ids
+                part.pending_echoes.discard(msg.sender_mid)
+
+                if not part.pending_echoes:
+                    if part.parent_mid is None:
+                        self._on_flood_complete(
+                            mid, frozenset(part.aggregated_component))
+                    else:
+                        parent_agent = self.agents.get(part.parent_mid)
+                        if parent_agent is not None:
+                            parent_agent.echo_inbox.append(
+                                EchoMessage(
+                                    flood_id=msg.flood_id,
+                                    initiator_mid=msg.initiator_mid,
+                                    sender_mid=mid,
+                                    component_ids=set(part.aggregated_component),
+                                ))
+
+    def _on_flood_complete(self, mid: str, component: FrozenSet[str]):
+        """Handle completion of a flood/echo round for fault-adjacent module *mid*."""
+        self._pending_floods.pop(mid, None)
+
+        if mid in self._awaiting_first_flood:
+            self._known_components[mid] = component
+            self._awaiting_first_flood.discard(mid)
+            logger.debug("Flood/echo baseline for {}: {} modules", mid, len(component))
+            return
+
+        prev = self._known_components.get(mid, frozenset())
+        if component > prev:
+            self._fault_resolved_mids.add(mid)
+            logger.info(
+                "Flood/echo: {} component grew ({} -> {}), fault resolved",
+                mid, len(prev), len(component))
+        else:
+            self._known_components[mid] = component
+
+    def _cleanup_stale_flood_participations(self):
+        """Remove flood participation records for completed floods."""
+        active_flood_ids: Set[int] = set(self._pending_floods.values())
+        for agent in self.agents.values():
+            stale = [fid for fid in agent.flood_participations
+                     if fid not in active_flood_ids]
+            for fid in stale:
+                del agent.flood_participations[fid]
 
     def get_physical_neighbors(self, body_idx: int) -> List[int]:
         """Discover bonded neighbors from PyBullet bond state."""
@@ -685,7 +913,14 @@ class DecentralizedCoagulation:
         """
         self._tick_count += 1
 
-        # Fault-adjacent modules continuously emit tokens
+        # Flood/echo protocol: process messages, then check heartbeats
+        self._process_discover_messages()
+        self._process_echo_messages()
+        self._maybe_initiate_floods()
+        if self._tick_count % 500 == 0:
+            self._cleanup_stale_flood_participations()
+
+        # Fault-adjacent modules emit tokens (skips resolved / awaiting-baseline)
         self._generate_fault_tokens()
 
         # One consistent bond graph for all move decisions this tick.
@@ -1018,13 +1253,18 @@ class DecentralizedCoagulation:
                 any_active = True
                 continue
 
-        # Also check if any tokens are still in flight
+        # Also check if any tokens or flood/echo messages are still in flight
         for agent in self.agents.values():
             if (agent.state != ModuleState.IDLE or
                     agent.incoming_tokens or
-                    agent.token is not None):
+                    agent.token is not None or
+                    agent.discover_inbox or
+                    agent.echo_inbox):
                 any_active = True
                 break
+
+        if not any_active and self._pending_floods:
+            any_active = True
 
         self._decision_bond_matrix = None
         return any_active
@@ -2570,3 +2810,69 @@ class DecentralizedRestructuring:
                     if self.agents[nn_mid].state in _moving:
                         return True
         return False
+
+
+class DisplacementRestructuring(DecentralizedRestructuring):
+    """Displacement-guided restructuring (phase 2 alternative).
+
+    Instead of propagating rendezvous tokens from non-movers' empty slots,
+    each displaced module computes its displacement from its pre-damage
+    position and uses that as a synthetic token direction.  No inter-module
+    token propagation is needed -- each agent independently knows where it
+    should return to.
+
+    Modules are driven by largest-displacement-first priority (the greedy
+    ordering from the graph-based ``restructuring_displacement``), adapted
+    to the async PyBullet tick loop.
+    """
+
+    DISPLACEMENT_THRESHOLD = 0.5
+
+    def __init__(self, sim, module_ids: List[str],
+                 body_indices: Dict[str, int],
+                 coag_moved: Set[str],
+                 original_positions: Dict[str, np.ndarray],
+                 pre_damage_neighbor_slots: Optional[Dict[str, List[np.ndarray]]] = None):
+        super().__init__(
+            sim=sim,
+            module_ids=module_ids,
+            body_indices=body_indices,
+            coag_moved=coag_moved,
+            pre_damage_neighbor_slots=pre_damage_neighbor_slots or {},
+            token_strategy="furthest",
+        )
+        self.original_positions = original_positions
+
+    def generate_initial_tokens(self):
+        """Inject displacement-based tokens for all displaced coag-movers."""
+        self._inject_displacement_tokens()
+
+    def _inject_displacement_tokens(self):
+        """For each displaced coag-mover, set a synthetic token pointing home."""
+        pos = self.sim.get_positions()
+        for mid in self.coag_moved:
+            if mid not in self.agents:
+                continue
+            if mid not in self.original_positions:
+                continue
+            agent = self.agents[mid]
+            if agent.state != ModuleState.IDLE:
+                continue
+            disp = self.original_positions[mid] - pos[agent.body_idx]
+            dist = float(np.linalg.norm(disp))
+            if dist < self.DISPLACEMENT_THRESHOLD:
+                continue
+            R = self.sim.body_rotation_matrix(agent.body_idx)
+            direction = R.T @ disp
+            agent.incoming_tokens.append(
+                Token(direction=direction.copy(), source_id=mid))
+
+    def _origin_world_for_pick_target(
+            self, agent: ModuleAgent, pos: np.ndarray) -> Optional[np.ndarray]:
+        """Scoring origin = the module's original (pre-damage) position."""
+        if agent.module_id in self.original_positions:
+            return self.original_positions[agent.module_id].copy()
+        if agent.token is None:
+            return None
+        R = self.sim.body_rotation_matrix(agent.body_idx)
+        return pos[agent.body_idx] + R @ agent.token.direction

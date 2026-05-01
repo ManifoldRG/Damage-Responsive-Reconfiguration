@@ -38,6 +38,80 @@ FAULT_MODE_RANDOM_CLUSTERS = "random_clusters"  # multiple small random clusters
 FAULT_MODE_LOCALIZED = "localized"       # one big contiguous cluster (alias for cluster)
 
 
+def _find_articulation_points(system) -> Set[str]:
+    """Return the set of articulation points (cut vertices) in the active graph.
+
+    A module is an articulation point if removing it increases the number
+    of connected components among the remaining active modules.  Uses
+    Tarjan's DFS algorithm in O(V+E).
+    """
+    active = [mid for mid, m in system.modules.items() if m.is_active]
+    if not active:
+        return set()
+
+    adj: Dict[str, List[str]] = {mid: [] for mid in active}
+    active_set = set(active)
+    for mid in active:
+        for nbr in system.get_neighbors(mid):
+            if nbr in active_set:
+                adj[mid].append(nbr)
+
+    disc: Dict[str, int] = {}
+    low: Dict[str, int] = {}
+    parent: Dict[str, Optional[str]] = {}
+    ap: Set[str] = set()
+    timer = [0]
+
+    def dfs(u: str) -> None:
+        disc[u] = low[u] = timer[0]
+        timer[0] += 1
+        child_count = 0
+        for v in adj[u]:
+            if v not in disc:
+                child_count += 1
+                parent[v] = u
+                dfs(v)
+                low[u] = min(low[u], low[v])
+                if parent[u] is None and child_count > 1:
+                    ap.add(u)
+                if parent[u] is not None and low[v] >= disc[u]:
+                    ap.add(u)
+            elif v != parent.get(u):
+                low[u] = min(low[u], disc[v])
+
+    for mid in active:
+        if mid not in disc:
+            parent[mid] = None
+            dfs(mid)
+
+    return ap
+
+
+def _causes_disconnection(system, fault_ids: List[str]) -> bool:
+    """Check whether removing *fault_ids* disconnects the active graph."""
+    removed = set(fault_ids)
+    remaining = [
+        mid for mid, m in system.modules.items()
+        if m.is_active and mid not in removed
+    ]
+    if not remaining:
+        return True
+
+    visited: Set[str] = set()
+    queue = deque([remaining[0]])
+    visited.add(remaining[0])
+    remaining_set = set(remaining)
+
+    while queue:
+        cur = queue.popleft()
+        for nbr in system.get_neighbors(cur):
+            if nbr in remaining_set and nbr not in visited:
+                visited.add(nbr)
+                queue.append(nbr)
+
+    return len(visited) < len(remaining_set)
+
+
 def _bfs_grow(system, seed_module: str, target_size: int, excluded: Set[str]) -> List[str]:
     """Grow a contiguous cluster from seed_module via BFS on system neighbors."""
     selected = [seed_module]
@@ -57,11 +131,24 @@ def _bfs_grow(system, seed_module: str, target_size: int, excluded: Set[str]) ->
     return selected
 
 
+_MAX_REJECTION_ATTEMPTS = 200
+
+
 def select_faulty_modules(
     system, n_faults: int, seed: int, fault_mode: str = FAULT_MODE_RANDOM
 ) -> List[str]:
     """
-    Select modules to mark as faulty based on the fault mode.
+    Select modules to mark as faulty, **guaranteeing** that removing them
+    disconnects the active graph.
+
+    Strategy:
+      * For single faults (n_faults == 1) we restrict the candidate pool
+        to articulation points (cut vertices) — modules whose removal is
+        guaranteed to disconnect the graph.
+      * For multi-fault modes a rejection-sampling loop selects candidates
+        using the original heuristic, then checks whether the removal
+        actually disconnects the graph.  If not it retries with a new
+        random seed (up to ``_MAX_REJECTION_ATTEMPTS``).
 
     Args:
         system: UDQDGSystem instance
@@ -79,29 +166,56 @@ def select_faulty_modules(
     if n_faults <= 0:
         return []
 
+    # --- Fast path for single faults: use articulation points directly ---
+    if n_faults == 1:
+        ap = _find_articulation_points(system)
+        if fault_mode == FAULT_MODE_RANDOM:
+            candidates = [mid for mid in module_ids if mid in ap]
+        elif fault_mode in (FAULT_MODE_CLUSTER, FAULT_MODE_LOCALIZED):
+            candidates = [mid for mid in module_ids if mid in ap]
+        elif fault_mode == FAULT_MODE_RANDOM_CLUSTERS:
+            candidates = [mid for mid in module_ids if mid in ap]
+        else:
+            raise ValueError(f"Unknown fault_mode: {fault_mode}")
+
+        if not candidates:
+            return random.sample(module_ids, 1)
+        return [random.choice(candidates)]
+
+    # --- Multi-fault: rejection sampling ---
+    for attempt in range(_MAX_REJECTION_ATTEMPTS):
+        rng_seed = seed + attempt * 7919
+        random.seed(rng_seed)
+
+        faults = _select_faults_inner(system, module_ids, n_faults, fault_mode)
+        if _causes_disconnection(system, faults):
+            return faults
+
+    # Fallback: return last attempt even if it didn't disconnect
+    return faults
+
+
+def _select_faults_inner(
+    system, module_ids: List[str], n_faults: int, fault_mode: str
+) -> List[str]:
+    """Core selection logic (no disconnection guarantee)."""
     if fault_mode == FAULT_MODE_RANDOM:
         return random.sample(module_ids, n_faults)
 
     elif fault_mode in (FAULT_MODE_CLUSTER, FAULT_MODE_LOCALIZED):
-        # Single contiguous cluster grown from a random seed module
         seed_module = random.choice(module_ids)
         return _bfs_grow(system, seed_module, n_faults, excluded=set())
 
     elif fault_mode == FAULT_MODE_RANDOM_CLUSTERS:
-        # Partition n_faults into small clusters of size 2-5
-        selected = []
-        selected_set = set()
+        selected: List[str] = []
+        selected_set: Set[str] = set()
         remaining = n_faults
 
         while remaining > 0:
-            # Pick cluster size 2-5, but don't exceed remaining
             cluster_size = min(random.randint(2, 5), remaining)
-
-            # Pick a seed module not already selected
             available = [m for m in module_ids if m not in selected_set]
             if not available:
                 break
-
             seed_module = random.choice(available)
             cluster = _bfs_grow(system, seed_module, cluster_size, excluded=selected_set)
             selected.extend(cluster)
@@ -231,49 +345,69 @@ class MonteCarloResults:
 def calculate_shape_difference(
     original_positions: Dict[str, np.ndarray],
     final_positions: Dict[str, np.ndarray],
-    faulty_modules: Set[str]
+    faulty_modules: Set[str],
+    tolerance: float = 0.05,
 ) -> float:
     """
     Calculate shape difference using pairwise inter-module distances.
 
     Per the paper's metric: diff(P, Q) = (|P| - |P ∩ Q|) / |P|
-    where P and Q are sets of pairwise distances before/after damage.
+    where P and Q are multisets of pairwise distances before/after damage.
+
+    Uses tolerance-based matching: a distance d_p in P is considered
+    matched if any unmatched distance d_q in Q satisfies
+    |d_p - d_q| <= tolerance.  This avoids false mismatches from
+    floating-point drift in physics-based simulators.
 
     Args:
         original_positions: Positions of ALL modules before fault
         final_positions: Positions of surviving modules after algorithm
         faulty_modules: Set of module IDs that were marked as faulty
+        tolerance: Maximum absolute difference for two distances to be
+            considered equal (default 0.05, roughly 5% of unit spacing)
 
     Returns:
         Shape difference diff(P, Q), anchored to pre-damage shape P.
     """
-    # Build P: pairwise distances of active (non-faulty) modules before damage
     active_orig = {
         mid: pos for mid, pos in original_positions.items()
         if mid not in faulty_modules
     }
 
-    P = set()
+    P_dists: List[float] = []
     orig_ids = list(active_orig.keys())
     for i, u in enumerate(orig_ids):
         for v in orig_ids[i + 1:]:
-            d = round(float(np.linalg.norm(active_orig[u] - active_orig[v])), 6)
-            P.add(d)
+            P_dists.append(float(np.linalg.norm(active_orig[u] - active_orig[v])))
 
-    # Build Q: pairwise distances of modules after algorithm
-    Q = set()
+    Q_dists: List[float] = []
     final_ids = list(final_positions.keys())
     for i, u in enumerate(final_ids):
         for v in final_ids[i + 1:]:
-            d = round(float(np.linalg.norm(final_positions[u] - final_positions[v])), 6)
-            Q.add(d)
+            Q_dists.append(float(np.linalg.norm(final_positions[u] - final_positions[v])))
 
-    if len(P) == 0:
+    if len(P_dists) == 0:
         return 0.0
 
-    # diff(P, Q) = (|P| - |P ∩ Q|) / |P|
-    intersection = P & Q
-    return (len(P) - len(intersection)) / len(P)
+    P_dists.sort()
+    Q_dists.sort()
+
+    matched = 0
+    q_idx = 0
+    q_used = [False] * len(Q_dists)
+
+    for d_p in P_dists:
+        while q_idx < len(Q_dists) and Q_dists[q_idx] < d_p - tolerance:
+            q_idx += 1
+        for j in range(q_idx, len(Q_dists)):
+            if Q_dists[j] > d_p + tolerance:
+                break
+            if not q_used[j]:
+                q_used[j] = True
+                matched += 1
+                break
+
+    return (len(P_dists) - matched) / len(P_dists)
 
 
 def run_single_trial(
