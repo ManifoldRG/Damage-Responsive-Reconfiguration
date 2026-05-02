@@ -247,14 +247,20 @@ def _run_phase(
     stall_interval: float,
     stall_patience: int,
 ) -> int:
-    """Run a simulation phase, returns tick count."""
+    """Run a simulation phase, returns tick count.
+
+    Termination is governed by `done_fn` and the stall timer
+    (`stall_interval` × `stall_patience`). `max_time` is accepted for
+    API/config compatibility but no longer enforced — the wall-clock cap
+    was capping out larger-N structures even when they were still making
+    progress; the stall timer is the only remaining termination guard.
+    """
     stall_check_time = sim.sim_time
     last_move_count = 0
     stall_count = 0
-    phase_start = sim.sim_time
     ticks = 0
 
-    while sim.sim_time - phase_start < max_time:
+    while True:
         sim.step(dt)
         policy.tick()
         ticks += 1
@@ -293,7 +299,7 @@ def run_single_bullet_trial(
     pivot_exclusion_radius: int = 4,
     max_phase_time: float = 180.0,
     stall_interval: float = 10.0,
-    stall_patience: int = 4,
+    stall_patience: int = 16,
     dt: float = 0.1,
     restructuring_method: str = "rendezvous",
     token_strategy: str = "furthest",
@@ -760,8 +766,8 @@ def main():
                         help="Max sim-seconds per phase (default: 180)")
     parser.add_argument("--stall-interval", type=float, default=10.0,
                         help="Seconds between stall checks (default: 10)")
-    parser.add_argument("--stall-patience", type=int, default=4,
-                        help="Stall windows before phase exit (default: 4)")
+    parser.add_argument("--stall-patience", type=int, default=16,
+                        help="Stall windows before phase exit (default: 16)")
     parser.add_argument("--resume", type=str, default=None, metavar="PATH",
                         help="Resume from existing output directory")
     parser.add_argument("--restructuring-method", type=str, default="rendezvous",
