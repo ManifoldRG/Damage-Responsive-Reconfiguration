@@ -151,6 +151,11 @@ def main():
         help="Fault placement: 'centers' (5 sub-star centres) or 'arms' "
              "(4 bridge modules in the limbs).",
     )
+    parser.add_argument(
+        "--module-shape", type=str, default="sphere",
+        choices=["sphere", "cube"],
+        help="Module geometry: sphere (rolling) or cube (edge-lever).",
+    )
     args = parser.parse_args()
 
     scenario = build_vicsek_fault_scenario(fault_mode=args.fault_mode)
@@ -158,10 +163,15 @@ def main():
           f"faults={scenario.fault_ids} (body {scenario.fault_body_idxs}), "
           f"active={len(scenario.module_ids)}")
 
-    BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
-    BulletSimulator.MAX_PIVOT_TIME = 30.0
+    if args.module_shape == "cube":
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = False
+        BulletSimulator.MAX_PIVOT_TIME = 60.0
+    else:
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
+        BulletSimulator.MAX_PIVOT_TIME = 30.0
     sim = BulletSimulator(
-        scenario.n, scenario.pos0, scenario.bonded0, gui=False)
+        scenario.n, scenario.pos0, scenario.bonded0, gui=False,
+        module_shape=args.module_shape)
 
     # Use the first fault as the nominal fault_id for the constructor
     coag = VicsekCoagulation(

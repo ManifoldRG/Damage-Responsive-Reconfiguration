@@ -297,15 +297,25 @@ def main():
         choices=["rendezvous", "displacement"],
         help="Phase 2 method: rendezvous tokens or displacement-guided.",
     )
+    parser.add_argument(
+        "--module-shape", type=str, default="sphere",
+        choices=["sphere", "cube"],
+        help="Module geometry: sphere (rolling) or cube (edge-lever).",
+    )
     args = parser.parse_args()
 
     scenario = build_y_line_fault_scenario(
         n=args.n, fault_body_idx=args.fault_index)
 
-    BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
-    BulletSimulator.MAX_PIVOT_TIME = 30.0
+    if args.module_shape == "cube":
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = False
+        BulletSimulator.MAX_PIVOT_TIME = 60.0
+    else:
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
+        BulletSimulator.MAX_PIVOT_TIME = 30.0
     sim = BulletSimulator(
-        scenario.n, scenario.pos0, scenario.bonded0, gui=False)
+        scenario.n, scenario.pos0, scenario.bonded0, gui=False,
+        module_shape=args.module_shape)
     # NOTE: fault body kept as full-mass, collision-on. No set_body_mass or
     # set_body_collision_with_all overrides (cf. five_module_pivot_chain_agent).
 

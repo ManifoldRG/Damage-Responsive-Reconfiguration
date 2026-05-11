@@ -146,16 +146,26 @@ def main():
         choices=["rendezvous", "displacement"],
         help="Phase 2 method: rendezvous tokens or displacement-guided.",
     )
+    parser.add_argument(
+        "--module-shape", type=str, default="sphere",
+        choices=["sphere", "cube"],
+        help="Module geometry: sphere (rolling) or cube (edge-lever).",
+    )
     args = parser.parse_args()
 
     scenario = build_star_fault_scenario(arm_len=args.arm_len)
     print(f"Star: {scenario.n} modules, arm_len={scenario.arm_len}, "
           f"fault=M0, fault_adjacent={scenario.fault_adjacent}")
 
-    BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
-    BulletSimulator.MAX_PIVOT_TIME = 30.0
+    if args.module_shape == "cube":
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = False
+        BulletSimulator.MAX_PIVOT_TIME = 60.0
+    else:
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
+        BulletSimulator.MAX_PIVOT_TIME = 30.0
     sim = BulletSimulator(
-        scenario.n, scenario.pos0, scenario.bonded0, gui=False)
+        scenario.n, scenario.pos0, scenario.bonded0, gui=False,
+        module_shape=args.module_shape)
 
     coag = StarFaultCoagulation(
         sim,

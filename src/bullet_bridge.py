@@ -30,7 +30,7 @@ class AsyncSimRunner:
     Individual pivots still use ``BulletSimulator.MAX_PIVOT_TIME``.
     """
 
-    TICK_DT = 0.01          # match BulletSimulator.PHYSICS_DT per integration step
+    TICK_DT = 0.05          # agent tick cadence (advances 5 physics substeps)
     TRAJ_INTERVAL = 1.0 / 15  # trajectory sample interval (15 fps real-time)
     STALL_INTERVAL = 10.0      # seconds between stall checks
     STALL_PATIENCE = 3         # consecutive stalls before abort
@@ -39,7 +39,8 @@ class AsyncSimRunner:
                  body_indices: Dict[str, int], *,
                  max_sim_time: float | None = None,
                  stall_interval: float | None = None,
-                 stall_patience: int | None = None):
+                 stall_patience: int | None = None,
+                 record_trajectories: bool = True):
         self.sim = sim
         self.module_ids = module_ids
         self.body_indices = body_indices
@@ -56,7 +57,9 @@ class AsyncSimRunner:
             int(stall_patience) if stall_patience is not None else self.STALL_PATIENCE
         )
 
-        # Track trajectories for ALL bodies (including faulty)
+        # Track trajectories for ALL bodies (including faulty); skipped
+        # entirely when record_trajectories=False (headless MC).
+        self._record_trajectories = bool(record_trajectories)
         self._trajectories: Dict[str, List[np.ndarray]] = {
             mid: [] for mid in body_indices
         }
@@ -65,6 +68,8 @@ class AsyncSimRunner:
 
     def _sample_trajectory(self):
         """Record current positions and bond state for all bodies if it's time."""
+        if not self._record_trajectories:
+            return
         if self.sim.sim_time >= self._next_traj_sample - 1e-6:
             pos = self.sim.get_positions()
             for mid, idx in self.body_indices.items():

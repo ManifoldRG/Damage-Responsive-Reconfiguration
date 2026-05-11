@@ -6,7 +6,9 @@ Mirrors ``run_monte_carlo_sweep.py`` but runs each trial through the
 BulletSimulator + DecentralizedCoagulation/Restructuring agent pipeline
 instead of the discrete UDQDGSystem.
 
-Sequential execution only (PyBullet is not thread-safe).
+Trials run sequentially by default. PyBullet is not thread-safe but it is
+process-safe — pass ``--workers N`` to dispatch trials across N
+subprocesses (each subprocess gets its own DIRECT physics client).
 
 Usage:
     python run_bullet_monte_carlo.py [options]
@@ -25,6 +27,7 @@ import math
 import os
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
@@ -89,13 +92,24 @@ def warn_arg_conflicts(args, config):
 
 @dataclass(frozen=True)
 class BulletScenario:
-    """All inputs needed to run a single-fault PyBullet trial."""
+    """All inputs needed to run a multi-fault PyBullet trial.
+
+    fault_ids / fault_body_idxs hold the full set of simultaneously-injected
+    faults. The legacy single-fault fields (fault_id, fault_body_idx,
+    fault_adjacent) carry the first fault for back-compat with callers that
+    only handled one fault — they are unused on the simultaneous path.
+    """
     n_total: int
     pos0: np.ndarray            # (n_total, 3)
     bonded0: np.ndarray         # (n_total, n_total) bool
+    # Single-fault legacy fields:
     fault_id: str
     fault_body_idx: int
     fault_adjacent: List[str]
+    # Multi-fault fields (used by the simultaneous-injection path):
+    fault_ids: List[str]
+    fault_body_idxs: List[int]
+    adjacent_map: Dict[str, int]   # active_module_id -> one fault body idx
     module_ids: List[str]       # active (non-faulty) module IDs
     body_indices: Dict[str, int]
     pre_damage_neighbor_slots: Dict[str, List[np.ndarray]]
@@ -104,14 +118,22 @@ class BulletScenario:
 
 def udqdg_to_bullet_scenario(
     system,
-    fault_id: str,
+    fault_ids,
 ) -> BulletScenario:
-    """Convert a UDQDGSystem + single fault ID into BulletSimulator inputs.
+    """Convert a UDQDGSystem + fault set into BulletSimulator inputs.
 
-    Maps module IDs to body indices 0..N-1 (sorted by ID for determinism).
-    The fault module becomes a real body in the physics world (collision on,
-    full mass) just like the line-fault demo.
+    Accepts a single fault id (str) for back-compat or a list of fault ids
+    for the simultaneous-injection path. All fault modules become real bodies
+    in the physics world (full mass, collision-on) — only excluded from the
+    policy's active module set.
     """
+    if isinstance(fault_ids, str):
+        fault_id_list = [fault_ids]
+    else:
+        fault_id_list = list(fault_ids)
+    fault_set = set(fault_id_list)
+    primary_fault = fault_id_list[0] if fault_id_list else ""
+
     all_mids = sorted(system.modules.keys())
     n_total = len(all_mids)
     mid_to_idx: Dict[str, int] = {mid: i for i, mid in enumerate(all_mids)}
@@ -126,20 +148,31 @@ def udqdg_to_bullet_scenario(
         bonded0[ia, ib] = True
         bonded0[ib, ia] = True
 
-    fault_body_idx = mid_to_idx[fault_id]
-    module_ids = [mid for mid in all_mids if mid != fault_id]
+    fault_body_idxs = [mid_to_idx[fid] for fid in fault_id_list]
+    module_ids = [mid for mid in all_mids if mid not in fault_set]
     body_indices = {mid: mid_to_idx[mid] for mid in module_ids}
 
+    # Adjacent-to-any-fault map: active module id -> first fault body idx it
+    # neighbors. set_multi_fault_adjacent uses this to seed flood/echo and
+    # token generation per fault.
+    adjacent_map: Dict[str, int] = {}
+    for (a, b) in system.edges:
+        if a in fault_set and b not in fault_set:
+            adjacent_map.setdefault(b, mid_to_idx[a])
+        elif b in fault_set and a not in fault_set:
+            adjacent_map.setdefault(a, mid_to_idx[b])
+
+    # Legacy single-fault adjacent list (preserved for any caller still on
+    # the single-fault path); points to primary fault only.
     fault_adjacent: List[str] = []
     for (a, b) in system.edges:
-        if a == fault_id and b != fault_id:
+        if a == primary_fault and b != primary_fault:
             fault_adjacent.append(b)
-        elif b == fault_id and a != fault_id:
+        elif b == primary_fault and a != primary_fault:
             if a not in fault_adjacent:
                 fault_adjacent.append(a)
 
     pre_damage_neighbor_slots: Dict[str, List[np.ndarray]] = {}
-    fault_pos = system.modules[fault_id].position
     for mid in module_ids:
         mid_pos = system.modules[mid].position
         neighbors = system.get_neighbors(mid)
@@ -162,9 +195,12 @@ def udqdg_to_bullet_scenario(
         n_total=n_total,
         pos0=pos0,
         bonded0=bonded0,
-        fault_id=fault_id,
-        fault_body_idx=fault_body_idx,
+        fault_id=primary_fault,
+        fault_body_idx=mid_to_idx[primary_fault] if primary_fault else -1,
         fault_adjacent=fault_adjacent,
+        fault_ids=fault_id_list,
+        fault_body_idxs=fault_body_idxs,
+        adjacent_map=adjacent_map,
         module_ids=module_ids,
         body_indices=body_indices,
         pre_damage_neighbor_slots=pre_damage_neighbor_slots,
@@ -304,6 +340,8 @@ def run_single_bullet_trial(
     restructuring_method: str = "rendezvous",
     token_strategy: str = "furthest",
     safety_radius: int = 2,
+    module_shape: str = "sphere",
+    max_pivot_time: Optional[float] = None,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -335,6 +373,16 @@ def run_single_bullet_trial(
     }
     faulty_modules_set = set(faulty_module_ids)
 
+    # Simultaneous fault injection: mark every selected fault before any
+    # bullet world is built. This matches the intended multi-failure
+    # semantics — the policy reconfigures the structure around all faults
+    # collectively in a single coag+restruct, instead of repairing one
+    # fault at a time. Faults remain as full-mass collision-on bodies in
+    # the bullet world (just excluded from the policy's module set).
+    for fid in faulty_module_ids:
+        if system.modules[fid].is_active:
+            system.mark_fault(fid)
+
     total_phase1_moves = 0
     total_phase2_moves = 0
     total_phase1_ticks = 0
@@ -342,88 +390,93 @@ def run_single_bullet_trial(
     post_phase1_positions: Optional[Dict[str, np.ndarray]] = None
     post_phase2_positions: Optional[Dict[str, np.ndarray]] = None
 
-    for fault_id in faulty_module_ids:
-        if not system.modules[fault_id].is_active:
-            continue
+    scenario = udqdg_to_bullet_scenario(system, faulty_module_ids)
 
-        scenario = udqdg_to_bullet_scenario(system, fault_id)
-
+    if module_shape == "cube":
+        BulletSimulator.USE_ROLLING_SPHERE_PIVOT = False
+        BulletSimulator.MAX_PIVOT_TIME = 40.0
+    else:
         BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
         BulletSimulator.MAX_PIVOT_TIME = 20.0
-        sim = BulletSimulator(
-            scenario.n_total, scenario.pos0, scenario.bonded0, gui=False)
+    if max_pivot_time is not None:
+        BulletSimulator.MAX_PIVOT_TIME = float(max_pivot_time)
+    sim = BulletSimulator(
+        scenario.n_total, scenario.pos0, scenario.bonded0, gui=False,
+        module_shape=module_shape)
 
-        try:
-            coag = _MCCoagulation(
-                sim,
-                fault_id=scenario.fault_id,
-                module_ids=scenario.module_ids,
-                body_indices=scenario.body_indices,
-            )
-            coag.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
-            coag._safety_radius = safety_radius
-            coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
-            coag.TEMPERATURE = temperature
-            coag.TOKEN_GEN_INTERVAL = 1.0
-            coag.set_fault_adjacent(
-                scenario.fault_adjacent, scenario.fault_body_idx)
+    try:
+        # _MCCoagulation requires a primary fault_id at construction; we
+        # immediately overwrite the single-fault registration with the
+        # multi-fault one. ALL fault bodies are registered as obstacles.
+        coag = _MCCoagulation(
+            sim,
+            fault_id=scenario.fault_ids[0] if scenario.fault_ids else "",
+            module_ids=scenario.module_ids,
+            body_indices=scenario.body_indices,
+        )
+        coag.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+        coag._safety_radius = safety_radius
+        coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
+        coag.TEMPERATURE = temperature
+        coag.TOKEN_GEN_INTERVAL = 1.0
+        coag.set_multi_fault_adjacent(
+            fault_ids=scenario.fault_ids,
+            fault_body_idxs=scenario.fault_body_idxs,
+            adjacent_map=scenario.adjacent_map,
+        )
 
-            phase1_ticks = _run_phase(
-                sim, coag, _phase1_done, dt,
+        phase1_ticks = _run_phase(
+            sim, coag, _phase1_done, dt,
+            max_phase_time, stall_interval, stall_patience)
+
+        phase1_connected = coag.is_connected()
+        total_phase1_moves = coag.total_moves
+        total_phase1_ticks = phase1_ticks
+        restored = phase1_connected
+
+        pos_snap = sim.get_positions()
+        post_phase1_positions = {
+            mid: pos_snap[scenario.body_indices[mid]].copy()
+            for mid in scenario.module_ids
+        }
+
+        if phase1_connected:
+            coag_moved: Set[str] = {m["module"] for m in coag.move_log}
+            if restructuring_method == "displacement":
+                restruct = _MCDisplacementRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    original_positions=scenario.original_positions,
+                )
+            else:
+                restruct = _MCRestructuring(
+                    sim=sim,
+                    module_ids=scenario.module_ids,
+                    body_indices=scenario.body_indices,
+                    coag_moved=coag_moved,
+                    pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
+                    token_strategy=token_strategy,
+                )
+            restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+            restruct._safety_radius = safety_radius
+            restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
+            restruct.generate_initial_tokens()
+
+            _run_phase(
+                sim, restruct, _phase2_done, dt,
                 max_phase_time, stall_interval, stall_patience)
 
-            phase1_connected = coag.is_connected()
-            total_phase1_moves += coag.total_moves
-            total_phase1_ticks += phase1_ticks
+            total_phase2_moves = restruct.total_moves
 
-            if not phase1_connected:
-                restored = False
-
-            pos_snap = sim.get_positions()
-            post_phase1_positions = {
-                mid: pos_snap[scenario.body_indices[mid]].copy()
+            pos_snap2 = sim.get_positions()
+            post_phase2_positions = {
+                mid: pos_snap2[scenario.body_indices[mid]].copy()
                 for mid in scenario.module_ids
             }
-
-            if phase1_connected:
-                coag_moved: Set[str] = {m["module"] for m in coag.move_log}
-                if restructuring_method == "displacement":
-                    restruct = _MCDisplacementRestructuring(
-                        sim=sim,
-                        module_ids=scenario.module_ids,
-                        body_indices=scenario.body_indices,
-                        coag_moved=coag_moved,
-                        original_positions=scenario.original_positions,
-                    )
-                else:
-                    restruct = _MCRestructuring(
-                        sim=sim,
-                        module_ids=scenario.module_ids,
-                        body_indices=scenario.body_indices,
-                        coag_moved=coag_moved,
-                        pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
-                        token_strategy=token_strategy,
-                    )
-                restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
-                restruct._safety_radius = safety_radius
-                restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
-                restruct.generate_initial_tokens()
-
-                _run_phase(
-                    sim, restruct, _phase2_done, dt,
-                    max_phase_time, stall_interval, stall_patience)
-
-                total_phase2_moves += restruct.total_moves
-
-                pos_snap2 = sim.get_positions()
-                post_phase2_positions = {
-                    mid: pos_snap2[scenario.body_indices[mid]].copy()
-                    for mid in scenario.module_ids
-                }
-        finally:
-            sim.disconnect()
-
-        system.modules[fault_id].is_active = False
+    finally:
+        sim.disconnect()
 
     if restored and post_phase1_positions is not None:
         shape_diff_phase1 = calculate_shape_difference(
@@ -457,6 +510,11 @@ def run_single_bullet_trial(
 # Aggregation loop (reuses MonteCarloResults)
 # ---------------------------------------------------------------------------
 
+def _run_trial_dispatch(kwargs: Dict) -> TrialResult:
+    """Top-level worker for ProcessPoolExecutor (must be picklable)."""
+    return run_single_bullet_trial(**kwargs)
+
+
 def run_bullet_monte_carlo(
     n_modules: int,
     n_faults: int = 1,
@@ -467,20 +525,23 @@ def run_bullet_monte_carlo(
     verbose: bool = False,
     config_mode: str = CONFIG_MODE_RANDOM,
     fault_mode: str = FAULT_MODE_RANDOM,
+    workers: int = 1,
     **trial_kwargs,
 ) -> MonteCarloResults:
-    """Run Monte Carlo simulation via PyBullet (sequential only)."""
+    """Run Monte Carlo simulation via PyBullet.
+
+    ``workers``: 1 = sequential (default); >1 = ProcessPoolExecutor with that
+    many subprocess workers. Each worker holds its own PyBullet DIRECT
+    client, so trials are fully isolated.
+    """
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
 
-    trials: List[TrialResult] = []
-    iterator = tqdm(range(n_trials), desc=f"n={n_modules}", disable=not verbose)
-    for i in iterator:
-        trial_seed = seed + i
-        result = run_single_bullet_trial(
+    trial_kwarg_list: List[Dict] = [
+        dict(
             n_modules=n_modules,
             n_faults=n_faults,
-            seed=trial_seed,
+            seed=seed + i,
             trial_id=i,
             mode_2d=mode_2d,
             fully_connected=fully_connected,
@@ -488,7 +549,24 @@ def run_bullet_monte_carlo(
             fault_mode=fault_mode,
             **trial_kwargs,
         )
-        trials.append(result)
+        for i in range(n_trials)
+    ]
+
+    trials: List[TrialResult] = []
+    if workers <= 1:
+        iterator = tqdm(trial_kwarg_list, desc=f"n={n_modules}", disable=not verbose)
+        for kw in iterator:
+            trials.append(run_single_bullet_trial(**kw))
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            iterator = tqdm(
+                executor.map(_run_trial_dispatch, trial_kwarg_list),
+                total=n_trials,
+                desc=f"n={n_modules} (x{workers})",
+                disable=not verbose,
+            )
+            for result in iterator:
+                trials.append(result)
 
     meaningful_trials = [t for t in trials if t.phase1_moves > 0]
     successful_trials = [t for t in meaningful_trials if t.restored]
@@ -773,6 +851,20 @@ def main():
     parser.add_argument("--restructuring-method", type=str, default="rendezvous",
                         choices=["rendezvous", "displacement"],
                         help="Phase 2 method: rendezvous tokens or displacement-guided (default: rendezvous)")
+    parser.add_argument("--module-shape", type=str, default="sphere",
+                        choices=["sphere", "cube"],
+                        help="Module geometry: sphere (rolling pivots) or cube "
+                             "(edge-lever pivots; only laterals are eligible) "
+                             "(default: sphere)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel subprocess workers per (n,config) batch "
+                             "(default: 1=sequential)")
+    parser.add_argument("--safety-radius", type=int, default=2,
+                        help="Single safety radius for is_movable() check "
+                             "(default: 2). Ignored if --ablation-hops set.")
+    parser.add_argument("--max-pivot-time", type=float, default=None,
+                        help="Override BulletSimulator.MAX_PIVOT_TIME in sec "
+                             "(default: 20s sphere / 40s cube)")
     args = parser.parse_args()
 
     # --- Resume mode ---
@@ -811,6 +903,7 @@ def main():
         stall_interval = config.get("stall_interval", 20.0)
         stall_patience = config.get("stall_patience", 8)
         restructuring_method = config.get("restructuring_method", "rendezvous")
+        module_shape = config.get("module_shape", "sphere")
         ablation = config.get("ablation", False)
         ablation_hops = config.get("ablation_hops", False)
         n_values_explicit = config.get("n_values", None)
@@ -851,6 +944,7 @@ def main():
         stall_interval = args.stall_interval
         stall_patience = args.stall_patience
         restructuring_method = args.restructuring_method
+        module_shape = args.module_shape
         ablation = args.ablation
         ablation_hops = args.ablation_hops
         n_values_explicit = args.n_values
@@ -880,6 +974,7 @@ def main():
             "stall_interval": stall_interval,
             "stall_patience": stall_patience,
             "restructuring_method": restructuring_method,
+            "module_shape": module_shape,
             "ablation": ablation,
             "ablation_hops": ablation_hops,
             "n_values": n_values_explicit,
@@ -899,7 +994,7 @@ def main():
     remaining = [n for n in all_n_values if n not in completed]
 
     strategies = TOKEN_STRATEGIES if ablation else ["furthest"]
-    radii = SAFETY_RADII if ablation_hops else [2]
+    radii = SAFETY_RADII if ablation_hops else [args.safety_radius]
 
     if config_mode == CONFIG_MODE_TREE:
         connectivity_desc = "tree (no cycles)"
@@ -939,6 +1034,7 @@ def main():
     print(f"  Pivot exclusion radius: {pivot_radius}")
     print(f"  Max phase time: {max_phase_time}s")
     print(f"  Restructuring: {restructuring_method}")
+    print(f"  Module shape: {module_shape}")
     if ablation:
         print(f"  Token strategy ablation: {strategies}")
     else:
@@ -947,7 +1043,10 @@ def main():
         print(f"  Safety radius ablation: {radii}")
     else:
         print(f"  Safety radius: 2")
-    print(f"  Sequential (PyBullet not thread-safe)")
+    if args.workers > 1:
+        print(f"  Workers: {args.workers} subprocesses (PyBullet process-safe)")
+    else:
+        print(f"  Sequential (use --workers N for subprocess parallelism)")
     if fault_modes_explicit:
         print(f"  Fault modes: {fault_modes_explicit}")
     elif cluster_faults:
@@ -1024,6 +1123,7 @@ def main():
                     verbose=False,
                     config_mode=config_mode,
                     fault_mode=fault_mode,
+                    workers=args.workers,
                     temperature=temperature,
                     pivot_exclusion_radius=pivot_radius,
                     max_phase_time=max_phase_time,
@@ -1032,6 +1132,8 @@ def main():
                     restructuring_method=restructuring_method,
                     token_strategy=strat,
                     safety_radius=rad,
+                    module_shape=module_shape,
+                    max_pivot_time=args.max_pivot_time,
                 )
 
                 summary_writer.writerow([

@@ -460,22 +460,31 @@ def run_single_trial(
     faulty_module_ids = select_faulty_modules(system, n_faults, seed + 1000, fault_mode)
     faulty_modules_set = set(faulty_module_ids)
 
-    # Run full damage response for each fault
+    # Simultaneous fault injection: mark every selected module faulty BEFORE
+    # running any coagulation. The decentralized algorithms (coagulation +
+    # restructuring) inspect `is_faulty` on every neighbor, so once all faults
+    # are pre-marked, a single coag+restruct pair handles them collectively —
+    # which is the intended "multiple-simultaneous-failures" semantics. The
+    # earlier per-fault loop fully repaired each fault before injecting the
+    # next, which is a different (and unintended) scenario.
+    active_faults = [fid for fid in faulty_module_ids
+                     if system.modules[fid].is_active]
+    for fid in active_faults:
+        system.mark_fault(fid)
+
     phase1_moves = 0
     phase2_moves = 0
     phase1_iterations = 0
     token_transmissions = 0
-    restored = True  # Assume success until a fault fails to reconnect
-    post_phase1_positions = None  # Snapshot after last fault's phase 1
+    restored = True
+    post_phase1_positions = None
 
-    for fault_id in faulty_module_ids:
-        # Skip if module is already inactive (from previous fault)
-        if not system.modules[fault_id].is_active:
-            continue
-
-        # Run damage response
+    if active_faults:
+        # full_damage_response treats any pre-marked fault as already faulty
+        # and runs ONE coag + ONE restruct over the whole damaged structure.
+        # The `fault_module_id` argument is used for stats/validation only.
         result = system.full_damage_response(
-            fault_module_id=fault_id,
+            fault_module_id=active_faults[0],
             restore_positions=True,
             max_phase1_iterations=1000,
             max_phase2_iterations=1000,
@@ -484,21 +493,19 @@ def run_single_trial(
             reconstruction_method=reconstruction_method
         )
 
-        # Accumulate stats
-        phase1_stats = result.get('phase1', {})
-        phase2_stats = result.get('phase2', {})
+        phase1_stats = result.get('phase1', {}) or {}
+        phase2_stats = result.get('phase2', {}) or {}
 
-        phase1_moves += phase1_stats.get('total_moves', 0)
-        phase1_iterations += phase1_stats.get('iterations', 0)
-        token_transmissions += phase1_stats.get('token_transmissions', 0)
-        restored = restored and phase1_stats.get('reconnected', False)
+        phase1_moves = phase1_stats.get('total_moves', 0)
+        phase1_iterations = phase1_stats.get('iterations', 0)
+        token_transmissions = phase1_stats.get('token_transmissions', 0)
+        restored = phase1_stats.get('reconnected', False)
 
-        # Keep the post-phase1 snapshot from the last fault processed
         if result.get('post_phase1_positions'):
             post_phase1_positions = result['post_phase1_positions']
 
         if phase2_stats:
-            phase2_moves += phase2_stats.get('restoration_moves', 0)
+            phase2_moves = phase2_stats.get('restoration_moves', 0)
             token_transmissions += phase2_stats.get('token_transmissions', 0)
 
     # Only calculate metrics for successful trials

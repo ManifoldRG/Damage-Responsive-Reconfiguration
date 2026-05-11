@@ -63,6 +63,33 @@ def _lateral_axis_handoff_step_cardinal_for_axis(
     return False
 
 
+def _cube_lateral_swept_clear(
+    occupied: set,
+    my_cell: Tuple[int, int, int],
+    target_cell: Tuple[int, int, int],
+    arm_axis_local: np.ndarray,
+    R_axis: np.ndarray,
+    nom: float,
+) -> bool:
+    """For cube modules, a 90° lever around the shared edge sweeps a quarter-disk
+    that intrudes into the two cells "above" the start and target cells, where
+    "above" is the arm direction (axis→pivot) extended by one lattice step.
+
+    Reject the candidate if either of those cells is occupied.
+    """
+    arm_loc = R_axis.T @ arm_axis_local / nom
+    arm_unit = np.round(arm_loc).astype(int)
+    if int(np.sum(np.abs(arm_unit))) != 1:
+        # Non-cardinal arm in axis frame: skip the test (be permissive — caller
+        # may still reject via other checks).
+        return True
+    above_pivot = tuple((np.array(my_cell, dtype=int) + arm_unit).tolist())
+    above_target = tuple((np.array(target_cell, dtype=int) + arm_unit).tolist())
+    if above_pivot in occupied or above_target in occupied:
+        return False
+    return True
+
+
 def _lattice_delta_perpendicular_to_arm(
     delta: Tuple[int, int, int],
     arm_world: np.ndarray,
@@ -757,6 +784,7 @@ class DecentralizedCoagulation:
         # score = negative distance to token origin (maximize = minimize dist)
         scored: List[Tuple[float, np.ndarray, int, str, Optional[int]]] = []
         nom = float(self.sim.NOMINAL_DIST)
+        module_shape = getattr(self.sim, "_module_shape", "sphere")
 
         for axis_idx in neighbors:
             if (fault_idxs and axis_idx in fault_idxs
@@ -781,8 +809,16 @@ class DecentralizedCoagulation:
                 ghost_goal_cell = tuple(
                     np.round(R.T @ (gpos_ax - p_ref) / nom).astype(int))
 
+            # Cube modules cannot do sphere-style corner pivots: a 90° lever
+            # around the contact edge lands the cube at a cell *diagonal* to
+            # axis (= the lateral-pivot destination), not at a perpendicular
+            # neighbor of axis. Skip the corner enumeration entirely for cubes.
+            corner_enabled = (module_shape != "cube")
+
             # ── Corner: 4 sites on axis — steps ⟂ (pivot − axis) in ref frame ──
             for delta in _LATTICE_DELTAS:
+                if not corner_enabled:
+                    break
                 perp = _lattice_delta_perpendicular_to_arm(
                     delta, arm_axis_to_pivot, R)
                 dw = nom * np.array(delta, dtype=float)
@@ -849,6 +885,11 @@ class DecentralizedCoagulation:
                 cos_angle = np.dot(r_vec, r_target) / (r_vec_n * r_tar_n)
                 if abs(cos_angle) > _LATERAL_PIVOT_MAX_ABS_COS:
                     continue
+                if module_shape == "cube":
+                    if not _cube_lateral_swept_clear(
+                            occupied, my_cell, target_cell,
+                            arm_axis_to_pivot, R, nom):
+                        continue
                 dist_to_origin = float(np.linalg.norm(target_world - origin))
                 score = -dist_to_origin
                 t_local = R.T @ (target_world - p_ref)
@@ -1952,6 +1993,7 @@ class DecentralizedRestructuring:
         fault_idxs = self._get_fault_idxs()
         scored: List[Tuple[float, np.ndarray, int, str, Optional[int]]] = []
         nom = float(self.sim.NOMINAL_DIST)
+        module_shape = getattr(self.sim, "_module_shape", "sphere")
 
         for axis_idx in neighbors:
             if (fault_idxs and axis_idx in fault_idxs
@@ -1976,7 +2018,11 @@ class DecentralizedRestructuring:
                 ghost_goal_cell = tuple(
                     np.round(R.T @ (gpos_ax - p_ref) / nom).astype(int))
 
+            corner_enabled = (module_shape != "cube")
+
             for delta in _LATTICE_DELTAS:
+                if not corner_enabled:
+                    break
                 perp = _lattice_delta_perpendicular_to_arm(
                     delta, arm_axis_to_pivot, R)
                 dw = nom * np.array(delta, dtype=float)
@@ -2041,6 +2087,11 @@ class DecentralizedRestructuring:
                 cos_angle = np.dot(r_vec, r_target) / (r_vec_n * r_tar_n)
                 if abs(cos_angle) > _LATERAL_PIVOT_MAX_ABS_COS:
                     continue
+                if module_shape == "cube":
+                    if not _cube_lateral_swept_clear(
+                            occupied, my_cell, target_cell,
+                            arm_axis_to_pivot, R, nom):
+                        continue
                 score = -float(np.linalg.norm(target_world - origin))
                 t_local = R.T @ (target_world - p_ref)
                 scored.append((score, t_local, axis_idx, "lateral", handoff_idx))

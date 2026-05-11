@@ -58,6 +58,11 @@ class PivotState:
     pivot_type: str = "corner"
     repel_idx: Optional[int] = None    # module whose surface repels; defaults to axis_idx
     repel_connector: Optional[int] = None    # connector index on repel module
+    # PD-settle phase: time at which is_pivot_complete first observed tols met.
+    # While set, _apply_pivot_attachment_actuation uses settle (high) gains to
+    # drive the pivot the last fraction of a meter onto the lattice cell
+    # without the teleport-induced constraint cascade.
+    settling_started_at: Optional[float] = None
 
 
 class BulletSimulator:
@@ -67,6 +72,12 @@ class BulletSimulator:
     MODULE_RADIUS = 0.5
     MAX_MOTOR_TORQUE = 2.0
     SPHERE_INERTIA = (2.0 / 5.0) * MODULE_MASS * MODULE_RADIUS ** 2
+    # Solid cube of side 2*MODULE_RADIUS: I = (1/6) m s^2 around any axis through center.
+    CUBE_INERTIA = (1.0 / 6.0) * MODULE_MASS * (2.0 * MODULE_RADIUS) ** 2
+
+    # Module geometry: "sphere" (rolling-contact) or "cube" (edge-lever pivots).
+    # Set per-instance in __init__; class default is sphere for backward compat.
+    MODULE_SHAPE_DEFAULT = "sphere"
 
     # False: fixed bonds + point-to-point pivot + attachment (or PD if flag on).
     USE_SPRING_BONDS = False
@@ -108,8 +119,8 @@ class BulletSimulator:
     ATTACHMENT_FORCE_CAP = 60.0   # N per directed attachment
 
     # Cartesian PD pivot actuation: F = Kp*(target - pos) - Kd*v_rel
-    PIVOT_PD_KP = 20.0    # N/m   (proportional: position error -> force)
-    PIVOT_PD_KD = 10.0    # N·s/m (derivative: damps relative velocity to zero)
+    PIVOT_PD_KP = 200.0    # N/m   (proportional: position error -> force)
+    PIVOT_PD_KD = 100.0    # N·s/m (derivative: damps relative velocity to zero)
     PIVOT_PD_F_MAX = 500.0  # N  (force cap per pivot pair)
 
     # Legacy soft bonds when RIGID_BONDS False and USE_SPRING_BONDS False
@@ -118,6 +129,18 @@ class BulletSimulator:
 
     DAMPING_COEFF = 2.4
     PHYSICS_DT = 0.01
+
+    # Performance knobs (all overridable per-instance/class).
+    # Solver iterations: 120/150 are well above what rigid spheres + a handful
+    # of constraints actually need; 50/60 was measured to give equivalent
+    # reconnection behavior at ~2x speed in the force-step loop.
+    NUM_SOLVER_ITERATIONS_RIGID = 50
+    NUM_SOLVER_ITERATIONS_SPRING = 60
+    # `_auto_proximity_bond` is O(N^2) with up to 36 connector queries per
+    # pair. Modules cannot traverse AUTO_BOND_CONNECTOR_DIST (0.1 m) in 10
+    # substeps (0.1 sim-s) under realistic actuation, so running it every
+    # substep is wasted work.
+    AUTO_BOND_INTERVAL_SUBSTEPS = 10
 
     # Spring pivot settling (relative geometry — not world target_pos; cluster may drift)
     SPRING_PIVOT_ANGLE_TOL = 0.04
@@ -143,6 +166,36 @@ class BulletSimulator:
     # Auto-bond: if any two mating connectors are within this distance and
     # neither module is actively pivoting, create a rigid bond automatically.
     AUTO_BOND_CONNECTOR_DIST = 0.1  # m
+    # Cosine tolerance for connector-axis alignment in auto-bond. Was 0.99985
+    # (~1°), which made auto-bond effectively dead once attitudes drifted from
+    # cardinal. 0.985 ~ 10° is loose enough to absorb realistic post-pivot drift
+    # while still requiring rough cardinal alignment. Pair with SNAP_TO_LATTICE
+    # so genuine post-pivot bodies are also cardinally aligned anyway.
+    AUTO_BOND_COSINE_TOL = 0.985
+
+    # Disabled: snapping the pivot body teleports it away from the rest poses
+    # encoded in its rigid-bond constraints to non-axis neighbors, which the
+    # next solver step then tries to "fix" violently. Pivots can't drop all
+    # bonds at start_pivot (the cluster would drift apart), so a naive snap
+    # creates a constraint-violation cascade that *worsens* outcomes. Left
+    # the helper in place so this can be revisited with a smarter scheme
+    # (e.g. recomputing rest poses on snap).
+    SNAP_TO_LATTICE_ON_PIVOT_COMPLETE = False
+
+    # PD-settle phase. Once a rolling-rigid pivot first observes tols met in
+    # is_pivot_complete, instead of teleporting (which violates non-axis bond
+    # rest poses) or completing immediately (which leaves residual pos error
+    # 0.05–0.5 m by stop_pivot snapshot time), enter a fixed settling window
+    # where _apply_pivot_attachment_actuation uses much stiffer gains aimed at
+    # the lattice target. Constraints absorb force smoothly instead of
+    # exploding. Completes when pos_err drops below PD_SETTLE_POS_TOL or the
+    # window elapses.
+    USE_PD_SETTLE_AFTER_PIVOT_COMPLETE = True
+    PD_SETTLE_DURATION = 0.4        # seconds of sim time (40 substeps @ dt=0.01)
+    PD_SETTLE_KP = 1200.0           # vs PIVOT_PD_KP=200 baseline
+    PD_SETTLE_KD = 300.0            # vs PIVOT_PD_KD=100 baseline
+    PD_SETTLE_F_MAX = 1200.0        # vs PIVOT_PD_F_MAX=500 baseline
+    PD_SETTLE_POS_TOL = 1e-3        # early-exit if drives close to exact
 
     def __init__(self, N: int, pos0: np.ndarray, bonded0: np.ndarray,
                  vel0: Optional[np.ndarray] = None, gui: bool = False,
@@ -151,9 +204,15 @@ class BulletSimulator:
                  momentum_diagnostics: bool = False,
                  momentum_diag_subsample: int = 1,
                  momentum_diag_max_samples: int = 200_000,
-                 pivot_attract_scale: float = 1.0):
+                 pivot_attract_scale: float = 1.0,
+                 module_shape: Optional[str] = None):
         self.N = N
         self._sim_time = 0.0
+        shape = module_shape if module_shape is not None else self.MODULE_SHAPE_DEFAULT
+        if shape not in ("sphere", "cube"):
+            raise ValueError(
+                f"module_shape must be 'sphere' or 'cube', got {shape!r}")
+        self._module_shape = shape
         self._mute_collision_for_bonded_after_pivot = (
             mute_collision_for_bonded_after_pivot)
         ps = float(pivot_attract_scale)
@@ -166,6 +225,23 @@ class BulletSimulator:
         self._momentum_diag_substep_idx = 0
         self._momentum_diag_samples: List[Dict[str, Any]] = []
         self._momentum_diag_summary: Dict[str, Any] = {}
+        # Per-substep position/velocity cache: populated at the start of each
+        # substep inside step(), invalidated before stepSimulation. Lets all
+        # force-calculation helpers share a single PyBullet round-trip per
+        # body instead of each fetching independently.
+        self._pos_cache: Optional[np.ndarray] = None
+        self._vel_cache: Optional[np.ndarray] = None
+        # Counts elapsed physics substeps; used to throttle auto-bond scans.
+        self._substep_counter: int = 0
+        # Auto-bond miss instrumentation. Each call to _auto_proximity_bond
+        # tallies why proximate (non-pivoting, unbonded) pairs failed to bond.
+        self._auto_bond_stats: Dict[str, int] = {
+            "pairs_in_com_range": 0,   # within 1.1m, attitude not yet checked
+            "cosine_fail_i": 0,        # i's attitude misaligned with bond axis
+            "cosine_fail_j": 0,        # j's attitude misaligned with bond axis
+            "connector_dist_fail": 0,  # both attitudes ok but no connector pair < 0.1m
+            "bonded_ok": 0,            # bond actually created
+        }
 
         mode = p.GUI if gui else p.DIRECT
         self._physics_client = p.connect(mode)
@@ -173,9 +249,15 @@ class BulletSimulator:
         p.setGravity(0, 0, 0, physicsClientId=self._physics_client)
         p.setTimeStep(self.PHYSICS_DT, physicsClientId=self._physics_client)
 
-        self._sphere_shape = p.createCollisionShape(
-            p.GEOM_SPHERE, radius=self.MODULE_RADIUS,
-            physicsClientId=self._physics_client)
+        if self._module_shape == "cube":
+            self._sphere_shape = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=[self.MODULE_RADIUS] * 3,
+                physicsClientId=self._physics_client)
+        else:
+            self._sphere_shape = p.createCollisionShape(
+                p.GEOM_SPHERE, radius=self.MODULE_RADIUS,
+                physicsClientId=self._physics_client)
 
         self._body_ids: List[int] = []
         for i in range(N):
@@ -192,14 +274,24 @@ class BulletSimulator:
                     angularVelocity=[0, 0, 0],
                     physicsClientId=self._physics_client,
                 )
-            p.changeDynamics(
-                body_id, -1,
-                restitution=0.05,
-                lateralFriction=0.35,
-                linearDamping=0.1,
-                angularDamping=0.1,
-                physicsClientId=self._physics_client,
-            )
+            if self._module_shape == "cube":
+                p.changeDynamics(
+                    body_id, -1,
+                    restitution=0.02,
+                    lateralFriction=0.9,
+                    linearDamping=0.15,
+                    angularDamping=0.2,
+                    physicsClientId=self._physics_client,
+                )
+            else:
+                p.changeDynamics(
+                    body_id, -1,
+                    restitution=0.05,
+                    lateralFriction=0.35,
+                    linearDamping=0.1,
+                    angularDamping=0.1,
+                    physicsClientId=self._physics_client,
+                )
             self._body_ids.append(body_id)
 
         self._bonds: Set[Tuple[int, int]] = set()
@@ -217,7 +309,8 @@ class BulletSimulator:
         # ``stop_pivot`` must not re-enable those pairs when restoring filters.
         self._collision_off_with_all: Set[int] = set()
 
-        nit = 150 if self.USE_SPRING_BONDS else 120
+        nit = (self.NUM_SOLVER_ITERATIONS_SPRING if self.USE_SPRING_BONDS
+               else self.NUM_SOLVER_ITERATIONS_RIGID)
         p.setPhysicsEngineParameter(
             numSolverIterations=nit,
             physicsClientId=self._physics_client,
@@ -243,6 +336,11 @@ class BulletSimulator:
 
     def handoff_contact_distance(self) -> float:
         """Lateral handoff proximity: one radius in spring mode."""
+        if self._module_shape == "cube":
+            # Face-to-face contact is at NOMINAL_DIST (1.0). Use a slightly looser
+            # gate so an in-flight lever (cube tipping over) crosses the threshold
+            # before reaching exact lattice alignment.
+            return 1.15
         return self.MODULE_RADIUS if self.USE_SPRING_BONDS else 1.05
 
     def _set_pair_collision(self, i: int, j: int, enable: bool):
@@ -386,6 +484,7 @@ class BulletSimulator:
         for ps in self._active_pivots.values():
             pivoting.add(ps.axis_idx)
 
+        stats = self._auto_bond_stats
         pos = self.get_positions()
         com_thresh = self.NOMINAL_DIST + self.AUTO_BOND_CONNECTOR_DIST
         for i in range(self.N):
@@ -398,13 +497,16 @@ class BulletSimulator:
                     continue
                 if float(np.linalg.norm(pos[i] - pos[j])) > com_thresh:
                     continue
+                stats["pairs_in_com_range"] += 1
                 d = pos[j] - pos[i]
                 d_hat = d / (np.linalg.norm(d) + 1e-12)
                 rot_i = self.body_rotation_matrix(i)
-                if float(np.max(np.abs(self.CONNECTOR_DIRS @ (rot_i.T @ d_hat)))) < 0.99985:
+                if float(np.max(np.abs(self.CONNECTOR_DIRS @ (rot_i.T @ d_hat)))) < self.AUTO_BOND_COSINE_TOL:
+                    stats["cosine_fail_i"] += 1
                     continue
                 rot_j = self.body_rotation_matrix(j)
-                if float(np.max(np.abs(self.CONNECTOR_DIRS @ (rot_j.T @ d_hat)))) < 0.99985:
+                if float(np.max(np.abs(self.CONNECTOR_DIRS @ (rot_j.T @ d_hat)))) < self.AUTO_BOND_COSINE_TOL:
+                    stats["cosine_fail_j"] += 1
                     continue
                 bonded = False
                 for ci in range(6):
@@ -418,6 +520,10 @@ class BulletSimulator:
                             break
                     if bonded:
                         break
+                if bonded:
+                    stats["bonded_ok"] += 1
+                else:
+                    stats["connector_dist_fail"] += 1
 
     # ── Pivot control ──────────────────────────────────────────────────
 
@@ -481,6 +587,7 @@ class BulletSimulator:
             self.USE_ROLLING_SPHERE_PIVOT
             and self.RIGID_BONDS
             and not self.USE_SPRING_BONDS
+            and self._module_shape == "sphere"
         )
         if use_rolling:
             logger.debug(
@@ -488,7 +595,16 @@ class BulletSimulator:
                 pivot_idx,
             )
         else:
-            child_frame = (-r0).tolist()
+            if self._module_shape == "cube":
+                # Cube lever: pin shared-edge midpoint between axis and pivot
+                # (the contact-face edge perpendicular to the motion direction).
+                # The constraint forces the pivot COM to swing on a circle about
+                # this edge, producing a 90° tip rather than a slide.
+                parent_frame, child_frame = self._cube_edge_midpoints_local(
+                    pivot_idx, axis_idx, target_pos_local, pivot_type)
+            else:
+                parent_frame = [0, 0, 0]
+                child_frame = (-r0).tolist()
             cid = p.createConstraint(
                 parentBodyUniqueId=self._body_ids[axis_idx],
                 parentLinkIndex=-1,
@@ -496,7 +612,7 @@ class BulletSimulator:
                 childLinkIndex=-1,
                 jointType=p.JOINT_POINT2POINT,
                 jointAxis=[0, 0, 0],
-                parentFramePosition=[0, 0, 0],
+                parentFramePosition=parent_frame,
                 childFramePosition=child_frame,
                 physicsClientId=self._physics_client,
             )
@@ -528,6 +644,32 @@ class BulletSimulator:
         logger.debug("Legacy pivot started: module {} around {} (angle={:.2f})",
                      pivot_idx, axis_idx, target_angle)
 
+    def _snap_pivot_to_lattice(self, pivot_idx: int, ps: PivotState,
+                                tgt_w: np.ndarray) -> None:
+        """Teleport pivot to lattice target + snap orientation + zero velocity.
+
+        Called on clean (non-timed-out) pivot completion in rigid mode. Spring
+        mode skipped because completion there is angle-based and the world
+        target may not represent the intended cluster position.
+        """
+        if not self.SNAP_TO_LATTICE_ON_PIVOT_COMPLETE:
+            return
+        if self.USE_SPRING_BONDS:
+            return
+        orn_tgt = self._crystal_target_quaternion_for_pivot(pivot_idx, ps)
+        p.resetBasePositionAndOrientation(
+            self._body_ids[pivot_idx],
+            np.asarray(tgt_w, dtype=float).tolist(),
+            list(orn_tgt),
+            physicsClientId=self._physics_client,
+        )
+        p.resetBaseVelocity(
+            self._body_ids[pivot_idx],
+            linearVelocity=[0.0, 0.0, 0.0],
+            angularVelocity=[0.0, 0.0, 0.0],
+            physicsClientId=self._physics_client,
+        )
+
     def _crystal_target_quaternion_for_pivot(
             self, pivot_idx: int, ps: PivotState) -> Tuple[float, float, float, float]:
         """World orientation (xyzw) for crystalline connector alignment.
@@ -550,7 +692,8 @@ class BulletSimulator:
                     self.USE_CRYSTAL_ATTITUDE_SNAP_AFTER_ROLLING_PIVOT
                     and self.USE_ROLLING_SPHERE_PIVOT
                     and self.RIGID_BONDS
-                    and not self.USE_SPRING_BONDS):
+                    and not self.USE_SPRING_BONDS
+                    and self._module_shape == "sphere"):
                 orn_tgt = self._crystal_target_quaternion_for_pivot(
                     pivot_idx, ps)
                 pos_cur, _ = p.getBasePositionAndOrientation(
@@ -589,6 +732,14 @@ class BulletSimulator:
 
     def clear_pivot_diagnostics(self):
         self._pivot_diagnostic_log.clear()
+
+    def get_auto_bond_stats(self) -> Dict[str, int]:
+        """Snapshot of auto-bond miss counters since last clear."""
+        return dict(self._auto_bond_stats)
+
+    def clear_auto_bond_stats(self):
+        for k in self._auto_bond_stats:
+            self._auto_bond_stats[k] = 0
 
     def get_pivot_diagnostic_log(self) -> List[Dict[str, Any]]:
         return list(self._pivot_diagnostic_log)
@@ -668,13 +819,37 @@ class BulletSimulator:
             and self.RIGID_BONDS
             and not self.USE_SPRING_BONDS)
         if rolling_rigid:
-            if (pos_err < float(self.PIVOT_POS_TOL)
-                    and omega_c < float(self.PIVOT_OMEGA_TOL)
-                    and rel_v < float(self.PIVOT_REL_V_TOL)):
-                ps.completed = True
-                return True
+            tols_met = (pos_err < float(self.PIVOT_POS_TOL)
+                        and omega_c < float(self.PIVOT_OMEGA_TOL)
+                        and rel_v < float(self.PIVOT_REL_V_TOL))
+            if self.USE_PD_SETTLE_AFTER_PIVOT_COMPLETE:
+                if ps.settling_started_at is None:
+                    if tols_met:
+                        # Enter settle phase; stronger PD will drive to lattice
+                        # over the next PD_SETTLE_DURATION seconds.
+                        ps.settling_started_at = self._sim_time
+                else:
+                    t_settle = self._sim_time - ps.settling_started_at
+                    if (pos_err < float(self.PD_SETTLE_POS_TOL)
+                            or t_settle >= float(self.PD_SETTLE_DURATION)):
+                        # Zero residual velocity for a clean handoff (does not
+                        # teleport position, so no constraint cascade).
+                        p.resetBaseVelocity(
+                            self._body_ids[pivot_idx],
+                            linearVelocity=[0.0, 0.0, 0.0],
+                            angularVelocity=[0.0, 0.0, 0.0],
+                            physicsClientId=self._physics_client,
+                        )
+                        ps.completed = True
+                        return True
+            else:
+                if tols_met:
+                    self._snap_pivot_to_lattice(pivot_idx, ps, tgt_w)
+                    ps.completed = True
+                    return True
         else:
             if pos_err < float(self.PIVOT_POS_TOL):
+                self._snap_pivot_to_lattice(pivot_idx, ps, tgt_w)
                 ps.completed = True
                 return True
 
@@ -731,6 +906,12 @@ class BulletSimulator:
             dt = self.PHYSICS_DT
         n_substeps = max(1, int(round(dt / self.PHYSICS_DT)))
         for _ in range(n_substeps):
+            # Single PyBullet round-trip per body for this substep's force
+            # computations; helpers read self._pos_cache/_vel_cache via
+            # get_positions/get_velocities.
+            self._pos_cache = self._fetch_positions()
+            self._vel_cache = self._fetch_velocities()
+
             self._apply_bond_forces()
             if self.USE_SPRING_BONDS:
                 self._apply_attachment_springs()
@@ -744,8 +925,14 @@ class BulletSimulator:
             if diag:
                 P_act = self.total_linear_momentum()
 
+            # Cache becomes stale once stepSimulation runs; clear it so
+            # post-step readers fetch fresh state.
+            self._pos_cache = None
+            self._vel_cache = None
+
             p.stepSimulation(physicsClientId=self._physics_client)
             self._sim_time += self.PHYSICS_DT
+            self._substep_counter += 1
 
             if diag:
                 P_bul = self.total_linear_momentum()
@@ -758,6 +945,7 @@ class BulletSimulator:
                 and self.USE_ROLLING_SPHERE_PIVOT
                 and self.RIGID_BONDS
                 and not self.USE_SPRING_BONDS
+                and self._module_shape == "sphere"
             )
             if had_roll:
                 for pidx, pst in list(self._active_pivots.items()):
@@ -789,7 +977,8 @@ class BulletSimulator:
                             no_slip_iterations=self.ROLLING_NO_SLIP_ITERATIONS,
                         )
 
-            self._auto_proximity_bond()
+            if self._substep_counter % self.AUTO_BOND_INTERVAL_SUBSTEPS == 0:
+                self._auto_proximity_bond()
 
             if diag:
                 P_roll = self.total_linear_momentum()
@@ -857,19 +1046,29 @@ class BulletSimulator:
                 trajectories[i].append(pos[i].copy())
         return trajectories
 
-    def get_positions(self) -> np.ndarray:
+    def _fetch_positions(self) -> np.ndarray:
         pos = np.zeros((self.N, 3))
         for i in range(self.N):
             pos[i] = p.getBasePositionAndOrientation(
                 self._body_ids[i], physicsClientId=self._physics_client)[0]
         return pos
 
-    def get_velocities(self) -> np.ndarray:
+    def _fetch_velocities(self) -> np.ndarray:
         vel = np.zeros((self.N, 3))
         for i in range(self.N):
             vel[i] = p.getBaseVelocity(
                 self._body_ids[i], physicsClientId=self._physics_client)[0]
         return vel
+
+    def get_positions(self) -> np.ndarray:
+        if self._pos_cache is not None:
+            return self._pos_cache
+        return self._fetch_positions()
+
+    def get_velocities(self) -> np.ndarray:
+        if self._vel_cache is not None:
+            return self._vel_cache
+        return self._fetch_velocities()
 
     def total_linear_momentum(self) -> np.ndarray:
         """Total linear momentum (kg·m/s); sum_i m_i v_i."""
@@ -969,6 +1168,44 @@ class BulletSimulator:
         d_hat = world_direction / (np.linalg.norm(world_direction) + 1e-12)
         dots = (rot @ self.CONNECTOR_DIRS.T).T @ d_hat  # shape (6,)
         return int(np.argmax(dots))
+
+    def _cube_edge_midpoints_local(
+            self, pivot_idx: int, axis_idx: int,
+            target_pos_local: np.ndarray, pivot_type: str
+    ) -> Tuple[List[float], List[float]]:
+        """Return (edge_in_axis_local, edge_in_pivot_local) for the lever edge.
+
+        The fulcrum is the edge between pivot's contact face (toward axis) and
+        the face on the side toward the motion direction. Computed once at
+        pivot start; the rotation about that edge produces a 90° lever.
+        """
+        pos = self.get_positions()
+        R_axis = self.body_rotation_matrix(axis_idx)
+        nom = float(self.NOMINAL_DIST)
+
+        arm_world = pos[pivot_idx] - pos[axis_idx]
+        n_loc_axis = R_axis.T @ arm_world / nom
+        n_loc_axis = np.round(n_loc_axis).astype(float)
+        # Snap to a strict cardinal unit (length 1).
+        nrm = float(np.linalg.norm(n_loc_axis))
+        if nrm > 1e-9:
+            n_loc_axis = n_loc_axis / nrm
+
+        target_loc = np.asarray(target_pos_local, dtype=float).reshape(3) / nom
+        if pivot_type == "lateral":
+            m_loc_axis = target_loc - n_loc_axis
+        else:
+            m_loc_axis = target_loc.copy()
+        m_loc_axis = np.round(m_loc_axis).astype(float)
+        mrm = float(np.linalg.norm(m_loc_axis))
+        if mrm > 1e-9:
+            m_loc_axis = m_loc_axis / mrm
+
+        edge_axis_local = self.MODULE_RADIUS * (n_loc_axis + m_loc_axis)
+        edge_world = pos[axis_idx] + R_axis @ edge_axis_local
+        R_piv = self.body_rotation_matrix(pivot_idx)
+        edge_pivot_local = R_piv.T @ (edge_world - pos[pivot_idx])
+        return edge_axis_local.tolist(), edge_pivot_local.tolist()
 
     def pivot_axis_geometric_contact(
             self, pivot_idx: int, axis_idx: int, pos: np.ndarray
@@ -1148,9 +1385,9 @@ class BulletSimulator:
         """
         if self.USE_SPRING_BONDS or not self._active_pivots:
             return
-        kp = self.PIVOT_PD_KP * self._pivot_attract_scale
-        kd = self.PIVOT_PD_KD
-        f_cap = self.PIVOT_PD_F_MAX
+        kp_base = self.PIVOT_PD_KP * self._pivot_attract_scale
+        kd_base = self.PIVOT_PD_KD
+        f_cap_base = self.PIVOT_PD_F_MAX
         pos = self.get_positions()
         vel = self.get_velocities()
         for pivot_idx, ps in self._active_pivots.items():
@@ -1159,6 +1396,16 @@ class BulletSimulator:
             tgt_w = self.resolve_pivot_target_world(ps)
             pos_err = tgt_w - pos[pivot_idx]
             v_rel = vel[pivot_idx] - vel[ax]
+
+            if (self.USE_PD_SETTLE_AFTER_PIVOT_COMPLETE
+                    and ps.settling_started_at is not None):
+                kp = self.PD_SETTLE_KP * self._pivot_attract_scale
+                kd = self.PD_SETTLE_KD
+                f_cap = self.PD_SETTLE_F_MAX
+            else:
+                kp = kp_base
+                kd = kd_base
+                f_cap = f_cap_base
 
             f_vec = kp * pos_err - kd * v_rel
 
