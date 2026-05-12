@@ -343,6 +343,7 @@ def run_single_bullet_trial(
     module_shape: str = "sphere",
     max_pivot_time: Optional[float] = None,
     use_flood_echo: bool = True,
+    token_gen_interval: float = 0.1,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -419,7 +420,7 @@ def run_single_bullet_trial(
         coag._safety_radius = safety_radius
         coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
         coag.TEMPERATURE = temperature
-        coag.TOKEN_GEN_INTERVAL = 1.0
+        coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
         coag.USE_FLOOD_ECHO = use_flood_echo
         coag.set_multi_fault_adjacent(
             fault_ids=scenario.fault_ids,
@@ -872,6 +873,11 @@ def main():
                         help="Disable flood/echo component-discovery protocol. "
                              "Fault-adjacent modules emit tokens unconditionally "
                              "(matches non-bullet MC behavior). Diagnostic.")
+    parser.add_argument("--token-gen-interval", type=float, default=0.1,
+                        help="Seconds of sim time between consecutive token "
+                             "emissions per fault-adjacent module (default: 0.1, "
+                             "matching the policy tick dt). Lower = more "
+                             "aggressive token flow.")
     args = parser.parse_args()
 
     # --- Resume mode ---
@@ -1142,6 +1148,7 @@ def main():
                     module_shape=module_shape,
                     max_pivot_time=args.max_pivot_time,
                     use_flood_echo=not args.no_flood_echo,
+                    token_gen_interval=args.token_gen_interval,
                 )
 
                 summary_writer.writerow([
