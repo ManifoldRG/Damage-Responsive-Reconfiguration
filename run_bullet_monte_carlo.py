@@ -342,6 +342,7 @@ def run_single_bullet_trial(
     safety_radius: int = 2,
     module_shape: str = "sphere",
     max_pivot_time: Optional[float] = None,
+    use_flood_echo: bool = True,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -419,6 +420,7 @@ def run_single_bullet_trial(
         coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
         coag.TEMPERATURE = temperature
         coag.TOKEN_GEN_INTERVAL = 1.0
+        coag.USE_FLOOD_ECHO = use_flood_echo
         coag.set_multi_fault_adjacent(
             fault_ids=scenario.fault_ids,
             fault_body_idxs=scenario.fault_body_idxs,
@@ -462,6 +464,7 @@ def run_single_bullet_trial(
             restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
             restruct._safety_radius = safety_radius
             restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
+            restruct.USE_FLOOD_ECHO = use_flood_echo
             restruct.generate_initial_tokens()
 
             _run_phase(
@@ -865,6 +868,10 @@ def main():
     parser.add_argument("--max-pivot-time", type=float, default=None,
                         help="Override BulletSimulator.MAX_PIVOT_TIME in sec "
                              "(default: 20s sphere / 40s cube)")
+    parser.add_argument("--no-flood-echo", action="store_true",
+                        help="Disable flood/echo component-discovery protocol. "
+                             "Fault-adjacent modules emit tokens unconditionally "
+                             "(matches non-bullet MC behavior). Diagnostic.")
     args = parser.parse_args()
 
     # --- Resume mode ---
@@ -1134,6 +1141,7 @@ def main():
                     safety_radius=rad,
                     module_shape=module_shape,
                     max_pivot_time=args.max_pivot_time,
+                    use_flood_echo=not args.no_flood_echo,
                 )
 
                 summary_writer.writerow([

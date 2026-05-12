@@ -250,6 +250,15 @@ class DecentralizedCoagulation:
     # (e.g. tie-fighter degeneracy on a center-fault line).
     TEMPERATURE: float = 0.01
 
+    # Flood/echo distributed component-discovery protocol. When True
+    # (default), fault-adjacent modules withhold tokens until a flood/echo
+    # round completes and stop emitting once their local component grows
+    # ("fault resolved"). When False, mirrors the non-bullet MC: tokens are
+    # emitted every TOKEN_GEN_INTERVAL unconditionally; coag termination is
+    # purely global is_connected(). Useful for diagnosing whether the
+    # flood/echo gating slows or destabilizes multi-fault scenarios.
+    USE_FLOOD_ECHO: bool = True
+
     def __init__(self, sim, fault_id: str, module_ids: List[str],
                  body_indices: Dict[str, int]):
         """
@@ -397,6 +406,10 @@ class DecentralizedCoagulation:
         Preserves resolved status for modules that were already resolved from
         a prior call (e.g. stall-recovery re-registration in bullet_bridge).
         """
+        if not self.USE_FLOOD_ECHO:
+            # Skip token-gating: emit tokens immediately from every fault-
+            # adjacent module on the next _generate_fault_tokens tick.
+            return
         for mid in adjacent_mids:
             if mid in self._fault_resolved_mids:
                 continue
@@ -954,12 +967,14 @@ class DecentralizedCoagulation:
         """
         self._tick_count += 1
 
-        # Flood/echo protocol: process messages, then check heartbeats
-        self._process_discover_messages()
-        self._process_echo_messages()
-        self._maybe_initiate_floods()
-        if self._tick_count % 500 == 0:
-            self._cleanup_stale_flood_participations()
+        # Flood/echo protocol: process messages, then check heartbeats.
+        # Skipped entirely when USE_FLOOD_ECHO=False (matches non-bullet MC).
+        if self.USE_FLOOD_ECHO:
+            self._process_discover_messages()
+            self._process_echo_messages()
+            self._maybe_initiate_floods()
+            if self._tick_count % 500 == 0:
+                self._cleanup_stale_flood_participations()
 
         # Fault-adjacent modules emit tokens (skips resolved / awaiting-baseline)
         self._generate_fault_tokens()
