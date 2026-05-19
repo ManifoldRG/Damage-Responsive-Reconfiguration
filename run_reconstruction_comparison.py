@@ -2,8 +2,12 @@
 """
 Reconstruction Method Comparison Runner
 
-Compares token-based (sidh-test) vs displacement-based (paper-code)
-Phase 2 reconstruction using shared Phase 1 state for fair comparison.
+Compares token-based (rendezvous) vs displacement-based Phase 2
+reconstruction. Phase 1 is shared exactly between both methods via a
+``GraphSimulator`` state snapshot taken at the end of coagulation —
+positions, orientations, and bonds are captured, then a fresh sim is
+built per Phase 2 method so the two restructuring policies see
+identical starting states.
 
 Usage:
     python run_reconstruction_comparison.py
@@ -14,8 +18,9 @@ import argparse
 import csv
 import json
 import os
-import sys
+from dataclasses import replace
 from datetime import datetime
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,9 +28,28 @@ from joblib import Parallel, delayed
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 
+from src.configurations import (
+    create_random_configuration,
+    create_random_tree_configuration,
+)
+from src.graph_sim import GraphSimulator
+from src.mc_runner import (
+    _MCCoagulation,
+    _MCDisplacementRestructuring,
+    _MCRestructuring,
+    _phase1_done,
+    _phase2_done,
+    _run_phase,
+    udqdg_to_scenario,
+)
 from src.monte_carlo import (
-    run_comparison_trial, CONFIG_MODE_RANDOM, CONFIG_MODE_TREE,
+    CONFIG_MODE_RANDOM,
+    CONFIG_MODE_TREE,
     FAULT_MODE_RANDOM,
+    TrialResult,
+    _causes_disconnection,
+    calculate_shape_difference,
+    select_faulty_modules,
 )
 
 
@@ -48,6 +72,222 @@ TRIALS_HEADERS = [
 ]
 
 
+def _snapshot_graph_sim(sim: GraphSimulator):
+    """Capture positions, orientations, and bonds from a `GraphSimulator`.
+
+    Returned tuple is consumed by ``_restore_graph_sim`` to build a fresh
+    sim with identical kinematic state. Pivots in flight are NOT preserved
+    — the caller is expected to drain via ``_run_phase`` (which already
+    calls ``stop_pivot`` on every active pivot at phase end).
+    """
+    return (
+        sim.get_positions().copy(),
+        sim._orientations.copy(),
+        sim.get_bond_matrix().copy(),
+    )
+
+
+def _restore_graph_sim(snapshot, n_total: int) -> GraphSimulator:
+    pos, orient, bonded = snapshot
+    sim = GraphSimulator(n_total, pos, bonded, module_shape="sphere")
+    sim._orientations = orient.copy()
+    return sim
+
+
+def _build_system_and_scenario(
+    n_modules: int, n_faults: int, seed: int, mode_2d: bool,
+    fully_connected: bool, config_mode: str, fault_mode: str,
+):
+    """Generate a UDQDGSystem + fault set that disconnects the active
+    graph, then translate to a `Scenario`. Tries up to 500 seed offsets
+    before giving up and returning the last attempt unmodified.
+    """
+    for structure_attempt in range(500):
+        gen_seed = seed + structure_attempt * 9973
+        if config_mode == CONFIG_MODE_TREE:
+            system = create_random_tree_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d, balanced=False)
+        else:
+            system = create_random_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d,
+                fully_connected=fully_connected)
+        faulty_ids = select_faulty_modules(
+            system, n_faults, gen_seed + 1000, fault_mode)
+        if _causes_disconnection(system, faulty_ids):
+            break
+
+    for fid in faulty_ids:
+        if system.modules[fid].is_active:
+            system.mark_fault(fid)
+    return system, faulty_ids
+
+
+def run_comparison_trial_graph(
+    n_modules: int, n_faults: int, seed: int, trial_id: int,
+    mode_2d: bool, fully_connected: bool, config_mode: str, fault_mode: str,
+    *,
+    temperature: float = 0.5,
+    pivot_exclusion_radius: int = 4,
+    dt: float = 0.1,
+    safety_radius: int = 2,
+    use_flood_echo: bool = False,
+    token_gen_interval: float = 0.1,
+    max_moves_per_module: int = 10,
+    use_position_history: bool = True,
+    token_strategy: str = "furthest",
+    forward_ap_cost: float = 0.1,
+) -> Tuple[TrialResult, TrialResult]:
+    """Run one trial with shared Phase 1 + both Phase 2 methods.
+
+    Returns ``(token_result, disp_result)`` — TrialResults with matching
+    ``trial_id`` / ``seed`` / ``phase1_moves`` / ``shape_difference_phase1``
+    but method-specific Phase 2 metrics.
+    """
+    original_positions = None
+    system, faulty_ids = _build_system_and_scenario(
+        n_modules, n_faults, seed, mode_2d, fully_connected,
+        config_mode, fault_mode)
+    original_positions = {
+        mid: m.position.copy() for mid, m in system.modules.items()
+    }
+    faulty_set = set(faulty_ids)
+
+    scenario = udqdg_to_scenario(system, faulty_ids)
+
+    # ── Phase 1: shared coagulation ────────────────────────────────────
+    sim = GraphSimulator(
+        scenario.n_total, scenario.pos0, scenario.bonded0,
+        module_shape="sphere")
+
+    coag = _MCCoagulation(
+        sim,
+        fault_id=scenario.fault_ids[0] if scenario.fault_ids else "",
+        module_ids=scenario.module_ids,
+        body_indices=scenario.body_indices,
+    )
+    coag.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+    coag._safety_radius = safety_radius
+    coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
+    coag.TEMPERATURE = temperature
+    coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
+    coag.INITIAL_ACTION_POINTS = int(max_moves_per_module)
+    coag.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+    for agent in coag.agents.values():
+        agent.action_points = int(max_moves_per_module)
+    coag.USE_FLOOD_ECHO = use_flood_echo
+    coag.USE_POSITION_HISTORY = bool(use_position_history)
+    coag.FORWARD_AP_COST = forward_ap_cost
+    coag.set_multi_fault_adjacent(
+        fault_ids=scenario.fault_ids,
+        fault_body_idxs=scenario.fault_body_idxs,
+        adjacent_map=scenario.adjacent_map,
+    )
+
+    phase1_ticks = _run_phase(
+        sim, coag, _phase1_done, dt,
+        max_time=0.0, stall_interval=0.0, stall_patience=0,
+        phase_label=f"coag[t{trial_id}/n{n_modules}/f{n_faults}]")
+
+    phase1_connected = coag.is_connected()
+    phase1_moves = coag.total_moves
+    coag_moved = {m["module"] for m in coag.move_log}
+
+    pos_snap = sim.get_positions()
+    post_phase1_positions = {
+        mid: pos_snap[scenario.body_indices[mid]].copy()
+        for mid in scenario.module_ids
+    }
+    if phase1_connected:
+        shape_diff_p1 = calculate_shape_difference(
+            original_positions, post_phase1_positions, faulty_set)
+    else:
+        shape_diff_p1 = None
+
+    snapshot = _snapshot_graph_sim(sim)
+
+    base = TrialResult(
+        trial_id=trial_id,
+        n_modules=n_modules,
+        n_faults=n_faults,
+        seed=seed,
+        restored=phase1_connected,
+        phase1_moves=phase1_moves,
+        phase2_moves=0,
+        shape_difference=None,
+        shape_difference_phase1=shape_diff_p1,
+        phase1_iterations=phase1_ticks,
+        total_moves=phase1_moves,
+        token_transmissions=0,
+        fault_mode=fault_mode,
+        token_strategy=token_strategy,
+        safety_radius=safety_radius,
+    )
+
+    if not phase1_connected:
+        # Both methods fail in the same way — return identical results
+        # with method labels.
+        return (replace(base, reconstruction_method="token"),
+                replace(base, reconstruction_method="displacement"))
+
+    # ── Phase 2: branch into both methods from the snapshot ────────────
+    def run_phase2(method: str) -> TrialResult:
+        sim2 = _restore_graph_sim(snapshot, scenario.n_total)
+
+        if method == "displacement":
+            restruct = _MCDisplacementRestructuring(
+                sim=sim2,
+                module_ids=scenario.module_ids,
+                body_indices=scenario.body_indices,
+                coag_moved=coag_moved,
+                original_positions=scenario.original_positions,
+            )
+        else:
+            restruct = _MCRestructuring(
+                sim=sim2,
+                module_ids=scenario.module_ids,
+                body_indices=scenario.body_indices,
+                coag_moved=coag_moved,
+                pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
+                token_strategy=token_strategy,
+            )
+        restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
+        restruct._safety_radius = safety_radius
+        restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
+        restruct.USE_FLOOD_ECHO = use_flood_echo
+        restruct.USE_POSITION_HISTORY = bool(use_position_history)
+        restruct.FORWARD_AP_COST = forward_ap_cost
+        restruct.INITIAL_ACTION_POINTS = int(max_moves_per_module)
+        restruct.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+        for agent in restruct.agents.values():
+            agent.action_points = int(max_moves_per_module)
+        restruct.generate_initial_tokens()
+
+        _run_phase(
+            sim2, restruct, _phase2_done, dt,
+            max_time=0.0, stall_interval=0.0, stall_patience=0,
+            phase_label=f"restruct-{method}[t{trial_id}/n{n_modules}/f{n_faults}]")
+
+        p2_moves = restruct.total_moves
+        pos_final = sim2.get_positions()
+        final_positions = {
+            mid: pos_final[scenario.body_indices[mid]].copy()
+            for mid in scenario.module_ids
+        }
+        shape_diff = calculate_shape_difference(
+            original_positions, final_positions, faulty_set)
+        return replace(
+            base,
+            reconstruction_method=method,
+            phase2_moves=p2_moves,
+            shape_difference=shape_diff,
+            total_moves=phase1_moves + p2_moves,
+        )
+
+    tok = run_phase2("token")
+    disp = run_phase2("displacement")
+    return tok, disp
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare token-based vs displacement-based reconstruction"
@@ -64,6 +304,12 @@ def main():
     parser.add_argument("--dynamic-faults", action="store_true")
     parser.add_argument("--jobs", "-j", type=int, default=-1)
     parser.add_argument("--no-graphs", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--max-moves-per-module", type=int, default=10)
+    parser.add_argument("--safety-radius", type=int, default=2)
+    parser.add_argument("--no-flood-echo", action="store_true")
+    parser.add_argument("--token-gen-interval", type=float, default=0.1)
+    parser.add_argument("--pivot-radius", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -78,6 +324,19 @@ def main():
     n_faults = args.faults
     n_jobs = args.jobs
 
+    trial_kwargs = dict(
+        mode_2d=mode_2d,
+        fully_connected=True,
+        config_mode=config_mode,
+        fault_mode=FAULT_MODE_RANDOM,
+        temperature=args.temperature,
+        max_moves_per_module=args.max_moves_per_module,
+        safety_radius=args.safety_radius,
+        use_flood_echo=not args.no_flood_echo,
+        token_gen_interval=args.token_gen_interval,
+        pivot_exclusion_radius=args.pivot_radius,
+    )
+
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_dir = os.path.join(args.output_dir, f"comparison_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
@@ -91,6 +350,8 @@ def main():
         "n_trials": n_trials, "seed": base_seed,
         "mode_2d": mode_2d, "config_mode": config_mode,
         "n_jobs": n_jobs,
+        **{k: v for k, v in trial_kwargs.items()
+           if k not in ("mode_2d", "fully_connected", "config_mode", "fault_mode")},
     }
     with open(os.path.join(output_dir, "config.json"), 'w') as f:
         json.dump(config, f, indent=2)
@@ -98,9 +359,8 @@ def main():
     all_n_values = list(range(n_min, n_max + 1, n_step))
 
     print("=" * 70)
-    print("RECONSTRUCTION METHOD COMPARISON")
+    print("RECONSTRUCTION METHOD COMPARISON (graph-sim, shared Phase 1)")
     print("=" * 70)
-    print("Comparing: token-based (sidh-test) vs displacement-based (paper-code)")
     print(f"  Module range: n = {n_min} to {n_max} (step {n_step})")
     if dynamic_faults:
         print(f"  Faults: f = floor(n/10) [dynamic]")
@@ -110,16 +370,18 @@ def main():
     print(f"  Seed: {base_seed}")
     print(f"  Output: {output_dir}")
     print(f"  Jobs: {n_jobs}")
-    print(f"  Phase 1 is shared — only Phase 2 differs between methods")
+    print(f"  Temperature: {args.temperature}")
+    print(f"  Safety radius: {args.safety_radius}")
+    print(f"  Max moves/module: {args.max_moves_per_module}")
+    print(f"  Flood/echo: {'on' if not args.no_flood_echo else 'off'}")
+    print("  Phase 1 is shared via GraphSimulator snapshot.")
     print("=" * 70)
     print()
 
     total_trials = len(all_n_values) * n_trials
     print(f"Running {len(all_n_values)} n-values x {n_trials} trials = "
-          f"{total_trials:,} trials (x2 Phase 2 methods each)")
-    print()
+          f"{total_trials:,} trials (x2 Phase 2 methods each)\n")
 
-    # Open CSV files
     summary_csv_path = os.path.join(output_dir, "sweep_summary.csv")
     trials_csv_path = os.path.join(output_dir, "trials.csv")
 
@@ -136,26 +398,25 @@ def main():
             f = max(1, n // 10) if dynamic_faults else n_faults
             config_seed = base_seed + (n - n_min) * n_trials
 
-            trial_args = [
-                (n, f, config_seed + i, i, mode_2d, True, config_mode,
-                 FAULT_MODE_RANDOM, "furthest", 2)
+            per_trial_kwargs = [
+                dict(n_modules=n, n_faults=f, seed=config_seed + i,
+                     trial_id=i, **trial_kwargs)
                 for i in range(n_trials)
             ]
 
             if n_jobs == 1:
-                pair_results = []
-                for a in trial_args:
-                    pair_results.append(run_comparison_trial(*a))
+                pair_results = [run_comparison_trial_graph(**kw)
+                                for kw in per_trial_kwargs]
             else:
                 pair_results = Parallel(n_jobs=n_jobs)(
-                    delayed(run_comparison_trial)(*a) for a in trial_args
-                )
+                    delayed(run_comparison_trial_graph)(**kw)
+                    for kw in per_trial_kwargs)
 
-            # Split into method-specific lists
             token_trials = [p[0] for p in pair_results]
             disp_trials = [p[1] for p in pair_results]
 
-            for method, trials in [("token", token_trials), ("displacement", disp_trials)]:
+            for method, trials in [("token", token_trials),
+                                   ("displacement", disp_trials)]:
                 meaningful = [t for t in trials if t.phase1_moves > 0]
                 successful = [t for t in meaningful if t.restored]
                 n_meaningful = len(meaningful)
@@ -221,7 +482,6 @@ def main():
 def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
                                n_trials, dynamic_faults):
     """Generate side-by-side comparison plots."""
-    # Read data, split by method
     data = {"token": {}, "displacement": {}}
 
     with open(summary_csv_path, 'r', newline='') as f:
@@ -245,7 +505,6 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
             except (ValueError, KeyError):
                 continue
 
-    # Get common n values
     common_n = sorted(set(data["token"].keys()) & set(data["displacement"].keys()))
     if not common_n:
         print("No common n values found, skipping graphs.")
@@ -259,19 +518,18 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f'Reconstruction Comparison: Token vs Displacement\n'
+        f'Reconstruction Comparison: Token (rendezvous) vs Displacement\n'
         f'({fault_desc}, {n_trials} trials per n)',
         fontsize=14, fontweight='bold'
     )
 
-    # 1. Shape Difference comparison
     ax = axes[0, 0]
     tok_sd = [tok[n]['shape_diff'] for n in common_n]
     disp_sd = [disp[n]['shape_diff'] for n in common_n]
     ax.plot(common_n, gaussian_filter1d(tok_sd, sigma), color='blue',
-            linewidth=2, label='Token-based')
+            linewidth=2, label='Token (rendezvous)')
     ax.plot(common_n, gaussian_filter1d(disp_sd, sigma), color='red',
-            linewidth=2, label='Displacement-based')
+            linewidth=2, label='Displacement')
     ax.scatter(common_n, tok_sd, alpha=0.2, color='blue', s=15)
     ax.scatter(common_n, disp_sd, alpha=0.2, color='red', s=15)
     ax.set_xlabel('Number of Modules (n)')
@@ -283,14 +541,13 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    # 2. Phase 2 moves comparison
     ax = axes[0, 1]
     tok_p2 = [tok[n]['p2_moves'] for n in common_n]
     disp_p2 = [disp[n]['p2_moves'] for n in common_n]
     ax.plot(common_n, gaussian_filter1d(tok_p2, sigma), color='blue',
-            linewidth=2, label='Token-based')
+            linewidth=2, label='Token (rendezvous)')
     ax.plot(common_n, gaussian_filter1d(disp_p2, sigma), color='red',
-            linewidth=2, label='Displacement-based')
+            linewidth=2, label='Displacement')
     ax.scatter(common_n, tok_p2, alpha=0.2, color='blue', s=15)
     ax.scatter(common_n, disp_p2, alpha=0.2, color='red', s=15)
     ax.set_xlabel('Number of Modules (n)')
@@ -299,14 +556,13 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    # 3. Total moves comparison
     ax = axes[1, 0]
     tok_total = [tok[n]['total_moves'] for n in common_n]
     disp_total = [disp[n]['total_moves'] for n in common_n]
     ax.plot(common_n, gaussian_filter1d(tok_total, sigma), color='blue',
-            linewidth=2, label='Token-based')
+            linewidth=2, label='Token (rendezvous)')
     ax.plot(common_n, gaussian_filter1d(disp_total, sigma), color='red',
-            linewidth=2, label='Displacement-based')
+            linewidth=2, label='Displacement')
     ax.scatter(common_n, tok_total, alpha=0.2, color='blue', s=15)
     ax.scatter(common_n, disp_total, alpha=0.2, color='red', s=15)
     ax.set_xlabel('Number of Modules (n)')
@@ -315,16 +571,14 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    # 4. Shape difference delta (token - displacement)
     ax = axes[1, 1]
     delta_sd = [tok[n]['shape_diff'] - disp[n]['shape_diff'] for n in common_n]
-    delta_p2 = [tok[n]['p2_moves'] - disp[n]['p2_moves'] for n in common_n]
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     ax.plot(common_n, gaussian_filter1d(delta_sd, sigma), color='purple',
-            linewidth=2, label='Δ Shape Diff (tok-disp)')
+            linewidth=2, label=u'\u0394 Shape Diff (tok-disp)')
     ax.scatter(common_n, delta_sd, alpha=0.2, color='purple', s=15)
     ax.set_xlabel('Number of Modules (n)')
-    ax.set_ylabel('Δ (Token - Displacement)')
+    ax.set_ylabel(u'\u0394 (Token - Displacement)')
     ax.set_title('Difference: Negative = Token Better')
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -335,12 +589,11 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
     plt.close()
     print(f"Saved: {graph_path}")
 
-    # Print summary table
     print("\n" + "=" * 85)
     print("COMPARISON SUMMARY")
     print("=" * 85)
-    print(f"{'n':>4} {'Token SD':>10} {'Disp SD':>10} {'Δ SD':>8} "
-          f"{'Token P2':>9} {'Disp P2':>9} {'Δ P2':>7}")
+    print(f"{'n':>4} {'Token SD':>10} {'Disp SD':>10} "
+          f"{'d SD':>8} {'Token P2':>9} {'Disp P2':>9} {'d P2':>7}")
     print("-" * 85)
 
     step = max(1, len(common_n) // 15)
@@ -356,7 +609,6 @@ def generate_comparison_graphs(summary_csv_path, output_dir, n_faults,
                   f"{delta_m:>+7.1f}")
     print("=" * 85)
 
-    # Overall averages
     avg_tok_sd = np.mean([tok[n]['shape_diff'] for n in common_n])
     avg_disp_sd = np.mean([disp[n]['shape_diff'] for n in common_n])
     avg_tok_p2 = np.mean([tok[n]['p2_moves'] for n in common_n])

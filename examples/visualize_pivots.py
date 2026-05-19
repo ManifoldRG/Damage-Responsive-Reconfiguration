@@ -2,6 +2,14 @@
 """
 Interactive 3D visualization of UDQDG system pivots.
 
+DEPRECATED: The ``full_damage_response`` / ``get_damage_response_summary``
+calls in this script were removed from ``UDQDGSystem`` in the Graph
+Parity refactor. Pivot animations are now driven by replaying the
+``move_log`` produced by ``DecentralizedCoagulation`` /
+``DecentralizedRestructuring`` running on top of ``GraphSimulator``
+(see ``src/agent_policy.py`` and ``src/graph_sim.py``). Migrate this
+script's data-collection section to that pipeline before running.
+
 Usage:
     python examples/visualize_pivots.py [config_type]
 

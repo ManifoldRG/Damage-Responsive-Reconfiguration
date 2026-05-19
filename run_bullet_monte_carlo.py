@@ -28,7 +28,6 @@ import os
 import random
 import sys
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -49,6 +48,19 @@ from src.agent_policy import (
 )
 from src.bullet_sim import BulletSimulator
 from src.configurations import create_random_configuration, create_random_tree_configuration
+from src.mc_runner import (
+    IDLE_OR_CAPPED_MIN_SIM_TIME,
+    Scenario as BulletScenario,
+    _MCCoagulation,
+    _MCDisplacementRestructuring,
+    _MCRestructuring,
+    _all_idle_or_capped,
+    _phase1_done,
+    _phase2_done,
+    _run_phase,
+    run_trial,
+    udqdg_to_scenario as udqdg_to_bullet_scenario,
+)
 from src.monte_carlo import (
     TrialResult,
     MonteCarloResults,
@@ -84,288 +96,6 @@ def warn_arg_conflicts(args, config):
         for c in conflicts:
             print(c)
         print()
-
-
-# ---------------------------------------------------------------------------
-# Translation layer
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class BulletScenario:
-    """All inputs needed to run a multi-fault PyBullet trial.
-
-    fault_ids / fault_body_idxs hold the full set of simultaneously-injected
-    faults. The legacy single-fault fields (fault_id, fault_body_idx,
-    fault_adjacent) carry the first fault for back-compat with callers that
-    only handled one fault — they are unused on the simultaneous path.
-    """
-    n_total: int
-    pos0: np.ndarray            # (n_total, 3)
-    bonded0: np.ndarray         # (n_total, n_total) bool
-    # Single-fault legacy fields:
-    fault_id: str
-    fault_body_idx: int
-    fault_adjacent: List[str]
-    # Multi-fault fields (used by the simultaneous-injection path):
-    fault_ids: List[str]
-    fault_body_idxs: List[int]
-    adjacent_map: Dict[str, int]   # active_module_id -> one fault body idx
-    module_ids: List[str]       # active (non-faulty) module IDs
-    body_indices: Dict[str, int]
-    pre_damage_neighbor_slots: Dict[str, List[np.ndarray]]
-    original_positions: Dict[str, np.ndarray]
-
-
-def udqdg_to_bullet_scenario(
-    system,
-    fault_ids,
-) -> BulletScenario:
-    """Convert a UDQDGSystem + fault set into BulletSimulator inputs.
-
-    Accepts a single fault id (str) for back-compat or a list of fault ids
-    for the simultaneous-injection path. All fault modules become real bodies
-    in the physics world (full mass, collision-on) — only excluded from the
-    policy's active module set.
-    """
-    if isinstance(fault_ids, str):
-        fault_id_list = [fault_ids]
-    else:
-        fault_id_list = list(fault_ids)
-    fault_set = set(fault_id_list)
-    primary_fault = fault_id_list[0] if fault_id_list else ""
-
-    all_mids = sorted(system.modules.keys())
-    n_total = len(all_mids)
-    mid_to_idx: Dict[str, int] = {mid: i for i, mid in enumerate(all_mids)}
-
-    pos0 = np.zeros((n_total, 3))
-    for mid, idx in mid_to_idx.items():
-        pos0[idx] = system.modules[mid].position
-
-    bonded0 = np.zeros((n_total, n_total), dtype=bool)
-    for (a, b) in system.edges:
-        ia, ib = mid_to_idx[a], mid_to_idx[b]
-        bonded0[ia, ib] = True
-        bonded0[ib, ia] = True
-
-    fault_body_idxs = [mid_to_idx[fid] for fid in fault_id_list]
-    module_ids = [mid for mid in all_mids if mid not in fault_set]
-    body_indices = {mid: mid_to_idx[mid] for mid in module_ids}
-
-    # Adjacent-to-any-fault map: active module id -> first fault body idx it
-    # neighbors. set_multi_fault_adjacent uses this to seed flood/echo and
-    # token generation per fault.
-    adjacent_map: Dict[str, int] = {}
-    for (a, b) in system.edges:
-        if a in fault_set and b not in fault_set:
-            adjacent_map.setdefault(b, mid_to_idx[a])
-        elif b in fault_set and a not in fault_set:
-            adjacent_map.setdefault(a, mid_to_idx[b])
-
-    # Legacy single-fault adjacent list (preserved for any caller still on
-    # the single-fault path); points to primary fault only.
-    fault_adjacent: List[str] = []
-    for (a, b) in system.edges:
-        if a == primary_fault and b != primary_fault:
-            fault_adjacent.append(b)
-        elif b == primary_fault and a != primary_fault:
-            if a not in fault_adjacent:
-                fault_adjacent.append(a)
-
-    pre_damage_neighbor_slots: Dict[str, List[np.ndarray]] = {}
-    for mid in module_ids:
-        mid_pos = system.modules[mid].position
-        neighbors = system.get_neighbors(mid)
-        dirs: List[np.ndarray] = []
-        for nbr in neighbors:
-            nbr_pos = system.modules[nbr].position
-            direction = nbr_pos - mid_pos
-            norm = np.linalg.norm(direction)
-            if norm > 1e-9:
-                direction = direction / norm
-            dirs.append(direction)
-        pre_damage_neighbor_slots[mid] = dirs
-
-    original_positions = {
-        mid: system.modules[mid].position.copy()
-        for mid in all_mids
-    }
-
-    return BulletScenario(
-        n_total=n_total,
-        pos0=pos0,
-        bonded0=bonded0,
-        fault_id=primary_fault,
-        fault_body_idx=mid_to_idx[primary_fault] if primary_fault else -1,
-        fault_adjacent=fault_adjacent,
-        fault_ids=fault_id_list,
-        fault_body_idxs=fault_body_idxs,
-        adjacent_map=adjacent_map,
-        module_ids=module_ids,
-        body_indices=body_indices,
-        pre_damage_neighbor_slots=pre_damage_neighbor_slots,
-        original_positions=original_positions,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Coagulation / Restructuring subclasses (body-frame token origin)
-# ---------------------------------------------------------------------------
-
-class _MCCoagulation(DecentralizedCoagulation):
-    """Token origin stored in holder's body frame (drift-invariant)."""
-
-    _safety_radius: int = 2
-
-    def _origin_world_for_pick_target(
-        self, agent: ModuleAgent, pos: np.ndarray
-    ) -> Optional[np.ndarray]:
-        if agent.token is None:
-            return None
-        R = self.sim.body_rotation_matrix(agent.body_idx)
-        return pos[agent.body_idx] + R @ agent.token.direction
-
-    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
-        return super().is_movable(body_idx, self._safety_radius)
-
-
-class _MCRestructuring(DecentralizedRestructuring):
-    """Token origin stored in holder's body frame (drift-invariant)."""
-
-    _safety_radius: int = 2
-
-    def _origin_world_for_pick_target(
-        self, agent: ModuleAgent, pos: np.ndarray
-    ) -> Optional[np.ndarray]:
-        if agent.token is None:
-            return None
-        R = self.sim.body_rotation_matrix(agent.body_idx)
-        return pos[agent.body_idx] + R @ agent.token.direction
-
-    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
-        return super().is_movable(body_idx, self._safety_radius)
-
-
-class _MCDisplacementRestructuring(DisplacementRestructuring):
-    """Displacement-guided restructuring for MC trials."""
-
-    _safety_radius: int = 2
-
-    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
-        return super().is_movable(body_idx, self._safety_radius)
-
-
-# ---------------------------------------------------------------------------
-# Phase helpers
-# ---------------------------------------------------------------------------
-
-IDLE_OR_CAPPED_MIN_SIM_TIME = 20.0
-
-
-def _all_idle_or_capped(policy) -> bool:
-    """True if every agent is "done" for the phase. Done = action_points
-    exhausted (``<= 0``), or IDLE-with-no-tokens. Any other state
-    (HAS_TOKEN, PIVOTING, REVERSING, WAITING, PROCESSING) is still active
-    and blocks termination — the agent is mid-cycle and will either burn
-    an action point or complete a pivot soon.
-
-    Guard: the check is suppressed for the first
-    ``IDLE_OR_CAPPED_MIN_SIM_TIME`` seconds of sim time so that tokens
-    have time to propagate through the structure before the phase can be
-    declared "done".
-    """
-    if policy.sim.sim_time < IDLE_OR_CAPPED_MIN_SIM_TIME:
-        return False
-
-    for a in policy.agents.values():
-        if a.action_points <= 0:
-            continue
-        if a.state != ModuleState.IDLE:
-            return False
-        if a.incoming_tokens or a.token is not None:
-            return False
-    return True
-
-
-def _phase1_done(policy, sim: BulletSimulator) -> bool:
-    if sim.has_active_pivots():
-        return False
-    if policy.is_connected():
-        return True
-    return _all_idle_or_capped(policy)
-
-
-def _phase2_done(policy, sim: BulletSimulator) -> bool:
-    if sim.has_active_pivots():
-        return False
-    if _all_idle_or_capped(policy):
-        return True
-    return False
-
-
-def _run_phase(
-    sim: BulletSimulator,
-    policy,
-    done_fn,
-    dt: float,
-    max_time: float,
-    stall_interval: float,
-    stall_patience: int,
-    phase_label: str = "phase",
-    heartbeat_wall_secs: float = 30.0,
-) -> int:
-    """Run a simulation phase, returns tick count.
-
-    Termination: ``done_fn`` only. The centralized stall timer is gone — the
-    per-module move cap (MAX_MOVES_PER_MODULE) bounds total work
-    decentrally. ``stall_interval`` / ``stall_patience`` / ``max_time`` are
-    accepted for API/config back-compat but unused.
-
-    Heartbeat: every ``heartbeat_wall_secs`` of wall time, prints a status
-    line with current tick count, sim time, successful_moves, and the
-    distribution of completed_moves across agents.
-    """
-    import time as _time
-    cap = getattr(policy, "MAX_MOVES_PER_MODULE", 0)
-    ticks = 0
-    t0 = _time.monotonic()
-    last_hb = t0
-    while True:
-        sim.step(dt)
-        policy.tick()
-        ticks += 1
-        if done_fn(policy, sim):
-            break
-        now = _time.monotonic()
-        if heartbeat_wall_secs > 0 and (now - last_hb) >= heartbeat_wall_secs:
-            last_hb = now
-            n_capped = sum(
-                1 for a in policy.agents.values()
-                if cap and a.completed_moves >= cap)
-            n_pivoting = sum(
-                1 for a in policy.agents.values()
-                if a.state == ModuleState.PIVOTING)
-            n_idle = sum(
-                1 for a in policy.agents.values()
-                if a.state == ModuleState.IDLE)
-            n_proc = sum(
-                1 for a in policy.agents.values()
-                if a.state == ModuleState.PROCESSING)
-            total_agents = len(policy.agents)
-            print(
-                f"  [{phase_label}] tick={ticks} sim_t={sim.sim_time:.1f}s "
-                f"wall={now - t0:.0f}s "
-                f"successful_moves={policy.successful_moves} "
-                f"capped={n_capped}/{total_agents} "
-                f"pivoting={n_pivoting} idle={n_idle} proc={n_proc}",
-                flush=True)
-
-    # Drain any in-flight pivots so the bond-restoration invariant fires for
-    # modules that were mid-pivot at termination.
-    for piv_idx in list(sim._active_pivots.keys()):
-        sim.stop_pivot(piv_idx)
-
-    return ticks
 
 
 def _connected_components_from_bonds(
@@ -511,10 +241,16 @@ def run_single_bullet_trial(
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
-    Generates a structure, injects faults one at a time, runs coagulation
-    and restructuring through BulletSimulator + agent policies, and
-    returns a TrialResult compatible with the existing MC framework.
+    Generates a structure, finds a fault set that disconnects it, builds a
+    ``BulletSimulator``, and delegates the phase loop to
+    ``src.mc_runner.run_trial``. Returns a ``TrialResult`` compatible with
+    the existing MC framework.
+
+    ``max_phase_time`` / ``stall_interval`` / ``stall_patience`` are kept in
+    the signature for back-compat with sweep CLI plumbing but unused — the
+    per-agent action-point cap bounds total work.
     """
+    del max_phase_time, stall_interval, stall_patience
     from src.monte_carlo import _causes_disconnection
 
     for structure_attempt in range(500):
@@ -540,21 +276,13 @@ def run_single_bullet_trial(
     faulty_modules_set = set(faulty_module_ids)
 
     # Simultaneous fault injection: mark every selected fault before any
-    # bullet world is built. This matches the intended multi-failure
-    # semantics — the policy reconfigures the structure around all faults
+    # bullet world is built. The policy reconfigures around all faults
     # collectively in a single coag+restruct, instead of repairing one
     # fault at a time. Faults remain as full-mass collision-on bodies in
     # the bullet world (just excluded from the policy's module set).
     for fid in faulty_module_ids:
         if system.modules[fid].is_active:
             system.mark_fault(fid)
-
-    total_phase1_moves = 0
-    total_phase2_moves = 0
-    total_phase1_ticks = 0
-    restored = True
-    post_phase1_positions: Optional[Dict[str, np.ndarray]] = None
-    post_phase2_positions: Optional[Dict[str, np.ndarray]] = None
 
     scenario = udqdg_to_bullet_scenario(system, faulty_module_ids)
 
@@ -570,144 +298,60 @@ def run_single_bullet_trial(
         scenario.n_total, scenario.pos0, scenario.bonded0, gui=False,
         module_shape=module_shape)
 
+    def _diag_cb(*, sim, coag, restruct, scenario, phase1_connected,
+                 total_phase1_moves, total_phase2_moves, total_phase1_ticks):
+        if dump_diagnostics_dir is None:
+            return
+        _write_trial_diagnostics(
+            dump_diagnostics_dir=dump_diagnostics_dir,
+            trial_id=trial_id,
+            seed=seed,
+            n_modules=n_modules,
+            n_faults=n_faults,
+            fault_mode=fault_mode,
+            safety_radius=safety_radius,
+            use_flood_echo=use_flood_echo,
+            token_gen_interval=token_gen_interval,
+            sim=sim,
+            coag=coag,
+            restruct=restruct,
+            scenario=scenario,
+            phase1_connected=phase1_connected,
+            total_phase1_moves=total_phase1_moves,
+            total_phase2_moves=total_phase2_moves,
+            total_phase1_ticks=total_phase1_ticks,
+        )
+
     try:
-        # _MCCoagulation requires a primary fault_id at construction; we
-        # immediately overwrite the single-fault registration with the
-        # multi-fault one. ALL fault bodies are registered as obstacles.
-        coag = _MCCoagulation(
-            sim,
-            fault_id=scenario.fault_ids[0] if scenario.fault_ids else "",
-            module_ids=scenario.module_ids,
-            body_indices=scenario.body_indices,
+        result = run_trial(
+            sim=sim,
+            scenario=scenario,
+            faulty_modules_set=faulty_modules_set,
+            original_positions=original_positions,
+            trial_id=trial_id,
+            n_modules=n_modules,
+            n_faults=n_faults,
+            temperature=temperature,
+            pivot_exclusion_radius=pivot_exclusion_radius,
+            dt=dt,
+            restructuring_method=restructuring_method,
+            token_strategy=token_strategy,
+            safety_radius=safety_radius,
+            use_flood_echo=use_flood_echo,
+            token_gen_interval=token_gen_interval,
+            max_moves_per_module=max_moves_per_module,
+            use_position_history=use_position_history,
+            forward_ap_cost=0.1,
+            fault_mode=fault_mode,
+            diagnostics_callback=_diag_cb,
         )
-        coag.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
-        coag._safety_radius = safety_radius
-        coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
-        coag.TEMPERATURE = temperature
-        coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
-        coag.INITIAL_ACTION_POINTS = int(max_moves_per_module)
-        coag.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
-        # Agents were instantiated with the class default; override per-agent.
-        for _agent in coag.agents.values():
-            _agent.action_points = int(max_moves_per_module)
-        coag.USE_FLOOD_ECHO = use_flood_echo
-        coag.USE_POSITION_HISTORY = bool(use_position_history)
-        coag.FORWARD_AP_COST = 0.1
-        coag.set_multi_fault_adjacent(
-            fault_ids=scenario.fault_ids,
-            fault_body_idxs=scenario.fault_body_idxs,
-            adjacent_map=scenario.adjacent_map,
-        )
-
-        phase1_ticks = _run_phase(
-            sim, coag, _phase1_done, dt,
-            max_phase_time, stall_interval, stall_patience,
-            phase_label=f"coag[t{trial_id}/n{n_modules}/f{n_faults}]")
-
-        phase1_connected = coag.is_connected()
-        total_phase1_moves = coag.total_moves
-        total_phase1_ticks = phase1_ticks
-        restored = phase1_connected
-
-        pos_snap = sim.get_positions()
-        post_phase1_positions = {
-            mid: pos_snap[scenario.body_indices[mid]].copy()
-            for mid in scenario.module_ids
-        }
-
-        if phase1_connected:
-            coag_moved: Set[str] = {m["module"] for m in coag.move_log}
-            if restructuring_method == "displacement":
-                restruct = _MCDisplacementRestructuring(
-                    sim=sim,
-                    module_ids=scenario.module_ids,
-                    body_indices=scenario.body_indices,
-                    coag_moved=coag_moved,
-                    original_positions=scenario.original_positions,
-                )
-            else:
-                restruct = _MCRestructuring(
-                    sim=sim,
-                    module_ids=scenario.module_ids,
-                    body_indices=scenario.body_indices,
-                    coag_moved=coag_moved,
-                    pre_damage_neighbor_slots=scenario.pre_damage_neighbor_slots,
-                    token_strategy=token_strategy,
-                )
-            restruct.PIVOT_EXCLUSION_RADIUS = pivot_exclusion_radius
-            restruct._safety_radius = safety_radius
-            restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
-            restruct.USE_FLOOD_ECHO = use_flood_echo
-            restruct.USE_POSITION_HISTORY = bool(use_position_history)
-            restruct.FORWARD_AP_COST = 0.1
-            restruct.INITIAL_ACTION_POINTS = int(max_moves_per_module)
-            restruct.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
-            for _agent in restruct.agents.values():
-                _agent.action_points = int(max_moves_per_module)
-            restruct.generate_initial_tokens()
-
-            _run_phase(
-                sim, restruct, _phase2_done, dt,
-                max_phase_time, stall_interval, stall_patience,
-                phase_label=f"restruct[t{trial_id}/n{n_modules}/f{n_faults}]")
-
-            total_phase2_moves = restruct.total_moves
-
-            pos_snap2 = sim.get_positions()
-            post_phase2_positions = {
-                mid: pos_snap2[scenario.body_indices[mid]].copy()
-                for mid in scenario.module_ids
-            }
-
-        if dump_diagnostics_dir is not None:
-            _write_trial_diagnostics(
-                dump_diagnostics_dir=dump_diagnostics_dir,
-                trial_id=trial_id,
-                seed=seed,
-                n_modules=n_modules,
-                n_faults=n_faults,
-                fault_mode=fault_mode,
-                safety_radius=safety_radius,
-                use_flood_echo=use_flood_echo,
-                token_gen_interval=token_gen_interval,
-                sim=sim,
-                coag=coag,
-                restruct=locals().get("restruct"),
-                scenario=scenario,
-                phase1_connected=phase1_connected,
-                total_phase1_moves=total_phase1_moves,
-                total_phase2_moves=total_phase2_moves,
-                total_phase1_ticks=total_phase1_ticks,
-            )
     finally:
         sim.disconnect()
 
-    if restored and post_phase1_positions is not None:
-        shape_diff_phase1 = calculate_shape_difference(
-            original_positions, post_phase1_positions, faulty_modules_set)
-
-        final_positions = post_phase2_positions if post_phase2_positions is not None else post_phase1_positions
-        shape_diff = calculate_shape_difference(
-            original_positions, final_positions, faulty_modules_set)
-    else:
-        shape_diff = None
-        shape_diff_phase1 = None
-
-    return TrialResult(
-        trial_id=trial_id,
-        n_modules=n_modules,
-        n_faults=n_faults,
-        seed=seed,
-        restored=restored,
-        phase1_moves=total_phase1_moves,
-        phase2_moves=total_phase2_moves,
-        shape_difference=shape_diff,
-        shape_difference_phase1=shape_diff_phase1,
-        phase1_iterations=total_phase1_ticks,
-        total_moves=total_phase1_moves + total_phase2_moves,
-        token_transmissions=0,
-        fault_mode=fault_mode,
-    )
+    # ``run_trial`` does not know the structure-gen seed; stamp it here so
+    # the TrialResult is fully reproducible from CSV.
+    result.seed = seed
+    return result
 
 
 # ---------------------------------------------------------------------------

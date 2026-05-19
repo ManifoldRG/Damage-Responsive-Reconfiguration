@@ -410,7 +410,7 @@ def calculate_shape_difference(
     return (len(P_dists) - matched) / len(P_dists)
 
 
-def run_single_trial(
+def run_single_graph_trial(
     n_modules: int,
     n_faults: int,
     seed: int,
@@ -419,319 +419,91 @@ def run_single_trial(
     fully_connected: bool = True,
     config_mode: str = CONFIG_MODE_RANDOM,
     fault_mode: str = FAULT_MODE_RANDOM,
+    *,
+    temperature: float = 0.5,
+    pivot_exclusion_radius: int = 4,
+    dt: float = 0.1,
+    restructuring_method: str = "displacement",
     token_strategy: str = "furthest",
     safety_radius: int = 2,
-    reconstruction_method: str = "token"
+    use_flood_echo: bool = False,
+    token_gen_interval: float = 0.1,
+    max_moves_per_module: int = 10,
+    use_position_history: bool = True,
 ) -> TrialResult:
+    """Execute one graph-based Monte Carlo trial with the decentralized agent
+    policy on top of ``GraphSimulator`` (perfect kinematic pivots, no physics).
+
+    Generates a structure, finds a fault set that disconnects the active
+    graph (up to 500 retries), pre-marks all faults, builds a
+    ``GraphSimulator``, and delegates the phase loop to
+    ``src.mc_runner.run_trial`` — the same shared driver used by the
+    PyBullet runner. Returns a ``TrialResult``.
     """
-    Execute a single Monte Carlo trial.
+    from .graph_sim import GraphSimulator
+    from .mc_runner import run_trial, udqdg_to_scenario
 
-    Args:
-        n_modules: Number of modules in the structure
-        n_faults: Number of faults to inject
-        seed: Random seed for reproducibility (structure uses seed, faults use seed+1000)
-        trial_id: Identifier for this trial
-        mode_2d: If True, use 2D mode
-        fully_connected: If True (default), connect to all adjacent modules (more branches).
-                        If False, connect to only one (chain-like). Only used for 'random' mode.
-        config_mode: Configuration generation mode ('random' or 'tree')
-        fault_mode: Fault selection strategy ('random', 'cluster', 'random_clusters', 'localized')
+    for structure_attempt in range(500):
+        gen_seed = seed + structure_attempt * 9973
+        if config_mode == CONFIG_MODE_TREE:
+            system = create_random_tree_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d, balanced=False)
+        else:
+            system = create_random_configuration(
+                n_modules, seed=gen_seed, mode_2d=mode_2d,
+                fully_connected=fully_connected)
 
-    Returns:
-        TrialResult with metrics and outcomes
-    """
-    # Generate structure based on config mode
-    if config_mode == CONFIG_MODE_TREE:
-        system = create_random_tree_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d, balanced=False
-        )
-    else:
-        system = create_random_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d, fully_connected=fully_connected
-        )
+        faulty_module_ids = select_faulty_modules(
+            system, n_faults, gen_seed + 1000, fault_mode)
 
-    # Record original positions
+        if _causes_disconnection(system, faulty_module_ids):
+            break
+
     original_positions = {
         mid: module.position.copy()
         for mid, module in system.modules.items()
     }
-
-    # Select fault modules based on fault mode
-    faulty_module_ids = select_faulty_modules(system, n_faults, seed + 1000, fault_mode)
     faulty_modules_set = set(faulty_module_ids)
 
-    # Simultaneous fault injection: mark every selected module faulty BEFORE
-    # running any coagulation. The decentralized algorithms (coagulation +
-    # restructuring) inspect `is_faulty` on every neighbor, so once all faults
-    # are pre-marked, a single coag+restruct pair handles them collectively —
-    # which is the intended "multiple-simultaneous-failures" semantics. The
-    # earlier per-fault loop fully repaired each fault before injecting the
-    # next, which is a different (and unintended) scenario.
-    active_faults = [fid for fid in faulty_module_ids
-                     if system.modules[fid].is_active]
-    for fid in active_faults:
-        system.mark_fault(fid)
+    for fid in faulty_module_ids:
+        if system.modules[fid].is_active:
+            system.mark_fault(fid)
 
-    phase1_moves = 0
-    phase2_moves = 0
-    phase1_iterations = 0
-    token_transmissions = 0
-    restored = True
-    post_phase1_positions = None
+    scenario = udqdg_to_scenario(system, faulty_module_ids)
+    sim = GraphSimulator(
+        scenario.n_total, scenario.pos0, scenario.bonded0,
+        module_shape="sphere")
 
-    if active_faults:
-        # full_damage_response treats any pre-marked fault as already faulty
-        # and runs ONE coag + ONE restruct over the whole damaged structure.
-        # The `fault_module_id` argument is used for stats/validation only.
-        result = system.full_damage_response(
-            fault_module_id=active_faults[0],
-            restore_positions=True,
-            max_phase1_iterations=1000,
-            max_phase2_iterations=1000,
+    try:
+        result = run_trial(
+            sim=sim,
+            scenario=scenario,
+            faulty_modules_set=faulty_modules_set,
+            original_positions=original_positions,
+            trial_id=trial_id,
+            n_modules=n_modules,
+            n_faults=n_faults,
+            temperature=temperature,
+            pivot_exclusion_radius=pivot_exclusion_radius,
+            dt=dt,
+            restructuring_method=restructuring_method,
             token_strategy=token_strategy,
             safety_radius=safety_radius,
-            reconstruction_method=reconstruction_method
+            use_flood_echo=use_flood_echo,
+            token_gen_interval=token_gen_interval,
+            max_moves_per_module=max_moves_per_module,
+            use_position_history=use_position_history,
+            forward_ap_cost=0.1,
+            fault_mode=fault_mode,
         )
+    finally:
+        sim.disconnect()
 
-        phase1_stats = result.get('phase1', {}) or {}
-        phase2_stats = result.get('phase2', {}) or {}
-
-        phase1_moves = phase1_stats.get('total_moves', 0)
-        phase1_iterations = phase1_stats.get('iterations', 0)
-        token_transmissions = phase1_stats.get('token_transmissions', 0)
-        restored = phase1_stats.get('reconnected', False)
-
-        if result.get('post_phase1_positions'):
-            post_phase1_positions = result['post_phase1_positions']
-
-        if phase2_stats:
-            phase2_moves = phase2_stats.get('restoration_moves', 0)
-            token_transmissions += phase2_stats.get('token_transmissions', 0)
-
-    # Only calculate metrics for successful trials
-    if restored:
-        # Get final positions of active modules
-        final_positions = {
-            mid: module.position.copy()
-            for mid, module in system.modules.items()
-            if module.is_active
-        }
-
-        # Calculate shape difference (after both phases)
-        shape_diff = calculate_shape_difference(
-            original_positions, final_positions, faulty_modules_set
-        )
-
-        # Calculate shape difference after phase 1 only (before restructuring)
-        if post_phase1_positions:
-            shape_diff_phase1 = calculate_shape_difference(
-                original_positions, post_phase1_positions, faulty_modules_set
-            )
-        else:
-            shape_diff_phase1 = shape_diff
-    else:
-        # Failed trial - metrics are None
-        shape_diff = None
-        shape_diff_phase1 = None
-
-    return TrialResult(
-        trial_id=trial_id,
-        n_modules=n_modules,
-        n_faults=n_faults,
-        seed=seed,
-        restored=restored,
-        phase1_moves=phase1_moves,
-        phase2_moves=phase2_moves,
-        shape_difference=shape_diff,
-        shape_difference_phase1=shape_diff_phase1,
-        phase1_iterations=phase1_iterations,
-        total_moves=phase1_moves + phase2_moves,
-        token_transmissions=token_transmissions,
-        fault_mode=fault_mode,
-        token_strategy=token_strategy,
-        safety_radius=safety_radius,
-        reconstruction_method=reconstruction_method,
-    )
-
-
-def run_comparison_trial(
-    n_modules: int,
-    n_faults: int,
-    seed: int,
-    trial_id: int = 0,
-    mode_2d: bool = False,
-    fully_connected: bool = True,
-    config_mode: str = CONFIG_MODE_RANDOM,
-    fault_mode: str = FAULT_MODE_RANDOM,
-    token_strategy: str = "furthest",
-    safety_radius: int = 2
-) -> Tuple[TrialResult, TrialResult]:
-    """
-    Run a single trial comparing token-based vs displacement-based reconstruction.
-
-    Shares the exact same Phase 1 state between both methods via deepcopy.
-    Returns (token_result, displacement_result).
-    """
-    # Generate structure
-    if config_mode == CONFIG_MODE_TREE:
-        system = create_random_tree_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d, balanced=False
-        )
-    else:
-        system = create_random_configuration(
-            n_modules, seed=seed, mode_2d=mode_2d, fully_connected=fully_connected
-        )
-
-    original_positions = {
-        mid: module.position.copy()
-        for mid, module in system.modules.items()
-    }
-
-    faulty_module_ids = select_faulty_modules(system, n_faults, seed + 1000, fault_mode)
-    faulty_modules_set = set(faulty_module_ids)
-
-    # Capture pre-damage neighbor sets BEFORE any faults are injected.
-    # This is critical: restructuring tokens are generated from these
-    # original neighbor directions (ρ_uv). Building them after Phase 1
-    # would just reflect the current state and produce zero tokens.
-    pre_damage_neighbors: Dict[str, Dict[str, np.ndarray]] = {}
-    for mid, module in system.modules.items():
-        if module.is_active and not module.is_faulty:
-            neighbors_info = {}
-            for n in system.get_neighbors(mid):
-                edge = system.edges.get((mid, n))
-                if edge:
-                    neighbors_info[n] = edge.translation.copy()
-            pre_damage_neighbors[mid] = neighbors_info
-
-    # --- Run Phase 1 only (no Phase 2) ---
-    phase1_moves = 0
-    phase1_iterations = 0
-    phase1_token_transmissions = 0
-    restored = True
-    post_phase1_positions = None
-
-    for fault_id in faulty_module_ids:
-        if not system.modules[fault_id].is_active:
-            continue
-
-        result = system.full_damage_response(
-            fault_module_id=fault_id,
-            restore_positions=False,  # Skip Phase 2
-            max_phase1_iterations=1000,
-            safety_radius=safety_radius
-        )
-
-        phase1_stats = result.get('phase1', {})
-        phase1_moves += phase1_stats.get('total_moves', 0)
-        phase1_iterations += phase1_stats.get('iterations', 0)
-        phase1_token_transmissions += phase1_stats.get('token_transmissions', 0)
-        restored = restored and phase1_stats.get('reconnected', False)
-
-        if result.get('post_phase1_positions'):
-            post_phase1_positions = result['post_phase1_positions']
-
-    # Calculate shape difference after phase 1
-    if restored and post_phase1_positions:
-        shape_diff_phase1 = calculate_shape_difference(
-            original_positions, post_phase1_positions, faulty_modules_set
-        )
-    elif restored:
-        shape_diff_phase1 = 0.0
-    else:
-        shape_diff_phase1 = None
-
-    # If Phase 1 failed, return failed results for both methods
-    if not restored:
-        base = TrialResult(
-            trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
-            seed=seed, restored=False, phase1_moves=phase1_moves,
-            phase2_moves=0, shape_difference=None,
-            shape_difference_phase1=shape_diff_phase1,
-            phase1_iterations=phase1_iterations,
-            total_moves=phase1_moves,
-            token_transmissions=phase1_token_transmissions,
-            fault_mode=fault_mode, token_strategy=token_strategy,
-            safety_radius=safety_radius,
-        )
-        from dataclasses import replace
-        token_res = replace(base, reconstruction_method="token")
-        disp_res = replace(base, reconstruction_method="displacement")
-        return token_res, disp_res
-
-    # --- Deep-copy system state after Phase 1, run each Phase 2 independently ---
-    system_token = copy.deepcopy(system)
-    system_disp = copy.deepcopy(system)
-
-    def _run_phase2(sys, method):
-        """Run Phase 2 on a system copy and return (phase2_moves, phase2_tokens, shape_diff)."""
-        if method == "displacement":
-            phase2_stats = sys.restructuring_displacement(
-                original_positions=original_positions,
-                max_iterations=1000,
-                record_steps=False
-            )
-        else:
-            # Find which modules moved during coagulation
-            # (any module not at its original position)
-            coag_moved = set()
-            for mid, orig_pos in original_positions.items():
-                if mid not in sys.modules or not sys.modules[mid].is_active:
-                    continue
-                if sys.modules[mid].is_faulty:
-                    continue
-                if np.linalg.norm(sys.modules[mid].position - orig_pos) > 0.5:
-                    coag_moved.add(mid)
-
-            phase2_stats = sys.restructuring(
-                pre_damage_neighbors=pre_damage_neighbors,
-                original_positions=original_positions,
-                max_iterations=1000,
-                record_steps=False,
-                token_strategy=token_strategy,
-                safety_radius=safety_radius,
-                coag_moved=coag_moved
-            )
-
-        p2_moves = phase2_stats.get('restoration_moves', 0)
-        p2_tokens = phase2_stats.get('token_transmissions', 0)
-
-        final_positions = {
-            mid: module.position.copy()
-            for mid, module in sys.modules.items()
-            if module.is_active
-        }
-        shape_diff = calculate_shape_difference(
-            original_positions, final_positions, faulty_modules_set
-        )
-        return p2_moves, p2_tokens, shape_diff
-
-    tok_p2_moves, tok_p2_tokens, tok_shape = _run_phase2(system_token, "token")
-    disp_p2_moves, disp_p2_tokens, disp_shape = _run_phase2(system_disp, "displacement")
-
-    token_result = TrialResult(
-        trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
-        seed=seed, restored=True, phase1_moves=phase1_moves,
-        phase2_moves=tok_p2_moves, shape_difference=tok_shape,
-        shape_difference_phase1=shape_diff_phase1,
-        phase1_iterations=phase1_iterations,
-        total_moves=phase1_moves + tok_p2_moves,
-        token_transmissions=phase1_token_transmissions + tok_p2_tokens,
-        fault_mode=fault_mode, token_strategy=token_strategy,
-        safety_radius=safety_radius, reconstruction_method="token",
-    )
-    disp_result = TrialResult(
-        trial_id=trial_id, n_modules=n_modules, n_faults=n_faults,
-        seed=seed, restored=True, phase1_moves=phase1_moves,
-        phase2_moves=disp_p2_moves, shape_difference=disp_shape,
-        shape_difference_phase1=shape_diff_phase1,
-        phase1_iterations=phase1_iterations,
-        total_moves=phase1_moves + disp_p2_moves,
-        token_transmissions=phase1_token_transmissions + disp_p2_tokens,
-        fault_mode=fault_mode, token_strategy=token_strategy,
-        safety_radius=safety_radius, reconstruction_method="displacement",
-    )
-    return token_result, disp_result
+    result.seed = seed
+    result.token_strategy = token_strategy
+    result.safety_radius = safety_radius
+    result.reconstruction_method = restructuring_method
+    return result
 
 
 def run_monte_carlo(
@@ -747,47 +519,68 @@ def run_monte_carlo(
     fault_mode: str = FAULT_MODE_RANDOM,
     token_strategy: str = "furthest",
     safety_radius: int = 2,
-    reconstruction_method: str = "token"
+    restructuring_method: str = "displacement",
+    *,
+    temperature: float = 0.5,
+    pivot_exclusion_radius: int = 4,
+    dt: float = 0.1,
+    use_flood_echo: bool = False,
+    token_gen_interval: float = 0.1,
+    max_moves_per_module: int = 10,
+    use_position_history: bool = True,
 ) -> MonteCarloResults:
-    """
-    Run Monte Carlo simulation with given parameters.
+    """Run Monte Carlo simulation using ``GraphSimulator`` + the
+    decentralized agent policies.
 
-    Args:
-        n_modules: Number of modules in each structure
-        n_faults: Number of faults to inject per trial
-        n_trials: Number of trials to run
-        seed: Base random seed (None for random)
-        mode_2d: If True, use 2D mode
-        fully_connected: If True (default), connect to all adjacent modules (more branches).
-                        If False, connect to only one (chain-like). Only for 'random' mode.
-        verbose: If True, print progress
-        config_mode: Configuration generation mode ('random' or 'tree')
-        n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
-        fault_mode: Fault selection strategy ('random', 'cluster', 'random_clusters', 'localized')
+    Each trial dispatches ``run_single_graph_trial`` with the supplied
+    knobs. ``n_jobs > 1`` runs trials in parallel via joblib's
+    ``Parallel``; each worker holds its own ``GraphSimulator``.
 
-    Returns:
-        MonteCarloResults with aggregated statistics
+    The simulation parameter defaults mirror the configuration the
+    PyBullet sweep settled on after the action-points refactor:
+    ``temperature=0.5``, ``use_flood_echo=False``,
+    ``max_moves_per_module=10``, ``forward_ap_cost`` baked into
+    ``mc_runner.run_trial`` at 0.1. ``restructuring_method`` replaces the
+    legacy ``reconstruction_method`` flag — values are ``"displacement"``
+    or ``"rendezvous"`` (token-based).
     """
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
 
-    trial_args = [
-        (n_modules, n_faults, seed + i, i, mode_2d, fully_connected, config_mode, fault_mode, token_strategy, safety_radius, reconstruction_method)
+    trial_kwargs_template = dict(
+        n_modules=n_modules,
+        n_faults=n_faults,
+        mode_2d=mode_2d,
+        fully_connected=fully_connected,
+        config_mode=config_mode,
+        fault_mode=fault_mode,
+        temperature=temperature,
+        pivot_exclusion_radius=pivot_exclusion_radius,
+        dt=dt,
+        restructuring_method=restructuring_method,
+        token_strategy=token_strategy,
+        safety_radius=safety_radius,
+        use_flood_echo=use_flood_echo,
+        token_gen_interval=token_gen_interval,
+        max_moves_per_module=max_moves_per_module,
+        use_position_history=use_position_history,
+    )
+    trial_kwarg_list = [
+        dict(seed=seed + i, trial_id=i, **trial_kwargs_template)
         for i in range(n_trials)
     ]
 
     if n_jobs == 1:
-        # Sequential execution
         trials: List[TrialResult] = []
-        iterator = tqdm(trial_args, desc=f"n={n_modules}", disable=not verbose)
-        for args in iterator:
-            result = run_single_trial(*args)
-            trials.append(result)
+        iterator = tqdm(trial_kwarg_list, desc=f"n={n_modules}",
+                        disable=not verbose)
+        for kw in iterator:
+            trials.append(run_single_graph_trial(**kw))
     else:
-        # Parallel execution
         trials = Parallel(n_jobs=n_jobs)(
-            delayed(run_single_trial)(*args)
-            for args in tqdm(trial_args, desc=f"n={n_modules}", disable=not verbose)
+            delayed(run_single_graph_trial)(**kw)
+            for kw in tqdm(trial_kwarg_list, desc=f"n={n_modules}",
+                           disable=not verbose)
         )
 
     # Filter out trials where fault didn't cause disconnection (phase1_moves = 0)
@@ -881,92 +674,9 @@ def run_monte_carlo(
         std_reconnection_rate=std_reconn,
         token_strategy=token_strategy,
         safety_radius=safety_radius,
-        reconstruction_method=reconstruction_method,
+        reconstruction_method=restructuring_method,
         trials=meaningful_trials  # Only include meaningful trials in raw data
     )
-
-
-def run_parameter_sweep(
-    n_range: Tuple[int, int],
-    f_range: Tuple[int, int] = (1, 1),
-    n_trials: int = 100,
-    seed: Optional[int] = None,
-    mode_2d: bool = False,
-    fully_connected: bool = True,
-    verbose: bool = False,
-    config_mode: str = CONFIG_MODE_RANDOM,
-    dynamic_faults: bool = False,
-    n_jobs: int = 1,
-    fault_mode: str = FAULT_MODE_RANDOM
-) -> Dict[Tuple[int, int], MonteCarloResults]:
-    """
-    Run Monte Carlo simulations across parameter ranges.
-
-    Args:
-        n_range: (min_n, max_n) inclusive range for module count
-        f_range: (min_f, max_f) inclusive range for fault count (ignored if dynamic_faults=True)
-        n_trials: Number of trials per configuration
-        seed: Base random seed
-        mode_2d: If True, use 2D mode
-        fully_connected: If True (default), connect to all adjacent modules (more branches).
-                        If False, connect to only one (chain-like). Only for 'random' mode.
-        verbose: If True, print progress
-        config_mode: Configuration generation mode ('random' or 'tree')
-        dynamic_faults: If True, faults = floor(n/10) for each n (ignores f_range)
-        n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
-
-    Returns:
-        Dictionary mapping (n, f) tuples to MonteCarloResults
-    """
-    if seed is None:
-        seed = random.randint(0, 2**31 - 1)
-
-    results: Dict[Tuple[int, int], MonteCarloResults] = {}
-    config_seed = seed
-
-    n_values = list(range(n_range[0], n_range[1] + 1))
-    n_iterator = tqdm(n_values, desc="Parameter sweep", disable=not verbose)
-
-    for n in n_iterator:
-        if dynamic_faults:
-            # Dynamic faults: f = floor(n/10), minimum 1
-            f = max(1, n // 10)
-            n_iterator.set_postfix(n=n, f=f)
-
-            result = run_monte_carlo(
-                n_modules=n,
-                n_faults=f,
-                n_trials=n_trials,
-                seed=config_seed,
-                mode_2d=mode_2d,
-                fully_connected=fully_connected,
-                verbose=False,
-                config_mode=config_mode,
-                n_jobs=n_jobs,
-                fault_mode=fault_mode
-            )
-            results[(n, f)] = result
-            config_seed += n_trials
-        else:
-            for f in range(f_range[0], min(f_range[1] + 1, n)):  # f < n
-                n_iterator.set_postfix(n=n, f=f)
-
-                result = run_monte_carlo(
-                    n_modules=n,
-                    n_faults=f,
-                    n_trials=n_trials,
-                    seed=config_seed,
-                    mode_2d=mode_2d,
-                    fully_connected=fully_connected,
-                    verbose=False,
-                    config_mode=config_mode,
-                    n_jobs=n_jobs,
-                    fault_mode=fault_mode
-                )
-                results[(n, f)] = result
-                config_seed += n_trials
-
-    return results
 
 
 def print_results_summary(results: MonteCarloResults) -> None:

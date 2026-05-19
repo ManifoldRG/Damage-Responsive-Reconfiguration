@@ -44,7 +44,8 @@ SUMMARY_HEADERS = [
     'mean_steps_to_reconnection', 'std_steps_to_reconnection',
     'mean_total_moves', 'std_total_moves',
     'mean_token_transmissions', 'std_token_transmissions',
-    'fault_mode', 'fault_pct', 'token_strategy', 'safety_radius'
+    'fault_mode', 'fault_pct', 'token_strategy', 'safety_radius',
+    'restructuring_method',
 ]
 
 TRIALS_HEADERS = [
@@ -52,7 +53,8 @@ TRIALS_HEADERS = [
     'restored', 'phase1_moves', 'phase2_moves',
     'shape_difference', 'shape_difference_phase1',
     'phase1_iterations', 'total_moves',
-    'token_transmissions', 'fault_mode', 'token_strategy', 'safety_radius'
+    'token_transmissions', 'fault_mode', 'token_strategy', 'safety_radius',
+    'restructuring_method',
 ]
 
 TOKEN_STRATEGIES = ["furthest", "nearest", "random"]
@@ -194,9 +196,55 @@ def main():
         help="Run safety radius ablation: sweep hop radii 2, 3, 4 for is_movable() check"
     )
     parser.add_argument(
-        "--reconstruction", type=str, default="displacement",
-        choices=["token", "displacement"],
-        help="Phase 2 reconstruction method (default: displacement)"
+        "--reconstruction", "--restructuring-method", type=str,
+        default="displacement",
+        choices=["token", "rendezvous", "displacement"],
+        dest="restructuring_method",
+        help="Phase 2 method (default: displacement). 'rendezvous' is an "
+             "alias for 'token'."
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.5,
+        help="Random-step temperature in agent policy pick_target "
+             "(default: 0.5; 0=greedy, higher=more exploration)"
+    )
+    parser.add_argument(
+        "--no-flood-echo", action="store_true",
+        help="Disable the flood/echo distributed component-discovery protocol "
+             "(matches the PyBullet sweep default — flood/echo blocks "
+             "fault-adjacent modules in many fault topologies)"
+    )
+    parser.add_argument(
+        "--max-moves-per-module", type=int, default=10,
+        help="Per-agent action-point budget (default: 10). Each successful "
+             "pivot, retarget, or give-up consumes 1 AP; token forwards cost "
+             "1/10 AP. Total work is bounded decentrally by this."
+    )
+    parser.add_argument(
+        "--safety-radius", type=int, default=2,
+        help="Hop radius used by is_movable() to gate pivots that would "
+             "disconnect the graph (default: 2). Ignored when --ablation-hops "
+             "is enabled (which sweeps {2,3,4})."
+    )
+    parser.add_argument(
+        "--token-gen-interval", type=float, default=0.1,
+        help="Min sim-time interval between consecutive token generations on "
+             "a fault-adjacent module (default: 0.1 s)"
+    )
+    parser.add_argument(
+        "--pivot-radius", type=int, default=4,
+        help="PIVOT_EXCLUSION_RADIUS — hop radius around a pivoting module "
+             "in which no other module may start a pivot (default: 4)"
+    )
+    parser.add_argument(
+        "--no-position-history", action="store_true",
+        help="Disable the per-agent visited-position history (cuts memory in "
+             "long-running trials but allows revisits)"
+    )
+    parser.add_argument(
+        "--max-phase-time", type=float, default=180.0,
+        help="(unused) Kept for back-compat with older sweep configs. Phase "
+             "termination is driven entirely by the per-agent action-point cap."
     )
 
     args = parser.parse_args()
@@ -227,7 +275,16 @@ def main():
         ablation = config.get('ablation', False)
         ablation_hops = config.get('ablation_hops', False)
         n_step = config.get('n_step', 1)
-        reconstruction_method = config.get('reconstruction_method', 'displacement')
+        restructuring_method = config.get(
+            'restructuring_method',
+            config.get('reconstruction_method', 'displacement'))
+        temperature = config.get('temperature', 0.5)
+        use_flood_echo = config.get('use_flood_echo', False)
+        max_moves_per_module = config.get('max_moves_per_module', 10)
+        safety_radius_cfg = config.get('safety_radius', 2)
+        token_gen_interval = config.get('token_gen_interval', 0.1)
+        pivot_radius = config.get('pivot_radius', 4)
+        use_position_history = config.get('use_position_history', True)
         output_dir = resume_dir
 
         completed = load_completed_n_values(output_dir)
@@ -256,7 +313,18 @@ def main():
         ablation = args.ablation
         ablation_hops = args.ablation_hops
         n_step = args.n_step
-        reconstruction_method = args.reconstruction
+        restructuring_method = args.restructuring_method
+        # Legacy "token" -> new "rendezvous" naming. Both are accepted on the
+        # CLI; downstream code branches on this string in `run_trial`.
+        if restructuring_method == "token":
+            restructuring_method = "rendezvous"
+        temperature = args.temperature
+        use_flood_echo = not args.no_flood_echo
+        max_moves_per_module = args.max_moves_per_module
+        safety_radius_cfg = args.safety_radius
+        token_gen_interval = args.token_gen_interval
+        pivot_radius = args.pivot_radius
+        use_position_history = not args.no_position_history
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_dir = os.path.join(args.output_dir, timestamp)
@@ -279,7 +347,14 @@ def main():
             "ablation": ablation,
             "ablation_hops": ablation_hops,
             "n_step": n_step,
-            "reconstruction_method": reconstruction_method,
+            "restructuring_method": restructuring_method,
+            "temperature": temperature,
+            "use_flood_echo": use_flood_echo,
+            "max_moves_per_module": max_moves_per_module,
+            "safety_radius": safety_radius_cfg,
+            "token_gen_interval": token_gen_interval,
+            "pivot_radius": pivot_radius,
+            "use_position_history": use_position_history,
         }
         with open(os.path.join(output_dir, "config.json"), 'w') as f:
             json.dump(config, f, indent=2)
@@ -317,7 +392,13 @@ def main():
     print(f"  Config type: {config_mode}")
     print(f"  Connectivity: {connectivity_desc}")
     print(f"  Parallel jobs: {n_jobs} {'(all cores)' if n_jobs == -1 else ''}")
-    print(f"  Reconstruction: {reconstruction_method}")
+    print(f"  Restructuring: {restructuring_method}")
+    print(f"  Temperature: {temperature}")
+    print(f"  Max moves / module: {max_moves_per_module}")
+    print(f"  Safety radius: {safety_radius_cfg}")
+    print(f"  Flood/echo: {'enabled' if use_flood_echo else 'disabled'}")
+    print(f"  Token-gen interval: {token_gen_interval}")
+    print(f"  Pivot radius: {pivot_radius}")
     if cluster_faults:
         print(f"  Cluster faults: enabled (cluster sizes 2,3,4,5)")
     if dynamic_pct:
@@ -349,7 +430,7 @@ def main():
 
     # --- Build list of (n, f, fault_mode, fault_pct_label, token_strategy, safety_radius) sweep jobs ---
     strategies = TOKEN_STRATEGIES if ablation else ["furthest"]
-    radii = SAFETY_RADII if ablation_hops else [2]
+    radii = SAFETY_RADII if ablation_hops else [safety_radius_cfg]
     sweep_jobs = []
     for n in remaining:
         if cluster_faults:
@@ -415,7 +496,13 @@ def main():
                     fault_mode=fault_mode,
                     token_strategy=tok_strat,
                     safety_radius=radius,
-                    reconstruction_method=reconstruction_method
+                    restructuring_method=restructuring_method,
+                    temperature=temperature,
+                    pivot_exclusion_radius=pivot_radius,
+                    use_flood_echo=use_flood_echo,
+                    token_gen_interval=token_gen_interval,
+                    max_moves_per_module=max_moves_per_module,
+                    use_position_history=use_position_history,
                 )
 
                 # Stream summary row
@@ -440,7 +527,8 @@ def main():
                     fault_mode,
                     fault_pct_label,
                     tok_strat,
-                    radius
+                    radius,
+                    restructuring_method,
                 ])
                 summary_file.flush()
 
@@ -456,7 +544,8 @@ def main():
                         trial.token_transmissions,
                         trial.fault_mode,
                         trial.token_strategy,
-                        trial.safety_radius
+                        trial.safety_radius,
+                        restructuring_method,
                     ])
                 trials_file.flush()
 

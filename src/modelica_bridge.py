@@ -2,8 +2,15 @@
 Bridge between the graph-based UDQDG reconfiguration algorithm and the
 OpenModelica physical simulation.
 
-Translates graph algorithm outputs (PivotStep / RestorationStep sequences)
-into physical motions executed in the Modelica simulator.
+DEPRECATED: This bridge calls ``UDQDGSystem.full_damage_response`` with
+``record_steps=True`` to harvest a ``PivotStep`` / ``RestorationStep``
+sequence, which is then replayed in Modelica. Both
+``full_damage_response`` and the step-log format were removed in the
+Graph Parity refactor — all simulation now flows through
+``GraphSimulator`` / ``BulletSimulator`` directly. If a Modelica path is
+still desired, port the policy callbacks from ``src/agent_policy.py``
+into a Modelica-driving simulator wrapper instead of replaying a
+pre-recorded step list.
 """
 
 import numpy as np

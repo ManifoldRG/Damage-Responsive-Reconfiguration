@@ -1,8 +1,14 @@
 """
 Generate a GIF animation of a cluster fault scenario with 40 modules.
 
-Creates a random 40-module tree structure, injects cluster faults,
-and animates the sequential damage response for each fault.
+DEPRECATED: This script depends on the legacy
+``UDQDGSystem.full_damage_response`` API and ``record_steps`` step-log
+format that were removed in the Graph Parity refactor. The new path
+uses ``GraphSimulator`` + ``DecentralizedCoagulation`` /
+``DecentralizedRestructuring`` (see ``src/agent_policy.py`` and
+``src/graph_sim.py``); per-pivot replay is available through the
+agents' ``move_log`` rather than a pre-recorded ``parallel_steps`` list.
+Migrate this script to that path before running.
 """
 
 import sys
