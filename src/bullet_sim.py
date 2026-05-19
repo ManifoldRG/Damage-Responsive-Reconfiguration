@@ -58,11 +58,6 @@ class PivotState:
     pivot_type: str = "corner"
     repel_idx: Optional[int] = None    # module whose surface repels; defaults to axis_idx
     repel_connector: Optional[int] = None    # connector index on repel module
-    # PD-settle phase: time at which is_pivot_complete first observed tols met.
-    # While set, _apply_pivot_attachment_actuation uses settle (high) gains to
-    # drive the pivot the last fraction of a meter onto the lattice cell
-    # without the teleport-induced constraint cascade.
-    settling_started_at: Optional[float] = None
 
 
 class BulletSimulator:
@@ -113,6 +108,13 @@ class BulletSimulator:
     NOMINAL_DIST = 1.0
     BOND_FORCE_CAP = 140.0        # N per body from COM-COM pair
 
+    # Max world distance between pivot and axis at stop_pivot for which we
+    # restore the rigid pivot↔axis bond. Beyond this we don't create the
+    # bond — the pair is too far to count as a clean lattice tether. Set to
+    # match the agent's BOND_THRESHOLD so all bond-creation gates use the
+    # same off-lattice slack.
+    BOND_RESTORE_DIST_THRESHOLD = 1.05
+
     # Attachment spring (weaker than bond): receiver COM toward surface on source
     K_ATTACHMENT = 50.0
     C_ATTACHMENT = 5.0
@@ -128,19 +130,25 @@ class BulletSimulator:
     C_BOND_SOFT_LEGACY = 45.0
 
     DAMPING_COEFF = 2.4
-    PHYSICS_DT = 0.01
+    PHYSICS_DT = 0.05
 
     # Performance knobs (all overridable per-instance/class).
     # Solver iterations: 120/150 are well above what rigid spheres + a handful
     # of constraints actually need; 50/60 was measured to give equivalent
     # reconnection behavior at ~2x speed in the force-step loop.
-    NUM_SOLVER_ITERATIONS_RIGID = 50
+    NUM_SOLVER_ITERATIONS_RIGID = 120
     NUM_SOLVER_ITERATIONS_SPRING = 60
     # `_auto_proximity_bond` is O(N^2) with up to 36 connector queries per
     # pair. Modules cannot traverse AUTO_BOND_CONNECTOR_DIST (0.1 m) in 10
     # substeps (0.1 sim-s) under realistic actuation, so running it every
     # substep is wasted work.
-    AUTO_BOND_INTERVAL_SUBSTEPS = 10
+    # Auto-bond cadence = once per policy tick (every 0.1 s sim time):
+    # 2 substeps at PHYSICS_DT=0.05.
+    AUTO_BOND_INTERVAL_SUBSTEPS = 2
+
+    # Diagnostic: per-module attitude drift sample once every ~5 s sim time
+    # (100 substeps at PHYSICS_DT=0.05).
+    ATTITUDE_DRIFT_INTERVAL_SUBSTEPS = 100
 
     # Spring pivot settling (relative geometry — not world target_pos; cluster may drift)
     SPRING_PIVOT_ANGLE_TOL = 0.04
@@ -166,12 +174,14 @@ class BulletSimulator:
     # Auto-bond: if any two mating connectors are within this distance and
     # neither module is actively pivoting, create a rigid bond automatically.
     AUTO_BOND_CONNECTOR_DIST = 0.1  # m
-    # Cosine tolerance for connector-axis alignment in auto-bond. Was 0.99985
-    # (~1°), which made auto-bond effectively dead once attitudes drifted from
-    # cardinal. 0.985 ~ 10° is loose enough to absorb realistic post-pivot drift
-    # while still requiring rough cardinal alignment. Pair with SNAP_TO_LATTICE
-    # so genuine post-pivot bodies are also cardinally aligned anyway.
-    AUTO_BOND_COSINE_TOL = 0.985
+    # Cosine tolerance for connector-axis alignment in auto-bond.
+    # 0.99985 ≈ cos(1°) — modules must be near-perfectly cardinally aligned
+    # for auto-bond to fire. Auto-bond is the fallback for proximity events
+    # that happen between stop_pivot calls; _reconnect_bonds (in the policy)
+    # is the primary bond-creation path and already covers post-pivot
+    # adjacency. Keeping auto-bond tight avoids fusing modules that just
+    # happen to be near each other while drifting.
+    AUTO_BOND_COSINE_TOL = 0.99985
 
     # Disabled: snapping the pivot body teleports it away from the rest poses
     # encoded in its rigid-bond constraints to non-axis neighbors, which the
@@ -181,21 +191,6 @@ class BulletSimulator:
     # the helper in place so this can be revisited with a smarter scheme
     # (e.g. recomputing rest poses on snap).
     SNAP_TO_LATTICE_ON_PIVOT_COMPLETE = False
-
-    # PD-settle phase. Once a rolling-rigid pivot first observes tols met in
-    # is_pivot_complete, instead of teleporting (which violates non-axis bond
-    # rest poses) or completing immediately (which leaves residual pos error
-    # 0.05–0.5 m by stop_pivot snapshot time), enter a fixed settling window
-    # where _apply_pivot_attachment_actuation uses much stiffer gains aimed at
-    # the lattice target. Constraints absorb force smoothly instead of
-    # exploding. Completes when pos_err drops below PD_SETTLE_POS_TOL or the
-    # window elapses.
-    USE_PD_SETTLE_AFTER_PIVOT_COMPLETE = True
-    PD_SETTLE_DURATION = 0.4        # seconds of sim time (40 substeps @ dt=0.01)
-    PD_SETTLE_KP = 1200.0           # vs PIVOT_PD_KP=200 baseline
-    PD_SETTLE_KD = 300.0            # vs PIVOT_PD_KD=100 baseline
-    PD_SETTLE_F_MAX = 1200.0        # vs PIVOT_PD_F_MAX=500 baseline
-    PD_SETTLE_POS_TOL = 1e-3        # early-exit if drives close to exact
 
     def __init__(self, N: int, pos0: np.ndarray, bonded0: np.ndarray,
                  vel0: Optional[np.ndarray] = None, gui: bool = False,
@@ -304,6 +299,13 @@ class BulletSimulator:
         self._active_pivots: Dict[int, PivotState] = {}
         self._pivot_constraints: Dict[int, int] = {}
         self._pivot_diagnostic_log: List[Dict[str, Any]] = []
+        # Attitude drift log: periodic snapshot of how aligned every module's
+        # body-frame is with the cardinal lattice axes. One entry per
+        # ATTITUDE_DRIFT_INTERVAL_SUBSTEPS substeps. Each entry:
+        #   (sim_time, mean_max_cosine, min_max_cosine, count_below_0.985)
+        # max_cosine = max over the 6 cardinal directions of |row_dot_dir|.
+        # Lower = more drift; 1.0 = perfectly axis-aligned.
+        self._attitude_drift_log: List[Tuple[float, float, float, int]] = []
         self._attachment_suppress: Set[Tuple[int, int]] = set()
         # Indices for which ``set_body_collision_with_all(i, False)`` was used;
         # ``stop_pivot`` must not re-enable those pairs when restoring filters.
@@ -576,19 +578,55 @@ class BulletSimulator:
                 pivot_idx, axis_idx, pivot_type, lattice_ref_body_idx, target_pos_local)
             return
 
-        # Rigid: drop fixed bond pivot–axis so point-to-point allows hinge motion
-        # (covers lateral after handoff, where only sim.start_pivot is called).
-        if self.RIGID_BONDS:
-            lo, hi = min(pivot_idx, axis_idx), max(pivot_idx, axis_idx)
-            if (lo, hi) in self._bonds:
-                self.remove_bond(pivot_idx, axis_idx)
-
         use_rolling = (
             self.USE_ROLLING_SPHERE_PIVOT
             and self.RIGID_BONDS
             and not self.USE_SPRING_BONDS
             and self._module_shape == "sphere"
         )
+
+        # Transition path: pivot_idx is already active (the policy is
+        # retargeting after a failed maneuver). Update PivotState fields in
+        # place — the rolling-sphere coupling continues uninterrupted, no
+        # bond/constraint manipulation needed. This is the only way to honor
+        # the "module always has at least one tether" invariant across
+        # failed-maneuver chains.
+        if pivot_idx in self._active_pivots and use_rolling:
+            ps = self._active_pivots[pivot_idx]
+            old_axis = ps.axis_idx
+            ps.axis_idx = axis_idx
+            ps.rot_axis = rot_axis / (np.linalg.norm(rot_axis) + 1e-12)
+            ps.target_angle = float(target_angle)
+            ps.kp = float(kp)
+            ps.kd = float(kd)
+            ps.duration = float(duration)
+            ps.start_time = self._sim_time
+            ps.r0 = r0.copy()
+            ps.lattice_ref_body_idx = int(lattice_ref_body_idx)
+            ps.target_pos_local = target_pos_local
+            ps.attract_body_idx = int(attract_body_idx)
+            ps.attract_connector = int(attract_connector)
+            ps.pivot_type = pivot_type
+            ps.repel_idx = repel_idx
+            ps.repel_connector = repel_connector
+            ps.completed = False
+            ps.timed_out = False
+            ps.collided = False
+            ps.prev_rel_v = 0.0
+            if old_axis != axis_idx:
+                self._attachment_suppress.discard((old_axis, pivot_idx))
+                self._attachment_suppress.add((axis_idx, pivot_idx))
+            logger.debug(
+                "Pivot {} retargeted around {} (was {})",
+                pivot_idx, axis_idx, old_axis)
+            return
+
+        # Rigid: drop fixed bond pivot–axis so point-to-point allows hinge motion
+        # (covers lateral after handoff, where only sim.start_pivot is called).
+        if self.RIGID_BONDS:
+            lo, hi = min(pivot_idx, axis_idx), max(pivot_idx, axis_idx)
+            if (lo, hi) in self._bonds:
+                self.remove_bond(pivot_idx, axis_idx)
         if use_rolling:
             logger.debug(
                 "Pivot {} uses rolling sphere coupling (no POINT2POINT)",
@@ -685,9 +723,25 @@ class BulletSimulator:
             self._body_ids[ref], physicsClientId=self._physics_client)
         return tuple(float(x) for x in orn)
 
-    def stop_pivot(self, pivot_idx: int):
+    def stop_pivot(self, pivot_idx: int, restore_axis_bond: bool = True):
+        """End an active pivot.
+
+        ``restore_axis_bond`` (default True): after destroying the temporary
+        P2P/rolling constraint, create a rigid bond between the pivot and its
+        axis at the current relative pose. This guarantees the pivot module
+        always exits ``stop_pivot`` tethered to some module — even if the
+        pivot timed out and the pair is off-lattice. The bond's rest pose is
+        captured from the current world poses, so a misaligned timeout
+        leaves a stretched-but-valid bond; the policy can then try further
+        recovery pivots from a tethered state. Pass False at lateral-handoff
+        call sites where the agent has explicitly switched the pivot↔axis
+        bond to a new partner already (re-bonding to the original axis would
+        create a duplicate stretched bond).
+        """
+        axis_for_restore: Optional[int] = None
         if pivot_idx in self._active_pivots:
             ps = self._active_pivots[pivot_idx]
+            axis_for_restore = ps.axis_idx
             if (
                     self.USE_CRYSTAL_ATTITUDE_SNAP_AFTER_ROLLING_PIVOT
                     and self.USE_ROLLING_SPHERE_PIVOT
@@ -710,6 +764,33 @@ class BulletSimulator:
                 self._snapshot_pivot_metrics(pivot_idx, timed_out=ps.timed_out))
             self._attachment_suppress.discard((ps.axis_idx, pivot_idx))
             del self._active_pivots[pivot_idx]
+
+            # Replace the temporary P2P/rolling tether with a permanent rigid
+            # bond at whatever the current relative pose is, but ONLY if the
+            # pair is within a reasonable distance. Beyond
+            # BOND_RESTORE_DIST_THRESHOLD the bond would be a misleading
+            # tether — it survives only until the next pivot's _start_pivot
+            # strips it, orphaning the dependent neighbor. Skipping the
+            # restore lets articulation checks see the actual disconnect and
+            # blocks further pivots that would compound the problem.
+            # create_bond is a no-op if something else already bonded the
+            # pair (success path where _reconnect_bonds also tries it).
+            if (restore_axis_bond
+                    and axis_for_restore is not None
+                    and 0 <= axis_for_restore < self.N
+                    and axis_for_restore != pivot_idx
+                    and self.RIGID_BONDS
+                    and not self.USE_SPRING_BONDS):
+                pos_p, _ = p.getBasePositionAndOrientation(
+                    self._body_ids[pivot_idx],
+                    physicsClientId=self._physics_client)
+                pos_a, _ = p.getBasePositionAndOrientation(
+                    self._body_ids[axis_for_restore],
+                    physicsClientId=self._physics_client)
+                d = float(np.linalg.norm(
+                    np.asarray(pos_p) - np.asarray(pos_a)))
+                if d <= float(self.BOND_RESTORE_DIST_THRESHOLD):
+                    self.create_bond(pivot_idx, axis_for_restore)
 
             for j in range(self.N):
                 if j != pivot_idx:
@@ -743,6 +824,34 @@ class BulletSimulator:
 
     def get_pivot_diagnostic_log(self) -> List[Dict[str, Any]]:
         return list(self._pivot_diagnostic_log)
+
+    def get_attitude_drift_log(self) -> List[Tuple[float, float, float, int]]:
+        """Return periodic attitude-drift samples since sim start.
+
+        Each entry: (sim_time, mean_max_cosine, min_max_cosine, count_below_0.985).
+        """
+        return list(self._attitude_drift_log)
+
+    def _sample_attitude_drift(self):
+        """Compute one snapshot of how cardinally aligned each module is.
+
+        For each module: take its body rotation matrix R, then compute
+        max_i max_d |R[:,i] . CONNECTOR_DIRS[d]| -- but since CONNECTOR_DIRS
+        are the cardinal axes, this is just the max absolute value of any
+        entry in R. A perfectly axis-aligned attitude gives 1.0 for every
+        module; drift drops the value.
+        """
+        max_cosines = np.zeros(self.N)
+        for i in range(self.N):
+            R = self.body_rotation_matrix(i)
+            max_cosines[i] = float(np.max(np.abs(R)))
+        below = int(np.sum(max_cosines < 0.985))
+        self._attitude_drift_log.append((
+            float(self._sim_time),
+            float(np.mean(max_cosines)),
+            float(np.min(max_cosines)),
+            below,
+        ))
 
     def pivot_timed_out(self, pivot_idx: int) -> bool:
         """True if the active pivot for *pivot_idx* has timed out."""
@@ -819,34 +928,12 @@ class BulletSimulator:
             and self.RIGID_BONDS
             and not self.USE_SPRING_BONDS)
         if rolling_rigid:
-            tols_met = (pos_err < float(self.PIVOT_POS_TOL)
-                        and omega_c < float(self.PIVOT_OMEGA_TOL)
-                        and rel_v < float(self.PIVOT_REL_V_TOL))
-            if self.USE_PD_SETTLE_AFTER_PIVOT_COMPLETE:
-                if ps.settling_started_at is None:
-                    if tols_met:
-                        # Enter settle phase; stronger PD will drive to lattice
-                        # over the next PD_SETTLE_DURATION seconds.
-                        ps.settling_started_at = self._sim_time
-                else:
-                    t_settle = self._sim_time - ps.settling_started_at
-                    if (pos_err < float(self.PD_SETTLE_POS_TOL)
-                            or t_settle >= float(self.PD_SETTLE_DURATION)):
-                        # Zero residual velocity for a clean handoff (does not
-                        # teleport position, so no constraint cascade).
-                        p.resetBaseVelocity(
-                            self._body_ids[pivot_idx],
-                            linearVelocity=[0.0, 0.0, 0.0],
-                            angularVelocity=[0.0, 0.0, 0.0],
-                            physicsClientId=self._physics_client,
-                        )
-                        ps.completed = True
-                        return True
-            else:
-                if tols_met:
-                    self._snap_pivot_to_lattice(pivot_idx, ps, tgt_w)
-                    ps.completed = True
-                    return True
+            if (pos_err < float(self.PIVOT_POS_TOL)
+                    and omega_c < float(self.PIVOT_OMEGA_TOL)
+                    and rel_v < float(self.PIVOT_REL_V_TOL)):
+                self._snap_pivot_to_lattice(pivot_idx, ps, tgt_w)
+                ps.completed = True
+                return True
         else:
             if pos_err < float(self.PIVOT_POS_TOL):
                 self._snap_pivot_to_lattice(pivot_idx, ps, tgt_w)
@@ -979,6 +1066,10 @@ class BulletSimulator:
 
             if self._substep_counter % self.AUTO_BOND_INTERVAL_SUBSTEPS == 0:
                 self._auto_proximity_bond()
+
+            if (self._substep_counter
+                    % self.ATTITUDE_DRIFT_INTERVAL_SUBSTEPS == 0):
+                self._sample_attitude_drift()
 
             if diag:
                 P_roll = self.total_linear_momentum()
@@ -1385,9 +1476,9 @@ class BulletSimulator:
         """
         if self.USE_SPRING_BONDS or not self._active_pivots:
             return
-        kp_base = self.PIVOT_PD_KP * self._pivot_attract_scale
-        kd_base = self.PIVOT_PD_KD
-        f_cap_base = self.PIVOT_PD_F_MAX
+        kp = self.PIVOT_PD_KP * self._pivot_attract_scale
+        kd = self.PIVOT_PD_KD
+        f_cap = self.PIVOT_PD_F_MAX
         pos = self.get_positions()
         vel = self.get_velocities()
         for pivot_idx, ps in self._active_pivots.items():
@@ -1396,16 +1487,6 @@ class BulletSimulator:
             tgt_w = self.resolve_pivot_target_world(ps)
             pos_err = tgt_w - pos[pivot_idx]
             v_rel = vel[pivot_idx] - vel[ax]
-
-            if (self.USE_PD_SETTLE_AFTER_PIVOT_COMPLETE
-                    and ps.settling_started_at is not None):
-                kp = self.PD_SETTLE_KP * self._pivot_attract_scale
-                kd = self.PD_SETTLE_KD
-                f_cap = self.PD_SETTLE_F_MAX
-            else:
-                kp = kp_base
-                kd = kd_base
-                f_cap = f_cap_base
 
             f_vec = kp * pos_err - kd * v_rel
 

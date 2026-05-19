@@ -259,19 +259,48 @@ class _MCDisplacementRestructuring(DisplacementRestructuring):
 # Phase helpers
 # ---------------------------------------------------------------------------
 
-def _phase1_done(policy, sim: BulletSimulator) -> bool:
-    return policy.is_connected() and not sim.has_active_pivots()
+IDLE_OR_CAPPED_MIN_SIM_TIME = 20.0
 
 
-def _phase2_done(policy, sim: BulletSimulator) -> bool:
-    if sim.has_active_pivots():
+def _all_idle_or_capped(policy) -> bool:
+    """True if every agent is "done" for the phase. Done = action_points
+    exhausted (``<= 0``), or IDLE-with-no-tokens. Any other state
+    (HAS_TOKEN, PIVOTING, REVERSING, WAITING, PROCESSING) is still active
+    and blocks termination — the agent is mid-cycle and will either burn
+    an action point or complete a pivot soon.
+
+    Guard: the check is suppressed for the first
+    ``IDLE_OR_CAPPED_MIN_SIM_TIME`` seconds of sim time so that tokens
+    have time to propagate through the structure before the phase can be
+    declared "done".
+    """
+    if policy.sim.sim_time < IDLE_OR_CAPPED_MIN_SIM_TIME:
         return False
+
     for a in policy.agents.values():
+        if a.action_points <= 0:
+            continue
         if a.state != ModuleState.IDLE:
             return False
         if a.incoming_tokens or a.token is not None:
             return False
     return True
+
+
+def _phase1_done(policy, sim: BulletSimulator) -> bool:
+    if sim.has_active_pivots():
+        return False
+    if policy.is_connected():
+        return True
+    return _all_idle_or_capped(policy)
+
+
+def _phase2_done(policy, sim: BulletSimulator) -> bool:
+    if sim.has_active_pivots():
+        return False
+    if _all_idle_or_capped(policy):
+        return True
+    return False
 
 
 def _run_phase(
@@ -282,39 +311,171 @@ def _run_phase(
     max_time: float,
     stall_interval: float,
     stall_patience: int,
+    phase_label: str = "phase",
+    heartbeat_wall_secs: float = 30.0,
 ) -> int:
     """Run a simulation phase, returns tick count.
 
-    Termination is governed by `done_fn` and the stall timer
-    (`stall_interval` × `stall_patience`). `max_time` is accepted for
-    API/config compatibility but no longer enforced — the wall-clock cap
-    was capping out larger-N structures even when they were still making
-    progress; the stall timer is the only remaining termination guard.
-    """
-    stall_check_time = sim.sim_time
-    last_move_count = 0
-    stall_count = 0
-    ticks = 0
+    Termination: ``done_fn`` only. The centralized stall timer is gone — the
+    per-module move cap (MAX_MOVES_PER_MODULE) bounds total work
+    decentrally. ``stall_interval`` / ``stall_patience`` / ``max_time`` are
+    accepted for API/config back-compat but unused.
 
+    Heartbeat: every ``heartbeat_wall_secs`` of wall time, prints a status
+    line with current tick count, sim time, successful_moves, and the
+    distribution of completed_moves across agents.
+    """
+    import time as _time
+    cap = getattr(policy, "MAX_MOVES_PER_MODULE", 0)
+    ticks = 0
+    t0 = _time.monotonic()
+    last_hb = t0
     while True:
         sim.step(dt)
         policy.tick()
         ticks += 1
-
         if done_fn(policy, sim):
             break
+        now = _time.monotonic()
+        if heartbeat_wall_secs > 0 and (now - last_hb) >= heartbeat_wall_secs:
+            last_hb = now
+            n_capped = sum(
+                1 for a in policy.agents.values()
+                if cap and a.completed_moves >= cap)
+            n_pivoting = sum(
+                1 for a in policy.agents.values()
+                if a.state == ModuleState.PIVOTING)
+            n_idle = sum(
+                1 for a in policy.agents.values()
+                if a.state == ModuleState.IDLE)
+            n_proc = sum(
+                1 for a in policy.agents.values()
+                if a.state == ModuleState.PROCESSING)
+            total_agents = len(policy.agents)
+            print(
+                f"  [{phase_label}] tick={ticks} sim_t={sim.sim_time:.1f}s "
+                f"wall={now - t0:.0f}s "
+                f"successful_moves={policy.successful_moves} "
+                f"capped={n_capped}/{total_agents} "
+                f"pivoting={n_pivoting} idle={n_idle} proc={n_proc}",
+                flush=True)
 
-        if sim.sim_time - stall_check_time > stall_interval:
-            if policy.successful_moves == last_move_count:
-                stall_count += 1
-                if stall_count >= stall_patience:
-                    break
-            else:
-                stall_count = 0
-                last_move_count = policy.successful_moves
-            stall_check_time = sim.sim_time
+    # Drain any in-flight pivots so the bond-restoration invariant fires for
+    # modules that were mid-pivot at termination.
+    for piv_idx in list(sim._active_pivots.keys()):
+        sim.stop_pivot(piv_idx)
 
     return ticks
+
+
+def _connected_components_from_bonds(
+    bond_matrix: np.ndarray,
+    active_body_indices: List[int],
+) -> List[List[int]]:
+    """BFS over the bond graph restricted to ``active_body_indices``.
+
+    Used to characterize the final structural state at phase end. Faulty
+    body indices should NOT be in active_body_indices; they're physical
+    obstacles in the sim but excluded from the policy's connectivity check.
+    """
+    active = set(active_body_indices)
+    seen: Set[int] = set()
+    components: List[List[int]] = []
+    for start in active_body_indices:
+        if start in seen:
+            continue
+        comp: List[int] = []
+        stack = [start]
+        while stack:
+            v = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            comp.append(v)
+            for j in np.where(bond_matrix[v])[0]:
+                jj = int(j)
+                if jj in active and jj not in seen:
+                    stack.append(jj)
+        components.append(sorted(comp))
+    return components
+
+
+def _write_trial_diagnostics(
+    *,
+    dump_diagnostics_dir: str,
+    trial_id: int,
+    seed: int,
+    n_modules: int,
+    n_faults: int,
+    fault_mode: str,
+    safety_radius: int,
+    use_flood_echo: bool,
+    token_gen_interval: float,
+    sim,
+    coag,
+    restruct,
+    scenario,
+    phase1_connected: bool,
+    total_phase1_moves: int,
+    total_phase2_moves: int,
+    total_phase1_ticks: int,
+) -> None:
+    """Write one JSON blob with per-trial diagnostic state.
+
+    Called just before ``sim.disconnect()`` so the bullet world is still
+    queryable. Inverts the monkey-patch pattern from
+    ``debug_pivot_outcomes.py`` — same data, but written to disk for
+    offline analysis instead of printed to stdout.
+    """
+    os.makedirs(dump_diagnostics_dir, exist_ok=True)
+    bond_matrix = sim.get_bond_matrix()
+    active_idxs = [scenario.body_indices[mid] for mid in scenario.module_ids]
+    components = _connected_components_from_bonds(bond_matrix, active_idxs)
+
+    final_pos = sim.get_positions()
+    bond_pairs = [
+        [int(i), int(j)]
+        for i in range(bond_matrix.shape[0])
+        for j in range(i + 1, bond_matrix.shape[1])
+        if bond_matrix[i, j]
+    ]
+
+    payload = {
+        "trial_id": int(trial_id),
+        "seed": int(seed),
+        "n_modules": int(n_modules),
+        "n_faults": int(n_faults),
+        "fault_mode": fault_mode,
+        "safety_radius": int(safety_radius),
+        "use_flood_echo": bool(use_flood_echo),
+        "token_gen_interval": float(token_gen_interval),
+        "connected": bool(phase1_connected),
+        "total_phase1_moves": int(total_phase1_moves),
+        "total_phase2_moves": int(total_phase2_moves),
+        "total_phase1_ticks": int(total_phase1_ticks),
+        "reversal_count_coag": int(getattr(coag, "reversal_count", 0)),
+        "reversal_count_restruct": int(getattr(restruct, "reversal_count", 0))
+        if restruct is not None else 0,
+        "pivot_log": sim.get_pivot_diagnostic_log(),
+        "auto_bond_stats": sim.get_auto_bond_stats(),
+        "attitude_drift_log": [list(t) for t in sim.get_attitude_drift_log()],
+        "final_pos": final_pos.tolist(),
+        "final_bonds": bond_pairs,
+        "fault_body_idxs": [int(i) for i in scenario.fault_body_idxs],
+        "fault_ids": list(scenario.fault_ids),
+        "module_ids": list(scenario.module_ids),
+        "body_indices": {mid: int(idx)
+                          for mid, idx in scenario.body_indices.items()},
+        "final_components": [[int(i) for i in c] for c in components],
+        "n_active_modules": len(scenario.module_ids),
+    }
+    out_path = os.path.join(
+        dump_diagnostics_dir,
+        f"trial_{trial_id:04d}_n{n_modules}_f{n_faults}"
+        f"_{fault_mode}_seed{seed}.json",
+    )
+    with open(out_path, "w") as f:
+        json.dump(payload, f)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +492,7 @@ def run_single_bullet_trial(
     config_mode: str = CONFIG_MODE_RANDOM,
     fault_mode: str = FAULT_MODE_RANDOM,
     *,
-    temperature: float = 0.01,
+    temperature: float = 0.1,
     pivot_exclusion_radius: int = 4,
     max_phase_time: float = 180.0,
     stall_interval: float = 10.0,
@@ -344,6 +505,9 @@ def run_single_bullet_trial(
     max_pivot_time: Optional[float] = None,
     use_flood_echo: bool = True,
     token_gen_interval: float = 0.1,
+    dump_diagnostics_dir: Optional[str] = None,
+    max_moves_per_module: int = 10,
+    use_position_history: bool = True,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -353,7 +517,7 @@ def run_single_bullet_trial(
     """
     from src.monte_carlo import _causes_disconnection
 
-    for structure_attempt in range(50):
+    for structure_attempt in range(500):
         gen_seed = seed + structure_attempt * 9973
         if config_mode == CONFIG_MODE_TREE:
             system = create_random_tree_configuration(
@@ -421,7 +585,14 @@ def run_single_bullet_trial(
         coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
         coag.TEMPERATURE = temperature
         coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
+        coag.INITIAL_ACTION_POINTS = int(max_moves_per_module)
+        coag.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+        # Agents were instantiated with the class default; override per-agent.
+        for _agent in coag.agents.values():
+            _agent.action_points = int(max_moves_per_module)
         coag.USE_FLOOD_ECHO = use_flood_echo
+        coag.USE_POSITION_HISTORY = bool(use_position_history)
+        coag.FORWARD_AP_COST = 0.1
         coag.set_multi_fault_adjacent(
             fault_ids=scenario.fault_ids,
             fault_body_idxs=scenario.fault_body_idxs,
@@ -430,7 +601,8 @@ def run_single_bullet_trial(
 
         phase1_ticks = _run_phase(
             sim, coag, _phase1_done, dt,
-            max_phase_time, stall_interval, stall_patience)
+            max_phase_time, stall_interval, stall_patience,
+            phase_label=f"coag[t{trial_id}/n{n_modules}/f{n_faults}]")
 
         phase1_connected = coag.is_connected()
         total_phase1_moves = coag.total_moves
@@ -466,11 +638,18 @@ def run_single_bullet_trial(
             restruct._safety_radius = safety_radius
             restruct.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
             restruct.USE_FLOOD_ECHO = use_flood_echo
+            restruct.USE_POSITION_HISTORY = bool(use_position_history)
+            restruct.FORWARD_AP_COST = 0.1
+            restruct.INITIAL_ACTION_POINTS = int(max_moves_per_module)
+            restruct.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+            for _agent in restruct.agents.values():
+                _agent.action_points = int(max_moves_per_module)
             restruct.generate_initial_tokens()
 
             _run_phase(
                 sim, restruct, _phase2_done, dt,
-                max_phase_time, stall_interval, stall_patience)
+                max_phase_time, stall_interval, stall_patience,
+                phase_label=f"restruct[t{trial_id}/n{n_modules}/f{n_faults}]")
 
             total_phase2_moves = restruct.total_moves
 
@@ -479,6 +658,27 @@ def run_single_bullet_trial(
                 mid: pos_snap2[scenario.body_indices[mid]].copy()
                 for mid in scenario.module_ids
             }
+
+        if dump_diagnostics_dir is not None:
+            _write_trial_diagnostics(
+                dump_diagnostics_dir=dump_diagnostics_dir,
+                trial_id=trial_id,
+                seed=seed,
+                n_modules=n_modules,
+                n_faults=n_faults,
+                fault_mode=fault_mode,
+                safety_radius=safety_radius,
+                use_flood_echo=use_flood_echo,
+                token_gen_interval=token_gen_interval,
+                sim=sim,
+                coag=coag,
+                restruct=locals().get("restruct"),
+                scenario=scenario,
+                phase1_connected=phase1_connected,
+                total_phase1_moves=total_phase1_moves,
+                total_phase2_moves=total_phase2_moves,
+                total_phase1_ticks=total_phase1_ticks,
+            )
     finally:
         sim.disconnect()
 
@@ -840,7 +1040,7 @@ def main():
                         help="Sweep token selection strategies: furthest, nearest, random")
     parser.add_argument("--ablation-hops", action="store_true",
                         help="Sweep safety radii: 2, 3, 4 for is_movable() check")
-    parser.add_argument("--temperature", type=float, default=0.01,
+    parser.add_argument("--temperature", type=float, default=0.1,
                         help="Coagulation temperature (default: 0.01)")
     parser.add_argument("--pivot-radius", type=int, default=4,
                         help="Pivot exclusion radius (default: 4)")
@@ -848,6 +1048,13 @@ def main():
                         help="Max sim-seconds per phase (default: 180)")
     parser.add_argument("--stall-interval", type=float, default=10.0,
                         help="Seconds between stall checks (default: 10)")
+    parser.add_argument("--max-moves-per-module", type=int, default=10,
+                        help="Per-module cap on successful pivots per phase. "
+                             "Once a module reaches this count it stops "
+                             "initiating new pivots for the remainder of the "
+                             "phase. Replaces the centralized stall timer "
+                             "with a decentralized bound: total work per "
+                             "phase is at most N × this value.")
     parser.add_argument("--stall-patience", type=int, default=16,
                         help="Stall windows before phase exit (default: 16)")
     parser.add_argument("--resume", type=str, default=None, metavar="PATH",
@@ -869,6 +1076,10 @@ def main():
     parser.add_argument("--max-pivot-time", type=float, default=None,
                         help="Override BulletSimulator.MAX_PIVOT_TIME in sec "
                              "(default: 20s sphere / 40s cube)")
+    parser.add_argument("--no-position-history", action="store_true",
+                        help="Disable per-agent position-history dedup in "
+                             "pick_target. Allows the agent to re-target "
+                             "lattice cells it has previously visited.")
     parser.add_argument("--no-flood-echo", action="store_true",
                         help="Disable flood/echo component-discovery protocol. "
                              "Fault-adjacent modules emit tokens unconditionally "
@@ -878,6 +1089,11 @@ def main():
                              "emissions per fault-adjacent module (default: 0.1, "
                              "matching the policy tick dt). Lower = more "
                              "aggressive token flow.")
+    parser.add_argument("--dump-diagnostics", type=str, default=None,
+                        metavar="DIR",
+                        help="If set, write one JSON per trial under DIR with "
+                             "pivot log, auto-bond stats, attitude drift, "
+                             "final structural state. Diagnostic only.")
     args = parser.parse_args()
 
     # --- Resume mode ---
@@ -1149,6 +1365,9 @@ def main():
                     max_pivot_time=args.max_pivot_time,
                     use_flood_echo=not args.no_flood_echo,
                     token_gen_interval=args.token_gen_interval,
+                    dump_diagnostics_dir=args.dump_diagnostics,
+                    max_moves_per_module=args.max_moves_per_module,
+                    use_position_history=not args.no_position_history,
                 )
 
                 summary_writer.writerow([

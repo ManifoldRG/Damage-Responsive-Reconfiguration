@@ -181,6 +181,25 @@ class ModuleAgent:
     wait_until: float = 0.0                            # sim time when WAITING expires
     token_hold_until: float = 0.0                        # sim time: stay IDLE before acting on token
     moving_token_received_tick: int = -999               # tick when last "moving" token was received
+    # Action points budget. Each module starts with INITIAL_ACTION_POINTS
+    # at the beginning of the phase and spends one per "action": a
+    # successful pivot completion OR a direction-token forward to neighbors.
+    # When the budget hits zero, the module drops any further incoming
+    # tokens and stays IDLE for the rest of the phase. This is the
+    # decentralized phase-termination mechanism: total work per phase is at
+    # most N × INITIAL_ACTION_POINTS events.
+    action_points: int = 10
+    completed_moves: int = 0                             # diagnostic: # of successful pivots (NOT a cap)
+    # Legacy field, no longer used as a cap (the action_points budget is
+    # the unified cap mechanism). Kept for back-compat with dump readers.
+    consecutive_pick_failures: int = 0
+    # Cells (in current axis's lattice frame) already attempted by retarget
+    # in the current maneuver chain. Used to avoid retargeting to the same
+    # failed cell forever. Cleared whenever the agent returns to IDLE.
+    retarget_blacklist: Set[Tuple[int, int, int]] = field(default_factory=set)
+    # Count of retarget attempts in the current maneuver chain (reset on
+    # IDLE). Caps total retargets per primary pivot to MAX_RETARGETS_PER_PIVOT.
+    retarget_count: int = 0
     reversal_handoff_idx: Optional[int] = None           # original axis to bond-switch to during lateral reversal
     discover_inbox: List["DiscoverMessage"] = field(default_factory=list)
     echo_inbox: List["EchoMessage"] = field(default_factory=list)
@@ -248,7 +267,31 @@ class DecentralizedCoagulation:
     # Probability (per tick) of accepting a random safe move when no
     # distance-reducing move exists.  Set > 0 to break symmetric deadlocks
     # (e.g. tie-fighter degeneracy on a center-fault line).
-    TEMPERATURE: float = 0.01
+    TEMPERATURE: float = 0.1  # per-tick prob of random exploration move
+
+    # Per-module action-points budget at phase start. Each agent spends 1
+    # point per successful pivot OR per direction-token forward. When the
+    # budget hits zero the agent drops incoming tokens and stays IDLE.
+    # This unifies the per-module work bound across active movers (which
+    # spend points on pivots) and interior modules (which spend points on
+    # token forwards): total work per phase ≤ N × INITIAL_ACTION_POINTS.
+    INITIAL_ACTION_POINTS: int = 10
+    # Back-compat alias for the older CLI/config name.
+    MAX_MOVES_PER_MODULE: int = 10
+
+    # If True, pick_target rejects (axis, target_cell) pairs the agent has
+    # already visited via a successful pivot this phase. Prevents
+    # oscillation between previously-visited cells. Set False to allow
+    # revisits — useful for diagnosing whether history dedup is what's
+    # blocking the policy at a particular cell.
+    USE_POSITION_HISTORY: bool = True
+
+    # Hard cap on retarget attempts within a single primary pivot chain.
+    # Combined with the retarget_blacklist (no cell retried twice), this
+    # bounds the work spent on any one stuck pivot. After this many
+    # retargets without success, the agent gives up the maneuver entirely
+    # — stop_pivot, IDLE.
+    MAX_RETARGETS_PER_PIVOT: int = 10
 
     # Flood/echo distributed component-discovery protocol. When True
     # (default), fault-adjacent modules withhold tokens until a flood/echo
@@ -258,6 +301,8 @@ class DecentralizedCoagulation:
     # purely global is_connected(). Useful for diagnosing whether the
     # flood/echo gating slows or destabilizes multi-fault scenarios.
     USE_FLOOD_ECHO: bool = True
+
+    FORWARD_AP_COST: float = 0.1
 
     def __init__(self, sim, fault_id: str, module_ids: List[str],
                  body_indices: Dict[str, int]):
@@ -277,6 +322,7 @@ class DecentralizedCoagulation:
             self.agents[mid] = ModuleAgent(
                 module_id=mid,
                 body_idx=body_indices[mid],
+                action_points=self.INITIAL_ACTION_POINTS,
             )
 
         # Reverse mapping: body_idx -> module_id
@@ -293,6 +339,7 @@ class DecentralizedCoagulation:
         self.successful_moves = 0
         self.move_log: List[Dict] = []
         self._tick_count: int = 0
+        self.reversal_count: int = 0
 
         # Flood/echo protocol state
         self._flood_counter: int = 0
@@ -845,7 +892,8 @@ class DecentralizedCoagulation:
                     continue
                 if target_cell in occupied or target_cell == my_cell:
                     continue
-                if (axis_idx, target_cell) in agent.position_history:
+                if (self.USE_POSITION_HISTORY
+                        and (axis_idx, target_cell) in agent.position_history):
                     continue
                 r_vec = my_pos - pos[axis_idx]
                 r_target = target_world - pos[axis_idx]
@@ -870,11 +918,18 @@ class DecentralizedCoagulation:
                 scored.append((score, t_local, axis_idx, "corner", None))
 
             # ── Lateral: copy axis–pivot offset to handoff (one φ from handoff COM) ──
+            # Rule: a lateral pivot is rejected ONLY when going from a
+            # non-fault axis to a fault handoff. Allowed cases:
+            #   non-fault → non-fault, fault → non-fault, fault → fault.
+            # Disallowed: non-fault → fault.
+            axis_is_fault = bool(fault_idxs and axis_idx in fault_idxs)
             axis_neighbors = self._decision_graph_neighbors(axis_idx)
             for handoff_idx in axis_neighbors:
                 if handoff_idx == agent.body_idx:
                     continue
-                if (fault_idxs and handoff_idx in fault_idxs):
+                handoff_is_fault = bool(
+                    fault_idxs and handoff_idx in fault_idxs)
+                if handoff_is_fault and not axis_is_fault:
                     continue
                 d_ah = pos[handoff_idx] - pos[axis_idx]
                 if not _lateral_axis_handoff_step_cardinal_for_axis(
@@ -885,7 +940,8 @@ class DecentralizedCoagulation:
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 if target_cell in occupied or target_cell == my_cell:
                     continue
-                if (axis_idx, target_cell) in agent.position_history:
+                if (self.USE_POSITION_HISTORY
+                        and (axis_idx, target_cell) in agent.position_history):
                     continue
                 if np.linalg.norm(target_world - pos[axis_idx]) < 1.05:
                     continue
@@ -994,6 +1050,11 @@ class DecentralizedCoagulation:
                 continue
 
             if agent.state == ModuleState.IDLE:
+                # Action-points budget: spent on successful pivots and on
+                # direction-token forwards. Once depleted the agent stays
+                # IDLE forever for this phase. Decentralized termination.
+                if agent.action_points <= 0:
+                    continue
                 neighbors = self._decision_graph_neighbors(agent.body_idx)
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
@@ -1038,7 +1099,12 @@ class DecentralizedCoagulation:
                                 agent.body_idx, agent.pivot_axis_idx)
                         # Physics constraint switch: restart pivot
                         # around the handoff module toward the target
-                        self.sim.stop_pivot(agent.body_idx)
+                        # Lateral handoff: agent has already swapped the
+                        # axis bond to the handoff partner above; tell the
+                        # sim NOT to restore a rigid M↔original-axis bond
+                        # (would create a stretched duplicate).
+                        self.sim.stop_pivot(agent.body_idx,
+                                            restore_axis_bond=False)
                         new_ax = agent.handoff_idx
                         my_pos = pos[agent.body_idx]
                         new_ax_pos = pos[new_ax]
@@ -1081,33 +1147,61 @@ class DecentralizedCoagulation:
                 if self.sim.is_pivot_complete(agent.body_idx):
                     collided = self.sim.pivot_collided(agent.body_idx)
                     timed_out = self.sim.pivot_timed_out(agent.body_idx)
-                    needs_reversal = (
-                        (collided or timed_out)
-                        and agent.pre_pivot_pos_local is not None)
 
-                    self.sim.stop_pivot(agent.body_idx)
-                    if (agent.lattice_ref_body_idx is not None
-                            and agent.target_pos_local is not None):
-                        nom = float(self.sim.NOMINAL_DIST)
-                        cell = tuple(
-                            np.round(agent.target_pos_local / nom).astype(int))
-                        agent.position_history.add(
-                            (agent.lattice_ref_body_idx, cell))
-                    self._reconnect_bonds(agent.body_idx)
-                    self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
-
-                    if needs_reversal:
-                        agent.pending_retry = None
-                        self._start_reversal(agent)
-                        any_active = True
-                        if collided:
+                    if collided or timed_out:
+                        # Failure: retarget to the nearest empty lattice cell
+                        # WITHOUT calling stop_pivot. The rolling-sphere
+                        # coupling persists — the module stays tethered to
+                        # its axis throughout the retry chain. If no empty
+                        # cell exists around the axis, give up cleanly
+                        # (stop_pivot + IDLE).
+                        if self._retarget_to_nearest_empty_cell(agent):
+                            agent.action_points -= 1
+                            self.reversal_count = (
+                                getattr(self, "reversal_count", 0) + 1)
+                            any_active = True
                             logger.info(
-                                "Module {} collision detected — reversing",
-                                mid)
+                                "Module {} pivot {} — retargeting to "
+                                "nearest empty cell",
+                                mid,
+                                "collided" if collided else "timed out")
                         else:
+                            agent.action_points -= 1
+                            self.sim.stop_pivot(agent.body_idx)
+                            self._reconnect_bonds(agent.body_idx)
+                            self._decision_bond_matrix = (
+                                self.sim.get_bond_matrix().copy())
+                            agent.state = ModuleState.IDLE
+                            agent.target_pos = None
+                            agent.target_pos_local = None
+                            agent.lattice_ref_body_idx = None
+                            agent.attract_body_idx = None
+                            agent.attract_connector = None
+                            agent.pivot_axis_idx = None
+                            agent.pivot_type = None
+                            agent.handoff_idx = None
+                            agent.handoff_done = False
+                            agent.token = None
+                            agent.retarget_blacklist.clear()
+                            agent.retarget_count = 0
                             logger.info(
-                                "Module {} pivot timed out — reversing", mid)
+                                "Module {} pivot failed (no empty cell or "
+                                "retarget cap hit) — giving up", mid)
                     else:
+                        # Success: tear down rolling coupling, install rigid
+                        # bond at the new lattice cell.
+                        self.sim.stop_pivot(agent.body_idx)
+                        if (agent.lattice_ref_body_idx is not None
+                                and agent.target_pos_local is not None):
+                            nom = float(self.sim.NOMINAL_DIST)
+                            cell = tuple(
+                                np.round(
+                                    agent.target_pos_local / nom).astype(int))
+                            agent.position_history.add(
+                                (agent.lattice_ref_body_idx, cell))
+                        self._reconnect_bonds(agent.body_idx)
+                        self._decision_bond_matrix = (
+                            self.sim.get_bond_matrix().copy())
                         agent.state = ModuleState.IDLE
                         agent.target_pos = None
                         agent.target_pos_local = None
@@ -1119,8 +1213,14 @@ class DecentralizedCoagulation:
                         agent.handoff_idx = None
                         agent.handoff_done = False
                         agent.token = None
+                        agent.retarget_blacklist.clear()
+                        agent.retarget_count = 0
+                        agent.completed_moves += 1
+                        agent.action_points -= 1
                         self.successful_moves += 1
-                        logger.info("Module {} pivot complete", mid)
+                        logger.info(
+                            "Module {} pivot complete (ap left: {})",
+                            mid, agent.action_points)
                 else:
                     any_active = True
                 continue
@@ -1138,7 +1238,12 @@ class DecentralizedCoagulation:
                         if agent.pivot_axis_idx is not None:
                             self.sim.remove_bond(
                                 agent.body_idx, agent.pivot_axis_idx)
-                        self.sim.stop_pivot(agent.body_idx)
+                        # Lateral handoff: agent has already swapped the
+                        # axis bond to the handoff partner above; tell the
+                        # sim NOT to restore a rigid M↔original-axis bond
+                        # (would create a stretched duplicate).
+                        self.sim.stop_pivot(agent.body_idx,
+                                            restore_axis_bond=False)
                         new_ax = agent.handoff_idx
                         my_pos = pos[agent.body_idx]
                         new_ax_pos = pos[new_ax]
@@ -1237,22 +1342,27 @@ class DecentralizedCoagulation:
             if agent.state == ModuleState.PROCESSING:
                 # Wait for processing delay
                 if self.sim.sim_time >= agent.process_ready_time:
-                    # Forward token to bonded neighbors
                     self._forward_token(agent)
+                    agent.action_points -= self.FORWARD_AP_COST
                     agent.state = ModuleState.IDLE
                     agent.token = None
                 else:
                     any_active = True
                 continue
 
-            # IDLE state: check for incoming tokens
-            if agent.incoming_tokens:
+            # IDLE state: check for incoming tokens. Skip if the agent has
+            # spent its action-points budget.
+            if agent.incoming_tokens and agent.action_points > 0:
                 best = min(agent.incoming_tokens,
                            key=lambda t: np.linalg.norm(t.direction))
                 agent.token = best
                 agent.incoming_tokens.clear()
                 agent.token_hold_until = self.sim.sim_time + 1.0
                 agent.state = ModuleState.HAS_TOKEN
+            elif agent.incoming_tokens:
+                # Budget exhausted — drop tokens so the agent no longer
+                # cycles through HAS_TOKEN/PROCESSING.
+                agent.incoming_tokens.clear()
 
             if agent.state == ModuleState.HAS_TOKEN:
                 if self.sim.sim_time < agent.token_hold_until:
@@ -1302,6 +1412,8 @@ class DecentralizedCoagulation:
                         any_active = True
                         continue
 
+                # No target found — agent will forward this token (and
+                # spend an action point) once the PROCESSING delay expires.
                 self._on_no_pick_target(agent)
                 agent.state = ModuleState.PROCESSING
                 agent.process_ready_time = (self.sim.sim_time
@@ -1442,6 +1554,113 @@ class DecentralizedCoagulation:
                      f", handoff={self._idx_to_mid.get(handoff_idx, handoff_idx)}"
                      if handoff_idx is not None else "")
 
+    def _retarget_to_nearest_empty_cell(self, agent: ModuleAgent) -> bool:
+        """Retarget the active pivot to the closest empty cardinal-adjacent cell.
+
+        Called on pivot failure (timeout/collision) INSTEAD of stop_pivot +
+        reversal. The rolling-sphere coupling stays alive — only the target
+        and rotation parameters change. ``sim.start_pivot`` is idempotent: it
+        detects that this module already has an active pivot and updates the
+        PivotState fields in place. The module never goes bondless.
+
+        Returns True if a valid empty cell was found and the pivot retargeted;
+        False if no such cell exists (every cardinal slot around the current
+        axis is occupied), in which case the caller should give up gracefully.
+
+        Excludes cells occupied by ANY body (including fault bodies, which sit
+        at their original lattice positions). Faults are obstacles, not
+        targets.
+        """
+        if agent.body_idx not in self.sim._active_pivots:
+            return False
+        ps = self.sim._active_pivots[agent.body_idx]
+        axis_idx = ps.axis_idx
+        if not (0 <= axis_idx < self.sim.N):
+            return False
+
+        pos = self.sim.get_positions()
+        my_pos = pos[agent.body_idx]
+        axis_pos = pos[axis_idx]
+        R = self.sim.body_rotation_matrix(axis_idx)
+        nom = float(self.sim.NOMINAL_DIST)
+
+        # Hard cap: bail out if too many retargets in this maneuver chain.
+        if agent.retarget_count >= self.MAX_RETARGETS_PER_PIVOT:
+            return False
+
+        # Cells (in axis-local lattice frame) occupied by any body. This
+        # naturally excludes cells already on a fault body because the
+        # fault body still sits at its lattice position and gets enumerated
+        # here. Corner pivots adjacent to faults are allowed — only the
+        # cell occupied BY a fault is rejected.
+        occupied: set = set()
+        for i in range(self.sim.N):
+            u = R.T @ (pos[i] - axis_pos) / nom
+            occupied.add(tuple(np.round(u).astype(int)))
+
+        best_target_local = None
+        best_cell: Optional[Tuple[int, int, int]] = None
+        best_dist = float("inf")
+        for delta in _LATTICE_DELTAS:
+            cell = (int(delta[0]), int(delta[1]), int(delta[2]))
+            if cell in occupied:
+                continue
+            # Skip cells already tried by retarget in this chain.
+            if cell in agent.retarget_blacklist:
+                continue
+            dw = nom * np.array(delta, dtype=float)
+            target_world = axis_pos + R @ dw
+            d = float(np.linalg.norm(target_world - my_pos))
+            if d < best_dist:
+                best_dist = d
+                best_target_local = R.T @ (target_world - axis_pos)
+                best_cell = cell
+
+        if best_target_local is None:
+            return False
+
+        # Record this cell as tried + bump retarget counter.
+        if best_cell is not None:
+            agent.retarget_blacklist.add(best_cell)
+        agent.retarget_count += 1
+
+        target_world = self.sim.target_world_from_local(
+            axis_idx, best_target_local)
+        r_vec = my_pos - axis_pos
+        rot_axis = self.sim.get_rotation_axis(my_pos, axis_pos, target_world)
+        r_target = target_world - axis_pos
+        cos_a = np.clip(
+            np.dot(r_vec, r_target) / (
+                np.linalg.norm(r_vec) * np.linalg.norm(r_target) + 1e-12),
+            -1, 1)
+        angle = np.arccos(cos_a)
+        kp, kd = self.sim.compute_pd_gains(r_vec, duration=12.0)
+        attract_conn = self.sim.nearest_connector(
+            axis_idx, target_world - axis_pos)
+
+        # sim.start_pivot's transition path updates PivotState in place
+        # because pivot_idx is already in _active_pivots — no constraint or
+        # bond manipulation, no gap in the rolling coupling.
+        self.sim.start_pivot(
+            agent.body_idx, axis_idx, rot_axis, angle, kp, kd,
+            duration=12.0,
+            lattice_ref_body_idx=axis_idx,
+            target_pos_local=best_target_local,
+            attract_body_idx=axis_idx,
+            attract_connector=attract_conn,
+            pivot_type="corner")
+
+        agent.target_pos = target_world.copy()
+        agent.target_pos_local = np.asarray(best_target_local).copy()
+        agent.lattice_ref_body_idx = axis_idx
+        agent.attract_body_idx = axis_idx
+        agent.attract_connector = attract_conn
+        agent.pivot_axis_idx = axis_idx
+        agent.pivot_type = "corner"
+        agent.handoff_idx = None
+        agent.handoff_done = False
+        return True
+
     def _start_reversal(self, agent: ModuleAgent):
         """Pivot the module back to its pre-pivot lattice position.
 
@@ -1450,17 +1669,31 @@ class DecentralizedCoagulation:
         axis (handoff module) toward the original axis, bond-switch, then
         roll on the original axis back to pre_pivot_pos_local.
         """
+        self.reversal_count = getattr(self, "reversal_count", 0) + 1
         pos = self.sim.get_positions()
         my_pos = pos[agent.body_idx]
 
         neighbors = self.get_physical_neighbors(agent.body_idx)
         if not neighbors:
+            # Find the nearest body in the sim. Only bond if within
+            # BOND_THRESHOLD (essentially at lattice spacing). Otherwise
+            # refuse to create a wildly-stretched rest-pose bond — leave
+            # the module orphaned and abort the reversal. Articulation
+            # checks elsewhere will see the truth.
             nearest = min(
                 (j for j in range(self.sim.N) if j != agent.body_idx),
                 key=lambda j: np.linalg.norm(
                     pos[j] - pos[agent.body_idx]))
-            self.sim.create_bond(agent.body_idx, nearest)
-            neighbors = [nearest]
+            nearest_dist = float(np.linalg.norm(
+                pos[nearest] - pos[agent.body_idx]))
+            if nearest_dist < self.BOND_THRESHOLD:
+                self.sim.create_bond(agent.body_idx, nearest)
+                neighbors = [nearest]
+            else:
+                agent.state = ModuleState.IDLE
+                agent.token = None
+                agent.pending_retry = None
+                return
 
         ref = agent.pre_pivot_lattice_ref
         target_local = agent.pre_pivot_pos_local
@@ -1571,12 +1804,23 @@ class DecentralizedCoagulation:
         pos = self.sim.get_positions()
 
         if not neighbors:
+            # Only bond if the nearest body is within BOND_THRESHOLD. If
+            # nothing is close enough, refuse to create a stretched rest-
+            # pose bond and abort the snap; the module stays orphaned.
             nearest = min(
                 (j for j in range(self.sim.N) if j != agent.body_idx),
                 key=lambda j: np.linalg.norm(
                     pos[j] - pos[agent.body_idx]))
-            self.sim.create_bond(agent.body_idx, nearest)
-            neighbors = [nearest]
+            nearest_dist = float(np.linalg.norm(
+                pos[nearest] - pos[agent.body_idx]))
+            if nearest_dist < self.BOND_THRESHOLD:
+                self.sim.create_bond(agent.body_idx, nearest)
+                neighbors = [nearest]
+            else:
+                agent.state = ModuleState.IDLE
+                agent.token = None
+                agent.pending_retry = None
+                return
 
         axis_idx = min(neighbors,
                        key=lambda n: np.linalg.norm(
@@ -1789,6 +2033,16 @@ class DecentralizedRestructuring:
     # See DecentralizedCoagulation.ALLOW_FAULT_AS_PIVOT_NEIGHBOR.
     ALLOW_FAULT_AS_PIVOT_NEIGHBOR: bool = True
 
+    # See DecentralizedCoagulation.INITIAL_ACTION_POINTS — same semantics
+    # in phase 2. Displacement-based restructuring usually retraces within
+    # this budget; token-based restructuring respects the same cap.
+    INITIAL_ACTION_POINTS: int = 10
+    MAX_MOVES_PER_MODULE: int = 10  # back-compat alias
+    MAX_RETARGETS_PER_PIVOT: int = 10
+    USE_POSITION_HISTORY: bool = True
+
+    FORWARD_AP_COST: float = 0.1
+
     @staticmethod
     def _fault_body_index(sim, agents: Dict[str, ModuleAgent]) -> Optional[int]:
         have = {a.body_idx for a in agents.values()}
@@ -1835,6 +2089,7 @@ class DecentralizedRestructuring:
             self.agents[mid] = ModuleAgent(
                 module_id=mid,
                 body_idx=body_indices[mid],
+                action_points=self.INITIAL_ACTION_POINTS,
             )
 
         self._idx_to_mid: Dict[int, str] = {v: k for k, v in body_indices.items()}
@@ -1846,6 +2101,7 @@ class DecentralizedRestructuring:
         self.successful_moves = 0
         self.move_log: List[Dict] = []
         self._tick_count: int = 0
+        self.reversal_count: int = 0
 
     def generate_initial_tokens(self):
         """Non-movers emit tokens for their empty neighbor slots."""
@@ -2051,7 +2307,8 @@ class DecentralizedRestructuring:
                     continue
                 if target_cell in occupied or target_cell == my_cell:
                     continue
-                if (axis_idx, target_cell) in agent.position_history:
+                if (self.USE_POSITION_HISTORY
+                        and (axis_idx, target_cell) in agent.position_history):
                     continue
                 r_vec = my_pos - pos[axis_idx]
                 r_target = target_world - pos[axis_idx]
@@ -2074,6 +2331,9 @@ class DecentralizedRestructuring:
                 t_local = R.T @ (target_world - p_ref)
                 scored.append((score, t_local, axis_idx, "corner", None))
 
+            # Lateral pivots: reject only if HANDOFF is a fault (the
+            # second-leg axis). The initial axis can be a fault — modules
+            # may lateral-pivot off a fault.
             axis_neighbors = self._decision_graph_neighbors(axis_idx)
             for handoff_idx in axis_neighbors:
                 if handoff_idx == agent.body_idx:
@@ -2089,7 +2349,8 @@ class DecentralizedRestructuring:
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 if target_cell in occupied or target_cell == my_cell:
                     continue
-                if (axis_idx, target_cell) in agent.position_history:
+                if (self.USE_POSITION_HISTORY
+                        and (axis_idx, target_cell) in agent.position_history):
                     continue
                 if np.linalg.norm(target_world - pos[axis_idx]) < 1.05:
                     continue
@@ -2172,6 +2433,11 @@ class DecentralizedRestructuring:
                 continue
 
             if agent.state == ModuleState.IDLE:
+                # Action-points budget: spent on successful pivots and on
+                # direction-token forwards. Once depleted the agent stays
+                # IDLE forever for this phase. Decentralized termination.
+                if agent.action_points <= 0:
+                    continue
                 neighbors = self._decision_graph_neighbors(agent.body_idx)
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
@@ -2212,7 +2478,12 @@ class DecentralizedRestructuring:
                         if agent.pivot_axis_idx is not None:
                             self.sim.remove_bond(
                                 agent.body_idx, agent.pivot_axis_idx)
-                        self.sim.stop_pivot(agent.body_idx)
+                        # Lateral handoff: agent has already swapped the
+                        # axis bond to the handoff partner above; tell the
+                        # sim NOT to restore a rigid M↔original-axis bond
+                        # (would create a stretched duplicate).
+                        self.sim.stop_pivot(agent.body_idx,
+                                            restore_axis_bond=False)
                         new_ax = agent.handoff_idx
                         my_pos = pos[agent.body_idx]
                         new_ax_pos = pos[new_ax]
@@ -2252,34 +2523,54 @@ class DecentralizedRestructuring:
                 if self.sim.is_pivot_complete(agent.body_idx):
                     collided = self.sim.pivot_collided(agent.body_idx)
                     timed_out = self.sim.pivot_timed_out(agent.body_idx)
-                    needs_reversal = (
-                        (collided or timed_out)
-                        and agent.pre_pivot_pos_local is not None)
 
-                    self.sim.stop_pivot(agent.body_idx)
-                    if (agent.lattice_ref_body_idx is not None
-                            and agent.target_pos_local is not None):
-                        nom = float(self.sim.NOMINAL_DIST)
-                        cell = tuple(
-                            np.round(agent.target_pos_local / nom).astype(int))
-                        agent.position_history.add(
-                            (agent.lattice_ref_body_idx, cell))
-                    self._reconnect_bonds(agent.body_idx)
-                    self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
-
-                    if needs_reversal:
-                        agent.pending_retry = None
-                        self._start_reversal(agent)
-                        any_active = True
-                        if collided:
+                    if collided or timed_out:
+                        # Failure: retarget without releasing the rolling
+                        # tether. See coag copy for rationale.
+                        if self._retarget_to_nearest_empty_cell(agent):
+                            agent.action_points -= 1
+                            self.reversal_count = (
+                                getattr(self, "reversal_count", 0) + 1)
+                            any_active = True
                             logger.info(
-                                "Module {} collision detected (phase 2) "
-                                "— reversing", mid)
+                                "Module {} pivot {} (phase 2) — retargeting",
+                                mid,
+                                "collided" if collided else "timed out")
                         else:
+                            agent.action_points -= 1
+                            self.sim.stop_pivot(agent.body_idx)
+                            self._reconnect_bonds(agent.body_idx)
+                            self._decision_bond_matrix = (
+                                self.sim.get_bond_matrix().copy())
+                            agent.state = ModuleState.IDLE
+                            agent.target_pos = None
+                            agent.target_pos_local = None
+                            agent.lattice_ref_body_idx = None
+                            agent.attract_body_idx = None
+                            agent.attract_connector = None
+                            agent.pivot_axis_idx = None
+                            agent.pivot_type = None
+                            agent.handoff_idx = None
+                            agent.handoff_done = False
+                            agent.token = None
+                            agent.retarget_blacklist.clear()
+                            agent.retarget_count = 0
                             logger.info(
-                                "Module {} pivot timed out (phase 2) "
-                                "— reversing", mid)
+                                "Module {} pivot failed (phase 2 — no empty "
+                                "cell or retarget cap hit) — giving up", mid)
                     else:
+                        self.sim.stop_pivot(agent.body_idx)
+                        if (agent.lattice_ref_body_idx is not None
+                                and agent.target_pos_local is not None):
+                            nom = float(self.sim.NOMINAL_DIST)
+                            cell = tuple(
+                                np.round(
+                                    agent.target_pos_local / nom).astype(int))
+                            agent.position_history.add(
+                                (agent.lattice_ref_body_idx, cell))
+                        self._reconnect_bonds(agent.body_idx)
+                        self._decision_bond_matrix = (
+                            self.sim.get_bond_matrix().copy())
                         agent.state = ModuleState.IDLE
                         agent.target_pos = None
                         agent.target_pos_local = None
@@ -2291,8 +2582,14 @@ class DecentralizedRestructuring:
                         agent.handoff_idx = None
                         agent.handoff_done = False
                         agent.token = None
+                        agent.retarget_blacklist.clear()
+                        agent.retarget_count = 0
+                        agent.completed_moves += 1
+                        agent.action_points -= 1
                         self.successful_moves += 1
-                        logger.info("Module {} pivot complete (phase 2)", mid)
+                        logger.info(
+                            "Module {} pivot complete (phase 2, ap left: {})",
+                            mid, agent.action_points)
                 else:
                     any_active = True
                 continue
@@ -2310,7 +2607,12 @@ class DecentralizedRestructuring:
                         if agent.pivot_axis_idx is not None:
                             self.sim.remove_bond(
                                 agent.body_idx, agent.pivot_axis_idx)
-                        self.sim.stop_pivot(agent.body_idx)
+                        # Lateral handoff: agent has already swapped the
+                        # axis bond to the handoff partner above; tell the
+                        # sim NOT to restore a rigid M↔original-axis bond
+                        # (would create a stretched duplicate).
+                        self.sim.stop_pivot(agent.body_idx,
+                                            restore_axis_bond=False)
                         new_ax = agent.handoff_idx
                         my_pos = pos[agent.body_idx]
                         new_ax_pos = pos[new_ax]
@@ -2409,13 +2711,14 @@ class DecentralizedRestructuring:
             if agent.state == ModuleState.PROCESSING:
                 if self.sim.sim_time >= agent.process_ready_time:
                     self._forward_token(agent)
+                    agent.action_points -= self.FORWARD_AP_COST
                     agent.state = ModuleState.IDLE
                     agent.token = None
                 else:
                     any_active = True
                 continue
 
-            if agent.incoming_tokens:
+            if agent.incoming_tokens and agent.action_points > 0:
                 if self.token_strategy == "nearest":
                     best = min(agent.incoming_tokens,
                                key=lambda t: np.linalg.norm(t.direction))
@@ -2428,6 +2731,9 @@ class DecentralizedRestructuring:
                 agent.incoming_tokens.clear()
                 agent.token_hold_until = self.sim.sim_time + 1.0
                 agent.state = ModuleState.HAS_TOKEN
+            elif agent.incoming_tokens:
+                # Budget exhausted — drop incoming tokens.
+                agent.incoming_tokens.clear()
 
             if agent.state == ModuleState.HAS_TOKEN:
                 if self.sim.sim_time < agent.token_hold_until:
@@ -2561,6 +2867,99 @@ class DecentralizedRestructuring:
                      f", handoff={self._idx_to_mid.get(handoff_idx, handoff_idx)}"
                      if handoff_idx is not None else "")
 
+    def _retarget_to_nearest_empty_cell(self, agent: ModuleAgent) -> bool:
+        """See DecentralizedCoagulation._retarget_to_nearest_empty_cell."""
+        if agent.body_idx not in self.sim._active_pivots:
+            return False
+        ps = self.sim._active_pivots[agent.body_idx]
+        axis_idx = ps.axis_idx
+        if not (0 <= axis_idx < self.sim.N):
+            return False
+
+        pos = self.sim.get_positions()
+        my_pos = pos[agent.body_idx]
+        axis_pos = pos[axis_idx]
+        R = self.sim.body_rotation_matrix(axis_idx)
+        nom = float(self.sim.NOMINAL_DIST)
+
+        if agent.retarget_count >= self.MAX_RETARGETS_PER_PIVOT:
+            return False
+
+        occupied: set = set()
+        for i in range(self.sim.N):
+            u = R.T @ (pos[i] - axis_pos) / nom
+            occupied.add(tuple(np.round(u).astype(int)))
+
+        fault_idxs = self._get_fault_idxs()
+        fault_positions = [pos[fidx] for fidx in fault_idxs
+                           if 0 <= fidx < self.sim.N]
+
+        def _is_fault_adjacent(world_pt) -> bool:
+            for fp in fault_positions:
+                if float(np.linalg.norm(world_pt - fp)) < nom * 1.5:
+                    return True
+            return False
+
+        best_target_local = None
+        best_cell = None
+        best_dist = float("inf")
+        for delta in _LATTICE_DELTAS:
+            cell = (int(delta[0]), int(delta[1]), int(delta[2]))
+            if cell in occupied:
+                continue
+            if cell in agent.retarget_blacklist:
+                continue
+            dw = nom * np.array(delta, dtype=float)
+            target_world = axis_pos + R @ dw
+            if _is_fault_adjacent(target_world):
+                continue
+            d = float(np.linalg.norm(target_world - my_pos))
+            if d < best_dist:
+                best_dist = d
+                best_target_local = R.T @ (target_world - axis_pos)
+                best_cell = cell
+
+        if best_target_local is None:
+            return False
+
+        if best_cell is not None:
+            agent.retarget_blacklist.add(best_cell)
+        agent.retarget_count += 1
+
+        target_world = self.sim.target_world_from_local(
+            axis_idx, best_target_local)
+        r_vec = my_pos - axis_pos
+        rot_axis = self.sim.get_rotation_axis(my_pos, axis_pos, target_world)
+        r_target = target_world - axis_pos
+        cos_a = np.clip(
+            np.dot(r_vec, r_target) / (
+                np.linalg.norm(r_vec) * np.linalg.norm(r_target) + 1e-12),
+            -1, 1)
+        angle = np.arccos(cos_a)
+        kp, kd = self.sim.compute_pd_gains(r_vec, duration=12.0)
+        attract_conn = self.sim.nearest_connector(
+            axis_idx, target_world - axis_pos)
+
+        self.sim.start_pivot(
+            agent.body_idx, axis_idx, rot_axis, angle, kp, kd,
+            duration=12.0,
+            lattice_ref_body_idx=axis_idx,
+            target_pos_local=best_target_local,
+            attract_body_idx=axis_idx,
+            attract_connector=attract_conn,
+            pivot_type="corner")
+
+        agent.target_pos = target_world.copy()
+        agent.target_pos_local = np.asarray(best_target_local).copy()
+        agent.lattice_ref_body_idx = axis_idx
+        agent.attract_body_idx = axis_idx
+        agent.attract_connector = attract_conn
+        agent.pivot_axis_idx = axis_idx
+        agent.pivot_type = "corner"
+        agent.handoff_idx = None
+        agent.handoff_done = False
+        return True
+
     def _start_reversal(self, agent: ModuleAgent):
         """Pivot the module back to its pre-pivot lattice position (phase 2).
 
@@ -2571,12 +2970,25 @@ class DecentralizedRestructuring:
 
         neighbors = self.get_physical_neighbors(agent.body_idx)
         if not neighbors:
+            # Find the nearest body in the sim. Only bond if within
+            # BOND_THRESHOLD (essentially at lattice spacing). Otherwise
+            # refuse to create a wildly-stretched rest-pose bond — leave
+            # the module orphaned and abort the reversal. Articulation
+            # checks elsewhere will see the truth.
             nearest = min(
                 (j for j in range(self.sim.N) if j != agent.body_idx),
                 key=lambda j: np.linalg.norm(
                     pos[j] - pos[agent.body_idx]))
-            self.sim.create_bond(agent.body_idx, nearest)
-            neighbors = [nearest]
+            nearest_dist = float(np.linalg.norm(
+                pos[nearest] - pos[agent.body_idx]))
+            if nearest_dist < self.BOND_THRESHOLD:
+                self.sim.create_bond(agent.body_idx, nearest)
+                neighbors = [nearest]
+            else:
+                agent.state = ModuleState.IDLE
+                agent.token = None
+                agent.pending_retry = None
+                return
 
         ref = agent.pre_pivot_lattice_ref
         target_local = agent.pre_pivot_pos_local
@@ -2686,12 +3098,23 @@ class DecentralizedRestructuring:
         pos = self.sim.get_positions()
 
         if not neighbors:
+            # Only bond if the nearest body is within BOND_THRESHOLD. If
+            # nothing is close enough, refuse to create a stretched rest-
+            # pose bond and abort the snap; the module stays orphaned.
             nearest = min(
                 (j for j in range(self.sim.N) if j != agent.body_idx),
                 key=lambda j: np.linalg.norm(
                     pos[j] - pos[agent.body_idx]))
-            self.sim.create_bond(agent.body_idx, nearest)
-            neighbors = [nearest]
+            nearest_dist = float(np.linalg.norm(
+                pos[nearest] - pos[agent.body_idx]))
+            if nearest_dist < self.BOND_THRESHOLD:
+                self.sim.create_bond(agent.body_idx, nearest)
+                neighbors = [nearest]
+            else:
+                agent.state = ModuleState.IDLE
+                agent.token = None
+                agent.pending_retry = None
+                return
 
         axis_idx = min(neighbors,
                        key=lambda n: np.linalg.norm(
@@ -2932,6 +3355,10 @@ class DisplacementRestructuring(DecentralizedRestructuring):
             direction = R.T @ disp
             agent.incoming_tokens.append(
                 Token(direction=direction.copy(), source_id=mid))
+
+    def _forward_token(self, agent: ModuleAgent):
+        """Displacement tokens are per-module; forwarding is meaningless. Drop."""
+        pass
 
     def _origin_world_for_pick_target(
             self, agent: ModuleAgent, pos: np.ndarray) -> Optional[np.ndarray]:
