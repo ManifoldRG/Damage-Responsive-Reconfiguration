@@ -77,12 +77,13 @@ class GraphSimulator:
         [0, 0, 1], [0, 0, -1],
     ], dtype=float)
 
-    # Multiplier on the policy-supplied pivot duration. Set <1 to make
-    # graph-sim pivots resolve faster than PyBullet timings while keeping
-    # the lateral-handoff midpoint reachable. 1.0 honors the policy value
-    # exactly (typically 12.0 s — same number of sim-time ticks per pivot
-    # as the PyBullet runner at dt=0.1).
-    PIVOT_DURATION_SCALE = 1.0
+    # Multiplier on the policy-supplied pivot duration. Graph sim has no
+    # physics, so pivot duration only governs how many ticks the agent
+    # spends in PIVOTING (for mid-flight lateral handoff and pivot-
+    # exclusion lockout). Policy passes duration=12.0; scale=1/60
+    # collapses that to 0.2 s = 2 ticks at dt=0.1, the minimum that
+    # preserves a clean mid-flight handoff window.
+    PIVOT_DURATION_SCALE = 1.0 / 60.0
 
     def __init__(self, N: int, pos0: np.ndarray, bonded0: np.ndarray,
                  vel0: Optional[np.ndarray] = None, gui: bool = False,

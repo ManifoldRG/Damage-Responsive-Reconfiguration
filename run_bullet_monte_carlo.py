@@ -32,6 +32,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from loguru import logger as _loguru_logger
+_loguru_logger.disable("src.agent_policy")
+_loguru_logger.disable("src.bullet_sim")
+_loguru_logger.disable("src.bullet_bridge")
 import matplotlib
 
 matplotlib.use("Agg")

@@ -368,6 +368,28 @@ def _run_phase(
     for piv_idx in list(sim._active_pivots.keys()):
         sim.stop_pivot(piv_idx)
 
+    now = _time.monotonic()
+    n_capped = sum(
+        1 for a in policy.agents.values()
+        if cap and a.completed_moves >= cap)
+    n_pivoting = sum(
+        1 for a in policy.agents.values()
+        if a.state == ModuleState.PIVOTING)
+    n_idle = sum(
+        1 for a in policy.agents.values()
+        if a.state == ModuleState.IDLE)
+    n_proc = sum(
+        1 for a in policy.agents.values()
+        if a.state == ModuleState.PROCESSING)
+    total_agents = len(policy.agents)
+    print(
+        f"  [{phase_label}] tick={ticks} sim_t={sim.sim_time:.1f}s "
+        f"wall={now - t0:.0f}s "
+        f"successful_moves={policy.successful_moves} "
+        f"capped={n_capped}/{total_agents} "
+        f"pivoting={n_pivoting} idle={n_idle} proc={n_proc}",
+        flush=True)
+
     return ticks
 
 

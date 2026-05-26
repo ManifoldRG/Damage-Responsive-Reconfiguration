@@ -24,6 +24,10 @@ import os
 import sys
 from datetime import datetime
 import numpy as np
+from loguru import logger as _loguru_logger
+_loguru_logger.disable("src.agent_policy")
+_loguru_logger.disable("src.bullet_sim")
+_loguru_logger.disable("src.bullet_bridge")
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
