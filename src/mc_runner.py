@@ -28,6 +28,16 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
 
+# Suppress per-pivot/per-token loguru chatter from the policy in MC runs.
+# Module-level disable runs in every worker process that imports mc_runner
+# (joblib/ProcessPoolExecutor workers don't inherit parent loguru state).
+# Callers who want the logs can call ``logger.enable("src.agent_policy")``
+# after importing mc_runner.
+from loguru import logger as _loguru_logger
+_loguru_logger.disable("src.agent_policy")
+_loguru_logger.disable("src.bullet_sim")
+_loguru_logger.disable("src.bullet_bridge")
+
 from .agent_policy import (
     DecentralizedCoagulation,
     DecentralizedRestructuring,

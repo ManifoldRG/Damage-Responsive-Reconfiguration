@@ -1059,25 +1059,32 @@ class DecentralizedCoagulation:
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
                 triangle_found = False
-                for ni_idx in range(len(neighbors)):
-                    for nj_idx in range(ni_idx + 1, len(neighbors)):
-                        a, b = neighbors[ni_idx], neighbors[nj_idx]
-                        if bm[a, b]:
-                            d_a = float(np.linalg.norm(pos[agent.body_idx] - pos[a]))
-                            d_b = float(np.linalg.norm(pos[agent.body_idx] - pos[b]))
-                            if d_a <= d_b:
-                                close, far = a, b
-                            else:
-                                close, far = b, a
-                            self.sim.remove_bond(agent.body_idx, far)
-                            self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
-                            self._start_corrective_pivot(agent, close)
-                            self._propagate_moving_tokens()
-                            triangle_found = True
-                            any_active = True
+                # Triangle cleanup must be gated on is_movable: the cleanup
+                # unconditionally removes a bond and corner-pivots the agent,
+                # which can sever the agent's other neighbors when the agent
+                # is an articulator. Skip cleanup for non-movable agents.
+                if self.is_movable(
+                        agent.body_idx,
+                        getattr(self, "_safety_radius", 2)):
+                    for ni_idx in range(len(neighbors)):
+                        for nj_idx in range(ni_idx + 1, len(neighbors)):
+                            a, b = neighbors[ni_idx], neighbors[nj_idx]
+                            if bm[a, b]:
+                                d_a = float(np.linalg.norm(pos[agent.body_idx] - pos[a]))
+                                d_b = float(np.linalg.norm(pos[agent.body_idx] - pos[b]))
+                                if d_a <= d_b:
+                                    close, far = a, b
+                                else:
+                                    close, far = b, a
+                                self.sim.remove_bond(agent.body_idx, far)
+                                self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
+                                self._start_corrective_pivot(agent, close)
+                                self._propagate_moving_tokens()
+                                triangle_found = True
+                                any_active = True
+                                break
+                        if triangle_found:
                             break
-                    if triangle_found:
-                        break
                 if triangle_found:
                     continue
 
@@ -2442,25 +2449,32 @@ class DecentralizedRestructuring:
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
                 triangle_found = False
-                for ni_idx in range(len(neighbors)):
-                    for nj_idx in range(ni_idx + 1, len(neighbors)):
-                        a, b = neighbors[ni_idx], neighbors[nj_idx]
-                        if bm[a, b]:
-                            d_a = float(np.linalg.norm(pos[agent.body_idx] - pos[a]))
-                            d_b = float(np.linalg.norm(pos[agent.body_idx] - pos[b]))
-                            if d_a <= d_b:
-                                close, far = a, b
-                            else:
-                                close, far = b, a
-                            self.sim.remove_bond(agent.body_idx, far)
-                            self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
-                            self._start_corrective_pivot(agent, close)
-                            self._propagate_moving_tokens()
-                            triangle_found = True
-                            any_active = True
+                # Triangle cleanup must be gated on is_movable: the cleanup
+                # unconditionally removes a bond and corner-pivots the agent,
+                # which can sever the agent's other neighbors when the agent
+                # is an articulator. Skip cleanup for non-movable agents.
+                if self.is_movable(
+                        agent.body_idx,
+                        getattr(self, "_safety_radius", 2)):
+                    for ni_idx in range(len(neighbors)):
+                        for nj_idx in range(ni_idx + 1, len(neighbors)):
+                            a, b = neighbors[ni_idx], neighbors[nj_idx]
+                            if bm[a, b]:
+                                d_a = float(np.linalg.norm(pos[agent.body_idx] - pos[a]))
+                                d_b = float(np.linalg.norm(pos[agent.body_idx] - pos[b]))
+                                if d_a <= d_b:
+                                    close, far = a, b
+                                else:
+                                    close, far = b, a
+                                self.sim.remove_bond(agent.body_idx, far)
+                                self._decision_bond_matrix = self.sim.get_bond_matrix().copy()
+                                self._start_corrective_pivot(agent, close)
+                                self._propagate_moving_tokens()
+                                triangle_found = True
+                                any_active = True
+                                break
+                        if triangle_found:
                             break
-                    if triangle_found:
-                        break
                 if triangle_found:
                     continue
 
