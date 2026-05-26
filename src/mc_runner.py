@@ -256,6 +256,53 @@ def _phase2_done(policy, sim) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Active-subgraph component count
+# ---------------------------------------------------------------------------
+
+def _count_active_components(sim, scenario: Scenario) -> tuple:
+    """Count connected components in the active subgraph.
+
+    The active subgraph is the bond graph restricted to non-fault body
+    indices — fault bodies remain physically present in the sim but are
+    excluded from connectivity counts (matching the policy's connectivity
+    semantics). Returns ``(n_components, largest_component_frac)`` where
+    ``largest_component_frac = max_component_size / n_active_modules``;
+    ``(0, 0.0)`` if no active modules exist.
+    """
+    fault_idxs = set(scenario.fault_body_idxs)
+    active_idxs = [
+        scenario.body_indices[mid] for mid in scenario.module_ids
+        if scenario.body_indices[mid] not in fault_idxs
+    ]
+    if not active_idxs:
+        return 0, 0.0
+    bm = sim.get_bond_matrix()
+    active_set = set(active_idxs)
+    seen: Set[int] = set()
+    largest = 0
+    n_comp = 0
+    for start in active_idxs:
+        if start in seen:
+            continue
+        n_comp += 1
+        stack = [start]
+        size = 0
+        while stack:
+            v = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            size += 1
+            for j in np.where(bm[v])[0]:
+                jj = int(j)
+                if jj in active_set and jj not in seen:
+                    stack.append(jj)
+        if size > largest:
+            largest = size
+    return n_comp, largest / len(active_idxs)
+
+
+# ---------------------------------------------------------------------------
 # Phase driver
 # ---------------------------------------------------------------------------
 
@@ -394,6 +441,8 @@ def run_trial(
         adjacent_map=scenario.adjacent_map,
     )
 
+    n_comp_pd, largest_frac_pd = _count_active_components(sim, scenario)
+
     phase1_ticks = _run_phase(
         sim, coag, _phase1_done, dt,
         max_time=0.0, stall_interval=0.0, stall_patience=0,
@@ -409,6 +458,10 @@ def run_trial(
         mid: pos_snap[scenario.body_indices[mid]].copy()
         for mid in scenario.module_ids
     }
+    n_comp_p1, largest_frac_p1 = _count_active_components(sim, scenario)
+
+    n_comp_p2: Optional[int] = None
+    largest_frac_p2: Optional[float] = None
 
     restruct = None
     if phase1_connected:
@@ -454,6 +507,7 @@ def run_trial(
             mid: pos_snap2[scenario.body_indices[mid]].copy()
             for mid in scenario.module_ids
         }
+        n_comp_p2, largest_frac_p2 = _count_active_components(sim, scenario)
 
     if diagnostics_callback is not None:
         diagnostics_callback(
@@ -493,4 +547,10 @@ def run_trial(
         total_moves=total_phase1_moves + total_phase2_moves,
         token_transmissions=0,
         fault_mode=fault_mode,
+        n_components_post_damage=n_comp_pd,
+        largest_component_frac_post_damage=largest_frac_pd,
+        n_components_post_phase1=n_comp_p1,
+        largest_component_frac_post_phase1=largest_frac_p1,
+        n_components_post_phase2=n_comp_p2,
+        largest_component_frac_post_phase2=largest_frac_p2,
     )

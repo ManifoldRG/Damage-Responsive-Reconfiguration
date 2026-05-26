@@ -228,6 +228,56 @@ def _select_faults_inner(
         raise ValueError(f"Unknown fault_mode: {fault_mode}")
 
 
+def _aggregate_component_metrics(
+    meaningful_trials: List["TrialResult"],
+) -> Dict[str, float]:
+    """Compute mean component counts and rejoined-fraction across trials.
+
+    ``rejoined_frac = (n_pd - n_end) / (n_pd - 1)`` — fraction of the
+    ``n_pd - 1`` merge operations needed to fully reconnect that the
+    algorithm actually accomplished. 0.0 = nothing rejoined, 1.0 = fully
+    reconnected. Trials with ``n_pd <= 1`` (fault didn't disconnect) are
+    excluded from the rejoined-frac aggregate. Phase-2 fields default to
+    NaN when no trial ran phase 2.
+    """
+    if not meaningful_trials:
+        nan = float("nan")
+        return dict(
+            mean_n_components_post_damage=nan,
+            mean_n_components_post_phase1=nan,
+            mean_n_components_post_phase2=nan,
+            mean_rejoined_frac_phase1=nan,
+            mean_rejoined_frac_total=nan,
+        )
+    pd_counts = [t.n_components_post_damage for t in meaningful_trials]
+    p1_counts = [t.n_components_post_phase1 for t in meaningful_trials]
+    p2_counts = [t.n_components_post_phase2 for t in meaningful_trials
+                 if t.n_components_post_phase2 is not None]
+    rejoin_p1 = [
+        (t.n_components_post_damage - t.n_components_post_phase1)
+        / (t.n_components_post_damage - 1)
+        for t in meaningful_trials if t.n_components_post_damage > 1
+    ]
+    rejoin_total = [
+        (t.n_components_post_damage - t.n_components_post_phase2)
+        / (t.n_components_post_damage - 1)
+        for t in meaningful_trials
+        if t.n_components_post_damage > 1
+        and t.n_components_post_phase2 is not None
+    ]
+    nan = float("nan")
+    return dict(
+        mean_n_components_post_damage=float(np.mean(pd_counts)),
+        mean_n_components_post_phase1=float(np.mean(p1_counts)),
+        mean_n_components_post_phase2=(
+            float(np.mean(p2_counts)) if p2_counts else nan),
+        mean_rejoined_frac_phase1=(
+            float(np.mean(rejoin_p1)) if rejoin_p1 else nan),
+        mean_rejoined_frac_total=(
+            float(np.mean(rejoin_total)) if rejoin_total else nan),
+    )
+
+
 @dataclass
 class TrialResult:
     """Results from a single Monte Carlo trial."""
@@ -252,6 +302,18 @@ class TrialResult:
 
     # Fault mode metadata
     fault_mode: str = FAULT_MODE_RANDOM
+
+    # Active-subgraph connected-component counts at three snapshots: just
+    # after fault marking (pre-coag), at phase-1 termination, and at
+    # phase-2 termination. ``*_post_phase2`` is None if phase 2 didn't run.
+    # ``largest_component_frac_*`` is the size of the largest component as
+    # a fraction of the active module count.
+    n_components_post_damage: int = 0
+    largest_component_frac_post_damage: float = 1.0
+    n_components_post_phase1: int = 0
+    largest_component_frac_post_phase1: float = 1.0
+    n_components_post_phase2: Optional[int] = None
+    largest_component_frac_post_phase2: Optional[float] = None
 
     # Token selection strategy (ablation study)
     token_strategy: str = "furthest"
@@ -301,6 +363,18 @@ class MonteCarloResults:
 
     # Reconnection rate std
     std_reconnection_rate: float = float('nan')
+
+    # Component-rejoining metrics (averaged across meaningful trials).
+    # ``rejoined_frac_phase1 = (n_pd - n_end_p1) / (n_pd - 1)``: fraction
+    # of the n_pd-1 merges required to fully reconnect that the algorithm
+    # actually accomplished. 0.0 = nothing rejoined, 1.0 = fully connected.
+    # Trials with n_pd <= 1 are excluded from this average. The mean
+    # component counts at each snapshot are reported alongside.
+    mean_n_components_post_damage: float = float('nan')
+    mean_n_components_post_phase1: float = float('nan')
+    mean_n_components_post_phase2: float = float('nan')
+    mean_rejoined_frac_phase1: float = float('nan')
+    mean_rejoined_frac_total: float = float('nan')
 
     # Token selection strategy (ablation study)
     token_strategy: str = "furthest"
@@ -652,6 +726,8 @@ def run_monte_carlo(
         std_tokens = float('nan')
         std_reconn = float('nan')
 
+    comp_metrics = _aggregate_component_metrics(meaningful_trials)
+
     return MonteCarloResults(
         n_modules=n_modules,
         n_faults=n_faults,
@@ -675,7 +751,8 @@ def run_monte_carlo(
         token_strategy=token_strategy,
         safety_radius=safety_radius,
         reconstruction_method=restructuring_method,
-        trials=meaningful_trials  # Only include meaningful trials in raw data
+        trials=meaningful_trials,  # Only include meaningful trials in raw data
+        **comp_metrics,
     )
 
 

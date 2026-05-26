@@ -474,6 +474,9 @@ def run_bullet_monte_carlo(
         std_tokens = float("nan")
         std_reconn = float("nan")
 
+    from src.monte_carlo import _aggregate_component_metrics
+    comp_metrics = _aggregate_component_metrics(meaningful_trials)
+
     return MonteCarloResults(
         n_modules=n_modules,
         n_faults=n_faults,
@@ -495,6 +498,7 @@ def run_bullet_monte_carlo(
         std_token_transmissions=std_tokens,
         std_reconnection_rate=std_reconn,
         trials=meaningful_trials,
+        **comp_metrics,
     )
 
 
@@ -512,6 +516,11 @@ SUMMARY_HEADERS = [
     "mean_steps_to_reconnection", "std_steps_to_reconnection",
     "mean_total_moves", "std_total_moves",
     "mean_token_transmissions", "std_token_transmissions",
+    "mean_n_components_post_damage",
+    "mean_n_components_post_phase1",
+    "mean_n_components_post_phase2",
+    "mean_rejoined_frac_phase1",
+    "mean_rejoined_frac_total",
     "fault_mode", "fault_pct",
     "token_strategy", "safety_radius", "restructuring_method",
 ]
@@ -521,7 +530,13 @@ TRIALS_HEADERS = [
     "restored", "phase1_moves", "phase2_moves",
     "shape_difference", "shape_difference_phase1",
     "phase1_iterations", "total_moves",
-    "token_transmissions", "fault_mode",
+    "token_transmissions",
+    "n_components_post_damage", "n_components_post_phase1",
+    "n_components_post_phase2",
+    "largest_component_frac_post_damage",
+    "largest_component_frac_post_phase1",
+    "largest_component_frac_post_phase2",
+    "fault_mode",
     "token_strategy", "safety_radius", "restructuring_method",
 ]
 
@@ -1032,6 +1047,11 @@ def main():
                     f"{result.std_total_moves:.2f}",
                     f"{result.mean_token_transmissions:.2f}",
                     f"{result.std_token_transmissions:.2f}",
+                    f"{result.mean_n_components_post_damage:.4f}",
+                    f"{result.mean_n_components_post_phase1:.4f}",
+                    f"{result.mean_n_components_post_phase2:.4f}",
+                    f"{result.mean_rejoined_frac_phase1:.4f}",
+                    f"{result.mean_rejoined_frac_total:.4f}",
                     fault_mode,
                     fault_pct_label,
                     strat,
@@ -1049,6 +1069,14 @@ def main():
                         trial.shape_difference_phase1 if trial.shape_difference_phase1 is not None else "",
                         trial.phase1_iterations, trial.total_moves,
                         trial.token_transmissions,
+                        trial.n_components_post_damage,
+                        trial.n_components_post_phase1,
+                        trial.n_components_post_phase2
+                        if trial.n_components_post_phase2 is not None else "",
+                        f"{trial.largest_component_frac_post_damage:.4f}",
+                        f"{trial.largest_component_frac_post_phase1:.4f}",
+                        f"{trial.largest_component_frac_post_phase2:.4f}"
+                        if trial.largest_component_frac_post_phase2 is not None else "",
                         trial.fault_mode,
                         strat,
                         rad,
