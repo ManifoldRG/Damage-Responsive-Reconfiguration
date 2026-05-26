@@ -181,15 +181,23 @@ class ModuleAgent:
     wait_until: float = 0.0                            # sim time when WAITING expires
     token_hold_until: float = 0.0                        # sim time: stay IDLE before acting on token
     moving_token_received_tick: int = -999               # tick when last "moving" token was received
-    # Action points budget. Each module starts with INITIAL_ACTION_POINTS
-    # at the beginning of the phase and spends one per "action": a
-    # successful pivot completion OR a direction-token forward to neighbors.
-    # When the budget hits zero, the module drops any further incoming
-    # tokens and stays IDLE for the rest of the phase. This is the
-    # decentralized phase-termination mechanism: total work per phase is at
-    # most N × INITIAL_ACTION_POINTS events.
+    # Two decoupled budgets, reset per phase by the runner:
+    #   action_points  — MOTION budget. One spent per pivot (success,
+    #     retarget, or giveup). Init = INITIAL_ACTION_POINTS.
+    #   forward_points — MESSAGING budget. One spent per token forward.
+    #     Init = INITIAL_ACTION_POINTS * FORWARD_POINTS_MULTIPLIER (100x),
+    #     so communication does not starve motion (the prior shared-budget
+    #     design let forwarding consume the entire cap at scale).
+    # An agent engages a token while EITHER budget remains; it moves only
+    # while action_points > 0 and forwards only while forward_points > 0.
     action_points: int = 10
+    forward_points: int = 1000
     completed_moves: int = 0                             # diagnostic: # of successful pivots (NOT a cap)
+    # Usage accounting (diagnostic). ``ap_spent_pivots`` counts motion
+    # points spent (1 per pivot/retarget/giveup); ``ap_spent_forwards``
+    # counts messaging points spent (1 per forward). Reset between phases.
+    ap_spent_pivots: float = 0.0
+    ap_spent_forwards: float = 0.0
     # Legacy field, no longer used as a cap (the action_points budget is
     # the unified cap mechanism). Kept for back-compat with dump readers.
     consecutive_pick_failures: int = 0
@@ -267,17 +275,21 @@ class DecentralizedCoagulation:
     # Probability (per tick) of accepting a random safe move when no
     # distance-reducing move exists.  Set > 0 to break symmetric deadlocks
     # (e.g. tie-fighter degeneracy on a center-fault line).
-    TEMPERATURE: float = 0.1  # per-tick prob of random exploration move
+    TEMPERATURE: float = 0.5  # per-tick prob of random exploration move
 
-    # Per-module action-points budget at phase start. Each agent spends 1
-    # point per successful pivot OR per direction-token forward. When the
-    # budget hits zero the agent drops incoming tokens and stays IDLE.
-    # This unifies the per-module work bound across active movers (which
-    # spend points on pivots) and interior modules (which spend points on
-    # token forwards): total work per phase ≤ N × INITIAL_ACTION_POINTS.
-    INITIAL_ACTION_POINTS: int = 10
+    # Per-module MOTION budget at phase start (1 point per pivot). Tuned
+    # default 5: empirically agents use ~1.2-1.5 motion points regardless
+    # of cap, so 5 never binds and keeps phases short. Forwards draw from
+    # the separate forward_points pool, not this one.
+    INITIAL_ACTION_POINTS: int = 5
     # Back-compat alias for the older CLI/config name.
-    MAX_MOVES_PER_MODULE: int = 10
+    MAX_MOVES_PER_MODULE: int = 5
+    # Messaging budget = FORWARD_POINTS_MULTIPLIER × motion budget. Token
+    # forwards draw from this separate pool so communication never starves
+    # the motion budget (see ModuleAgent.forward_points). Kept modest so
+    # the phase still terminates promptly once motion is exhausted —
+    # too-large values let agents churn forwards long after they can move.
+    FORWARD_POINTS_MULTIPLIER: int = 10
 
     # If True, pick_target rejects (axis, target_cell) pairs the agent has
     # already visited via a successful pivot this phase. Prevents
@@ -323,6 +335,8 @@ class DecentralizedCoagulation:
                 module_id=mid,
                 body_idx=body_indices[mid],
                 action_points=self.INITIAL_ACTION_POINTS,
+                forward_points=(self.INITIAL_ACTION_POINTS
+                                * self.FORWARD_POINTS_MULTIPLIER),
             )
 
         # Reverse mapping: body_idx -> module_id
@@ -332,7 +346,7 @@ class DecentralizedCoagulation:
         self._fault_adjacent: Set[str] = set()
         self._fault_directions: Dict[str, np.ndarray] = {}
         self._last_token_gen_time: float = -999.0
-        self.TOKEN_GEN_INTERVAL = 1.0  # re-emit tokens every second
+        self.TOKEN_GEN_INTERVAL = 10.0  # re-emit tokens every 10 s (tuned)
 
         # Statistics
         self.total_moves = 0
@@ -498,6 +512,16 @@ class DecentralizedCoagulation:
                 continue
             agent = self.agents[mid]
             if agent.state != ModuleState.IDLE:
+                continue
+            # Only seed a token if the module can still propagate it.
+            # A fault-adjacent module almost never makes a productive
+            # self-move (it is already next to the fault); its role is to
+            # SEED the wavefront for movers elsewhere, which requires
+            # forwarding. Once its forward budget is spent, generating
+            # self-tokens just creates non-terminating churn (the seed can
+            # neither move nor relay). Gating here bounds total tokens to
+            # ~ sum of forward budgets, guaranteeing the phase terminates.
+            if agent.forward_points <= 0:
                 continue
             if adj_map is not None and mid in adj_map:
                 f_idx = adj_map[mid]
@@ -1050,20 +1074,22 @@ class DecentralizedCoagulation:
                 continue
 
             if agent.state == ModuleState.IDLE:
-                # Action-points budget: spent on successful pivots and on
-                # direction-token forwards. Once depleted the agent stays
-                # IDLE forever for this phase. Decentralized termination.
-                if agent.action_points <= 0:
+                # Skip entirely only when BOTH budgets are spent — a
+                # motion-exhausted agent can still relay tokens, so it must
+                # fall through to the token-consumption logic below.
+                if agent.action_points <= 0 and agent.forward_points <= 0:
                     continue
                 neighbors = self._decision_graph_neighbors(agent.body_idx)
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
                 triangle_found = False
-                # Triangle cleanup must be gated on is_movable: the cleanup
+                # Triangle cleanup is a corrective pivot (motion), so it is
+                # gated on motion budget AND is_movable: the cleanup
                 # unconditionally removes a bond and corner-pivots the agent,
                 # which can sever the agent's other neighbors when the agent
-                # is an articulator. Skip cleanup for non-movable agents.
-                if self.is_movable(
+                # is an articulator. Skip cleanup for non-movable / motion-
+                # exhausted agents.
+                if agent.action_points > 0 and self.is_movable(
                         agent.body_idx,
                         getattr(self, "_safety_radius", 2)):
                     for ni_idx in range(len(neighbors)):
@@ -1164,6 +1190,7 @@ class DecentralizedCoagulation:
                         # (stop_pivot + IDLE).
                         if self._retarget_to_nearest_empty_cell(agent):
                             agent.action_points -= 1
+                            agent.ap_spent_pivots += 1.0
                             self.reversal_count = (
                                 getattr(self, "reversal_count", 0) + 1)
                             any_active = True
@@ -1174,6 +1201,7 @@ class DecentralizedCoagulation:
                                 "collided" if collided else "timed out")
                         else:
                             agent.action_points -= 1
+                            agent.ap_spent_pivots += 1.0
                             self.sim.stop_pivot(agent.body_idx)
                             self._reconnect_bonds(agent.body_idx)
                             self._decision_bond_matrix = (
@@ -1224,6 +1252,7 @@ class DecentralizedCoagulation:
                         agent.retarget_count = 0
                         agent.completed_moves += 1
                         agent.action_points -= 1
+                        agent.ap_spent_pivots += 1.0
                         self.successful_moves += 1
                         logger.info(
                             "Module {} pivot complete (ap left: {})",
@@ -1349,17 +1378,21 @@ class DecentralizedCoagulation:
             if agent.state == ModuleState.PROCESSING:
                 # Wait for processing delay
                 if self.sim.sim_time >= agent.process_ready_time:
-                    self._forward_token(agent)
-                    agent.action_points -= self.FORWARD_AP_COST
+                    if agent.forward_points > 0:
+                        self._forward_token(agent)
+                        agent.forward_points -= 1
+                        agent.ap_spent_forwards += 1.0
                     agent.state = ModuleState.IDLE
                     agent.token = None
                 else:
                     any_active = True
                 continue
 
-            # IDLE state: check for incoming tokens. Skip if the agent has
-            # spent its action-points budget.
-            if agent.incoming_tokens and agent.action_points > 0:
+            # IDLE state: engage a token while EITHER budget remains —
+            # motion (to pivot) or messaging (to relay). Only when both are
+            # exhausted does the agent drop tokens and go quiet.
+            if agent.incoming_tokens and (
+                    agent.action_points > 0 or agent.forward_points > 0):
                 best = min(agent.incoming_tokens,
                            key=lambda t: np.linalg.norm(t.direction))
                 agent.token = best
@@ -1367,16 +1400,18 @@ class DecentralizedCoagulation:
                 agent.token_hold_until = self.sim.sim_time + 1.0
                 agent.state = ModuleState.HAS_TOKEN
             elif agent.incoming_tokens:
-                # Budget exhausted — drop tokens so the agent no longer
-                # cycles through HAS_TOKEN/PROCESSING.
+                # Both budgets exhausted — drop tokens so the agent no
+                # longer cycles through HAS_TOKEN/PROCESSING.
                 agent.incoming_tokens.clear()
 
             if agent.state == ModuleState.HAS_TOKEN:
                 if self.sim.sim_time < agent.token_hold_until:
                     any_active = True
                     continue
-                if not self.is_movable(agent.body_idx):
-                    # Not safe to move -- forward the token instead
+                if (not self.is_movable(agent.body_idx)
+                        or agent.action_points <= 0):
+                    # Not safe to move, or motion budget exhausted --
+                    # forward the token instead (uses the messaging budget).
                     agent.state = ModuleState.PROCESSING
                     agent.process_ready_time = (self.sim.sim_time
                                                 + self.TOKEN_PROCESS_DELAY)
@@ -2043,8 +2078,9 @@ class DecentralizedRestructuring:
     # See DecentralizedCoagulation.INITIAL_ACTION_POINTS — same semantics
     # in phase 2. Displacement-based restructuring usually retraces within
     # this budget; token-based restructuring respects the same cap.
-    INITIAL_ACTION_POINTS: int = 10
-    MAX_MOVES_PER_MODULE: int = 10  # back-compat alias
+    INITIAL_ACTION_POINTS: int = 5
+    MAX_MOVES_PER_MODULE: int = 5  # back-compat alias
+    FORWARD_POINTS_MULTIPLIER: int = 10
     MAX_RETARGETS_PER_PIVOT: int = 10
     USE_POSITION_HISTORY: bool = True
 
@@ -2097,6 +2133,8 @@ class DecentralizedRestructuring:
                 module_id=mid,
                 body_idx=body_indices[mid],
                 action_points=self.INITIAL_ACTION_POINTS,
+                forward_points=(self.INITIAL_ACTION_POINTS
+                                * self.FORWARD_POINTS_MULTIPLIER),
             )
 
         self._idx_to_mid: Dict[int, str] = {v: k for k, v in body_indices.items()}
@@ -2440,20 +2478,22 @@ class DecentralizedRestructuring:
                 continue
 
             if agent.state == ModuleState.IDLE:
-                # Action-points budget: spent on successful pivots and on
-                # direction-token forwards. Once depleted the agent stays
-                # IDLE forever for this phase. Decentralized termination.
-                if agent.action_points <= 0:
+                # Skip entirely only when BOTH budgets are spent — a
+                # motion-exhausted agent can still relay tokens, so it must
+                # fall through to the token-consumption logic below.
+                if agent.action_points <= 0 and agent.forward_points <= 0:
                     continue
                 neighbors = self._decision_graph_neighbors(agent.body_idx)
                 bm = self._decision_bond_matrix
                 pos = self.sim.get_positions()
                 triangle_found = False
-                # Triangle cleanup must be gated on is_movable: the cleanup
+                # Triangle cleanup is a corrective pivot (motion), so it is
+                # gated on motion budget AND is_movable: the cleanup
                 # unconditionally removes a bond and corner-pivots the agent,
                 # which can sever the agent's other neighbors when the agent
-                # is an articulator. Skip cleanup for non-movable agents.
-                if self.is_movable(
+                # is an articulator. Skip cleanup for non-movable / motion-
+                # exhausted agents.
+                if agent.action_points > 0 and self.is_movable(
                         agent.body_idx,
                         getattr(self, "_safety_radius", 2)):
                     for ni_idx in range(len(neighbors)):
@@ -2543,6 +2583,7 @@ class DecentralizedRestructuring:
                         # tether. See coag copy for rationale.
                         if self._retarget_to_nearest_empty_cell(agent):
                             agent.action_points -= 1
+                            agent.ap_spent_pivots += 1.0
                             self.reversal_count = (
                                 getattr(self, "reversal_count", 0) + 1)
                             any_active = True
@@ -2552,6 +2593,7 @@ class DecentralizedRestructuring:
                                 "collided" if collided else "timed out")
                         else:
                             agent.action_points -= 1
+                            agent.ap_spent_pivots += 1.0
                             self.sim.stop_pivot(agent.body_idx)
                             self._reconnect_bonds(agent.body_idx)
                             self._decision_bond_matrix = (
@@ -2600,6 +2642,7 @@ class DecentralizedRestructuring:
                         agent.retarget_count = 0
                         agent.completed_moves += 1
                         agent.action_points -= 1
+                        agent.ap_spent_pivots += 1.0
                         self.successful_moves += 1
                         logger.info(
                             "Module {} pivot complete (phase 2, ap left: {})",
@@ -2724,15 +2767,18 @@ class DecentralizedRestructuring:
 
             if agent.state == ModuleState.PROCESSING:
                 if self.sim.sim_time >= agent.process_ready_time:
-                    self._forward_token(agent)
-                    agent.action_points -= self.FORWARD_AP_COST
+                    if agent.forward_points > 0:
+                        self._forward_token(agent)
+                        agent.forward_points -= 1
+                        agent.ap_spent_forwards += 1.0
                     agent.state = ModuleState.IDLE
                     agent.token = None
                 else:
                     any_active = True
                 continue
 
-            if agent.incoming_tokens and agent.action_points > 0:
+            if agent.incoming_tokens and (
+                    agent.action_points > 0 or agent.forward_points > 0):
                 if self.token_strategy == "nearest":
                     best = min(agent.incoming_tokens,
                                key=lambda t: np.linalg.norm(t.direction))
@@ -2746,14 +2792,15 @@ class DecentralizedRestructuring:
                 agent.token_hold_until = self.sim.sim_time + 1.0
                 agent.state = ModuleState.HAS_TOKEN
             elif agent.incoming_tokens:
-                # Budget exhausted — drop incoming tokens.
+                # Both budgets exhausted — drop incoming tokens.
                 agent.incoming_tokens.clear()
 
             if agent.state == ModuleState.HAS_TOKEN:
                 if self.sim.sim_time < agent.token_hold_until:
                     any_active = True
                     continue
-                if not self.is_movable(agent.body_idx):
+                if (not self.is_movable(agent.body_idx)
+                        or agent.action_points <= 0):
                     agent.state = ModuleState.PROCESSING
                     agent.process_ready_time = (self.sim.sim_time
                                                 + self.TOKEN_PROCESS_DELAY)

@@ -226,26 +226,39 @@ IDLE_OR_CAPPED_MIN_SIM_TIME = 20.0
 def _all_idle_or_capped(policy) -> bool:
     """True if every agent is "done" for the phase.
 
-    Done := action_points exhausted (``<= 0``), or IDLE with no tokens.
-    Any other state (HAS_TOKEN, PIVOTING, REVERSING, WAITING, PROCESSING)
-    is still active and blocks termination — the agent is mid-cycle and
-    will either burn an action point or complete a pivot soon.
+    With decoupled budgets an agent is "done" when it can no longer do
+    useful work. The cases are:
+      - both budgets exhausted (action_points<=0 AND forward_points<=0);
+      - IDLE with no pending tokens;
+      - holding/queuing a token it cannot act on: it has no forward budget
+        to relay it AND it cannot move it (no motion budget, or the
+        criticality test rejects it). Such a token is dropped next tick.
+    Any in-flight state (PIVOTING/REVERSING/WAITING) blocks termination.
 
-    Guard: the check is suppressed for the first
-    ``IDLE_OR_CAPPED_MIN_SIM_TIME`` seconds of sim time so tokens have
-    time to propagate through the structure before the phase can be
-    declared "done".
+    Note: the old predicate keyed solely on action_points (the unified
+    budget). Under the split, a fault-adjacent immovable module never
+    spends its motion budget yet keeps receiving self-generated tokens,
+    so keying on action_points alone made the phase never terminate.
+
+    Guard: suppressed for the first ``IDLE_OR_CAPPED_MIN_SIM_TIME`` sim
+    seconds so tokens can propagate before "done" can be declared.
     """
     if policy.sim.sim_time < IDLE_OR_CAPPED_MIN_SIM_TIME:
         return False
 
+    sr = getattr(policy, "_safety_radius", 2)
     for a in policy.agents.values():
-        if a.action_points <= 0:
+        if a.action_points <= 0 and a.forward_points <= 0:
             continue
         if a.state != ModuleState.IDLE:
             return False
         if a.incoming_tokens or a.token is not None:
-            return False
+            # Active only if it can actually act on the token.
+            if a.forward_points > 0:
+                return False
+            if a.action_points > 0 and policy.is_movable(a.body_idx, sr):
+                return False
+            # else: token will be dropped — agent is effectively done.
     return True
 
 
@@ -263,6 +276,38 @@ def _phase2_done(policy, sim) -> bool:
     if _all_idle_or_capped(policy):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Action-point usage snapshot
+# ---------------------------------------------------------------------------
+
+def _ap_usage_snapshot(policy) -> Dict[str, float]:
+    """Aggregate per-agent AP spend across all agents in the current phase.
+
+    Returns mean/max of ``ap_spent_pivots`` and ``ap_spent_forwards``, plus
+    mean/max of total AP spent. Excludes the (presumed-isolated) zero
+    counters from agents that never received a token, since including them
+    would dilute the means with structural non-participants.
+    """
+    if not policy.agents:
+        nan = float("nan")
+        return dict(
+            mean_ap_pivots=nan, max_ap_pivots=nan,
+            mean_ap_forwards=nan, max_ap_forwards=nan,
+            mean_ap_total=nan, max_ap_total=nan,
+        )
+    pivs = [a.ap_spent_pivots for a in policy.agents.values()]
+    fwds = [a.ap_spent_forwards for a in policy.agents.values()]
+    tots = [p + f for p, f in zip(pivs, fwds)]
+    return dict(
+        mean_ap_pivots=float(np.mean(pivs)),
+        max_ap_pivots=float(np.max(pivs)),
+        mean_ap_forwards=float(np.mean(fwds)),
+        max_ap_forwards=float(np.max(fwds)),
+        mean_ap_total=float(np.mean(tots)),
+        max_ap_total=float(np.max(tots)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +507,10 @@ def run_trial(
     coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
     coag.INITIAL_ACTION_POINTS = int(max_moves_per_module)
     coag.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+    _fwd_pts = int(max_moves_per_module) * coag.FORWARD_POINTS_MULTIPLIER
     for _agent in coag.agents.values():
         _agent.action_points = int(max_moves_per_module)
+        _agent.forward_points = _fwd_pts
     coag.USE_FLOOD_ECHO = use_flood_echo
     coag.USE_POSITION_HISTORY = bool(use_position_history)
     coag.FORWARD_AP_COST = forward_ap_cost
@@ -491,9 +538,11 @@ def run_trial(
         for mid in scenario.module_ids
     }
     n_comp_p1, largest_frac_p1 = _count_active_components(sim, scenario)
+    ap_p1 = _ap_usage_snapshot(coag)
 
     n_comp_p2: Optional[int] = None
     largest_frac_p2: Optional[float] = None
+    ap_p2: Optional[Dict[str, float]] = None
 
     restruct = None
     if phase1_connected:
@@ -523,8 +572,11 @@ def run_trial(
         restruct.FORWARD_AP_COST = forward_ap_cost
         restruct.INITIAL_ACTION_POINTS = int(max_moves_per_module)
         restruct.MAX_MOVES_PER_MODULE = int(max_moves_per_module)
+        _fwd_pts_r = (int(max_moves_per_module)
+                      * restruct.FORWARD_POINTS_MULTIPLIER)
         for _agent in restruct.agents.values():
             _agent.action_points = int(max_moves_per_module)
+            _agent.forward_points = _fwd_pts_r
         restruct.generate_initial_tokens()
 
         _run_phase(
@@ -540,6 +592,7 @@ def run_trial(
             for mid in scenario.module_ids
         }
         n_comp_p2, largest_frac_p2 = _count_active_components(sim, scenario)
+        ap_p2 = _ap_usage_snapshot(restruct)
 
     if diagnostics_callback is not None:
         diagnostics_callback(
@@ -585,4 +638,16 @@ def run_trial(
         largest_component_frac_post_phase1=largest_frac_p1,
         n_components_post_phase2=n_comp_p2,
         largest_component_frac_post_phase2=largest_frac_p2,
+        ap_phase1_mean_pivots=ap_p1["mean_ap_pivots"],
+        ap_phase1_max_pivots=ap_p1["max_ap_pivots"],
+        ap_phase1_mean_forwards=ap_p1["mean_ap_forwards"],
+        ap_phase1_max_forwards=ap_p1["max_ap_forwards"],
+        ap_phase1_mean_total=ap_p1["mean_ap_total"],
+        ap_phase1_max_total=ap_p1["max_ap_total"],
+        ap_phase2_mean_pivots=ap_p2["mean_ap_pivots"] if ap_p2 else None,
+        ap_phase2_max_pivots=ap_p2["max_ap_pivots"] if ap_p2 else None,
+        ap_phase2_mean_forwards=ap_p2["mean_ap_forwards"] if ap_p2 else None,
+        ap_phase2_max_forwards=ap_p2["max_ap_forwards"] if ap_p2 else None,
+        ap_phase2_mean_total=ap_p2["mean_ap_total"] if ap_p2 else None,
+        ap_phase2_max_total=ap_p2["max_ap_total"] if ap_p2 else None,
     )

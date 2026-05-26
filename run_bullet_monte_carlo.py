@@ -226,7 +226,7 @@ def run_single_bullet_trial(
     config_mode: str = CONFIG_MODE_RANDOM,
     fault_mode: str = FAULT_MODE_RANDOM,
     *,
-    temperature: float = 0.1,
+    temperature: float = 0.5,
     pivot_exclusion_radius: int = 4,
     max_phase_time: float = 180.0,
     stall_interval: float = 10.0,
@@ -238,9 +238,9 @@ def run_single_bullet_trial(
     module_shape: str = "sphere",
     max_pivot_time: Optional[float] = None,
     use_flood_echo: bool = True,
-    token_gen_interval: float = 0.1,
+    token_gen_interval: float = 10.0,
     dump_diagnostics_dir: Optional[str] = None,
-    max_moves_per_module: int = 10,
+    max_moves_per_module: int = 5,
     use_position_history: bool = True,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
@@ -525,6 +525,12 @@ SUMMARY_HEADERS = [
     "mean_n_components_post_phase2",
     "mean_rejoined_frac_phase1",
     "mean_rejoined_frac_total",
+    "mean_ap_phase1_mean_total",
+    "mean_ap_phase1_max_total",
+    "mean_ap_phase1_mean_pivots",
+    "mean_ap_phase1_mean_forwards",
+    "mean_ap_phase2_mean_total",
+    "mean_ap_phase2_max_total",
     "fault_mode", "fault_pct",
     "token_strategy", "safety_radius", "restructuring_method",
 ]
@@ -703,7 +709,7 @@ def main():
                         help="Sweep token selection strategies: furthest, nearest, random")
     parser.add_argument("--ablation-hops", action="store_true",
                         help="Sweep safety radii: 2, 3, 4 for is_movable() check")
-    parser.add_argument("--temperature", type=float, default=0.1,
+    parser.add_argument("--temperature", type=float, default=0.5,
                         help="Coagulation temperature (default: 0.01)")
     parser.add_argument("--pivot-radius", type=int, default=4,
                         help="Pivot exclusion radius (default: 4)")
@@ -711,7 +717,7 @@ def main():
                         help="Max sim-seconds per phase (default: 180)")
     parser.add_argument("--stall-interval", type=float, default=10.0,
                         help="Seconds between stall checks (default: 10)")
-    parser.add_argument("--max-moves-per-module", type=int, default=10,
+    parser.add_argument("--max-moves-per-module", type=int, default=5,
                         help="Per-module cap on successful pivots per phase. "
                              "Once a module reaches this count it stops "
                              "initiating new pivots for the remainder of the "
@@ -747,7 +753,7 @@ def main():
                         help="Disable flood/echo component-discovery protocol. "
                              "Fault-adjacent modules emit tokens unconditionally "
                              "(matches non-bullet MC behavior). Diagnostic.")
-    parser.add_argument("--token-gen-interval", type=float, default=0.1,
+    parser.add_argument("--token-gen-interval", type=float, default=10.0,
                         help="Seconds of sim time between consecutive token "
                              "emissions per fault-adjacent module (default: 0.1, "
                              "matching the policy tick dt). Lower = more "
@@ -1056,6 +1062,12 @@ def main():
                     f"{result.mean_n_components_post_phase2:.4f}",
                     f"{result.mean_rejoined_frac_phase1:.4f}",
                     f"{result.mean_rejoined_frac_total:.4f}",
+                    f"{result.mean_ap_phase1_mean_total:.4f}",
+                    f"{result.mean_ap_phase1_max_total:.4f}",
+                    f"{result.mean_ap_phase1_mean_pivots:.4f}",
+                    f"{result.mean_ap_phase1_mean_forwards:.4f}",
+                    f"{result.mean_ap_phase2_mean_total:.4f}",
+                    f"{result.mean_ap_phase2_max_total:.4f}",
                     fault_mode,
                     fault_pct_label,
                     strat,

@@ -266,6 +266,10 @@ def _aggregate_component_metrics(
         and t.n_components_post_phase2 is not None
     ]
     nan = float("nan")
+    ap_p2_means_total = [t.ap_phase2_mean_total for t in meaningful_trials
+                         if t.ap_phase2_mean_total is not None]
+    ap_p2_maxes_total = [t.ap_phase2_max_total for t in meaningful_trials
+                         if t.ap_phase2_max_total is not None]
     return dict(
         mean_n_components_post_damage=float(np.mean(pd_counts)),
         mean_n_components_post_phase1=float(np.mean(p1_counts)),
@@ -275,6 +279,18 @@ def _aggregate_component_metrics(
             float(np.mean(rejoin_p1)) if rejoin_p1 else nan),
         mean_rejoined_frac_total=(
             float(np.mean(rejoin_total)) if rejoin_total else nan),
+        mean_ap_phase1_mean_total=float(np.mean(
+            [t.ap_phase1_mean_total for t in meaningful_trials])),
+        mean_ap_phase1_max_total=float(np.mean(
+            [t.ap_phase1_max_total for t in meaningful_trials])),
+        mean_ap_phase1_mean_pivots=float(np.mean(
+            [t.ap_phase1_mean_pivots for t in meaningful_trials])),
+        mean_ap_phase1_mean_forwards=float(np.mean(
+            [t.ap_phase1_mean_forwards for t in meaningful_trials])),
+        mean_ap_phase2_mean_total=(
+            float(np.mean(ap_p2_means_total)) if ap_p2_means_total else nan),
+        mean_ap_phase2_max_total=(
+            float(np.mean(ap_p2_maxes_total)) if ap_p2_maxes_total else nan),
     )
 
 
@@ -314,6 +330,24 @@ class TrialResult:
     largest_component_frac_post_phase1: float = 1.0
     n_components_post_phase2: Optional[int] = None
     largest_component_frac_post_phase2: Optional[float] = None
+
+    # Action-point usage at the end of each phase. ``mean_*`` is the
+    # average AP-spend across all active agents; ``max_*`` is the worst-
+    # case single-agent spend (useful for deciding if INITIAL_ACTION_POINTS
+    # is binding). Forwards cost 0.1 AP each; pivots cost 1.0 each.
+    # Phase-2 fields are None if phase 2 didn't run.
+    ap_phase1_mean_pivots: float = 0.0
+    ap_phase1_max_pivots: float = 0.0
+    ap_phase1_mean_forwards: float = 0.0
+    ap_phase1_max_forwards: float = 0.0
+    ap_phase1_mean_total: float = 0.0
+    ap_phase1_max_total: float = 0.0
+    ap_phase2_mean_pivots: Optional[float] = None
+    ap_phase2_max_pivots: Optional[float] = None
+    ap_phase2_mean_forwards: Optional[float] = None
+    ap_phase2_max_forwards: Optional[float] = None
+    ap_phase2_mean_total: Optional[float] = None
+    ap_phase2_max_total: Optional[float] = None
 
     # Token selection strategy (ablation study)
     token_strategy: str = "furthest"
@@ -375,6 +409,16 @@ class MonteCarloResults:
     mean_n_components_post_phase2: float = float('nan')
     mean_rejoined_frac_phase1: float = float('nan')
     mean_rejoined_frac_total: float = float('nan')
+
+    # Action-point usage aggregates (averaged across meaningful trials).
+    # mean_* averages the per-trial mean AP spent across agents.
+    # max_* averages the per-trial maximum AP spent by any one agent.
+    mean_ap_phase1_mean_total: float = float('nan')
+    mean_ap_phase1_max_total: float = float('nan')
+    mean_ap_phase1_mean_pivots: float = float('nan')
+    mean_ap_phase1_mean_forwards: float = float('nan')
+    mean_ap_phase2_mean_total: float = float('nan')
+    mean_ap_phase2_max_total: float = float('nan')
 
     # Token selection strategy (ablation study)
     token_strategy: str = "furthest"
@@ -501,8 +545,8 @@ def run_single_graph_trial(
     token_strategy: str = "furthest",
     safety_radius: int = 2,
     use_flood_echo: bool = False,
-    token_gen_interval: float = 0.1,
-    max_moves_per_module: int = 10,
+    token_gen_interval: float = 10.0,
+    max_moves_per_module: int = 5,
     use_position_history: bool = True,
 ) -> TrialResult:
     """Execute one graph-based Monte Carlo trial with the decentralized agent
@@ -599,8 +643,8 @@ def run_monte_carlo(
     pivot_exclusion_radius: int = 4,
     dt: float = 0.1,
     use_flood_echo: bool = False,
-    token_gen_interval: float = 0.1,
-    max_moves_per_module: int = 10,
+    token_gen_interval: float = 10.0,
+    max_moves_per_module: int = 5,
     use_position_history: bool = True,
 ) -> MonteCarloResults:
     """Run Monte Carlo simulation using ``GraphSimulator`` + the

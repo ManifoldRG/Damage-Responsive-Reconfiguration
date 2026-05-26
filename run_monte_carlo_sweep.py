@@ -53,6 +53,12 @@ SUMMARY_HEADERS = [
     'mean_n_components_post_phase2',
     'mean_rejoined_frac_phase1',
     'mean_rejoined_frac_total',
+    'mean_ap_phase1_mean_total',
+    'mean_ap_phase1_max_total',
+    'mean_ap_phase1_mean_pivots',
+    'mean_ap_phase1_mean_forwards',
+    'mean_ap_phase2_mean_total',
+    'mean_ap_phase2_max_total',
     'fault_mode', 'fault_pct', 'token_strategy', 'safety_radius',
     'restructuring_method',
 ]
@@ -230,7 +236,7 @@ def main():
              "fault-adjacent modules in many fault topologies)"
     )
     parser.add_argument(
-        "--max-moves-per-module", type=int, default=10,
+        "--max-moves-per-module", type=int, default=5,
         help="Per-agent action-point budget (default: 10). Each successful "
              "pivot, retarget, or give-up consumes 1 AP; token forwards cost "
              "1/10 AP. Total work is bounded decentrally by this."
@@ -242,7 +248,7 @@ def main():
              "is enabled (which sweeps {2,3,4})."
     )
     parser.add_argument(
-        "--token-gen-interval", type=float, default=0.1,
+        "--token-gen-interval", type=float, default=10.0,
         help="Min sim-time interval between consecutive token generations on "
              "a fault-adjacent module (default: 0.1 s)"
     )
@@ -295,9 +301,9 @@ def main():
             config.get('reconstruction_method', 'displacement'))
         temperature = config.get('temperature', 0.5)
         use_flood_echo = config.get('use_flood_echo', False)
-        max_moves_per_module = config.get('max_moves_per_module', 10)
+        max_moves_per_module = config.get('max_moves_per_module', 5)
         safety_radius_cfg = config.get('safety_radius', 2)
-        token_gen_interval = config.get('token_gen_interval', 0.1)
+        token_gen_interval = config.get('token_gen_interval', 10.0)
         pivot_radius = config.get('pivot_radius', 4)
         use_position_history = config.get('use_position_history', True)
         output_dir = resume_dir
@@ -544,6 +550,12 @@ def main():
                     f'{result.mean_n_components_post_phase2:.4f}',
                     f'{result.mean_rejoined_frac_phase1:.4f}',
                     f'{result.mean_rejoined_frac_total:.4f}',
+                    f'{result.mean_ap_phase1_mean_total:.4f}',
+                    f'{result.mean_ap_phase1_max_total:.4f}',
+                    f'{result.mean_ap_phase1_mean_pivots:.4f}',
+                    f'{result.mean_ap_phase1_mean_forwards:.4f}',
+                    f'{result.mean_ap_phase2_mean_total:.4f}',
+                    f'{result.mean_ap_phase2_max_total:.4f}',
                     fault_mode,
                     fault_pct_label,
                     tok_strat,
