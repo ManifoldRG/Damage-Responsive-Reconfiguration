@@ -32,11 +32,31 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import pybullet as _pb
 from loguru import logger as _loguru_logger
 _loguru_logger.disable("src.agent_policy")
 _loguru_logger.disable("src.bullet_sim")
 _loguru_logger.disable("src.bullet_bridge")
 import matplotlib
+
+# Worker-level PyBullet client cache. None ⇒ each trial constructs its own
+# DIRECT client (the legacy behavior). When `--fast` is set, `_worker_init`
+# below opens one client per worker process and `run_single_bullet_trial`
+# reuses it across trials, saving ~connect+disconnect per trial and removing
+# a known source of Windows PyBullet flake on long sweeps.
+_WORKER_CLIENT: Optional[int] = None
+
+
+def _worker_init(fast: bool) -> None:
+    """ProcessPoolExecutor initializer (also called from the sequential
+    path). Applies the fast profile inside the worker process (class attrs
+    do not propagate across fork/spawn) and opens the reusable client."""
+    global _WORKER_CLIENT
+    # Import here so the side-effects land in the worker's module namespace.
+    from src.bullet_sim import BulletSimulator as _BS
+    if fast:
+        _BS.apply_fast_profile()
+        _WORKER_CLIENT = _pb.connect(_pb.DIRECT)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -290,17 +310,22 @@ def run_single_bullet_trial(
 
     scenario = udqdg_to_bullet_scenario(system, faulty_module_ids)
 
+    fast = bool(getattr(BulletSimulator, "FAST_PROFILE", False))
     if module_shape == "cube":
         BulletSimulator.USE_ROLLING_SPHERE_PIVOT = False
-        BulletSimulator.MAX_PIVOT_TIME = 40.0
+        BulletSimulator.MAX_PIVOT_TIME = 20.0 if fast else 40.0
     else:
         BulletSimulator.USE_ROLLING_SPHERE_PIVOT = True
-        BulletSimulator.MAX_PIVOT_TIME = 20.0
+        BulletSimulator.MAX_PIVOT_TIME = 10.0 if fast else 20.0
     if max_pivot_time is not None:
         BulletSimulator.MAX_PIVOT_TIME = float(max_pivot_time)
+
+    sim_kwargs = dict(gui=False, module_shape=module_shape)
+    if _WORKER_CLIENT is not None:
+        _pb.resetSimulation(physicsClientId=_WORKER_CLIENT)
+        sim_kwargs["physics_client_id"] = _WORKER_CLIENT
     sim = BulletSimulator(
-        scenario.n_total, scenario.pos0, scenario.bonded0, gui=False,
-        module_shape=module_shape)
+        scenario.n_total, scenario.pos0, scenario.bonded0, **sim_kwargs)
 
     def _diag_cb(*, sim, coag, restruct, scenario, phase1_connected,
                  total_phase1_moves, total_phase2_moves, total_phase1_ticks):
@@ -404,13 +429,23 @@ def run_bullet_monte_carlo(
         for i in range(n_trials)
     ]
 
+    fast = bool(getattr(BulletSimulator, "FAST_PROFILE", False))
     trials: List[TrialResult] = []
     if workers <= 1:
+        # Sequential path runs in this process; the main process already
+        # called apply_fast_profile() up-front, but the reusable client lives
+        # in _WORKER_CLIENT and must be opened here if it has not been.
+        if fast and _WORKER_CLIENT is None:
+            _worker_init(fast=True)
         iterator = tqdm(trial_kwarg_list, desc=f"n={n_modules}", disable=not verbose)
         for kw in iterator:
             trials.append(run_single_bullet_trial(**kw))
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_worker_init,
+            initargs=(fast,),
+        ) as executor:
             iterator = tqdm(
                 executor.map(_run_trial_dispatch, trial_kwarg_list),
                 total=n_trials,
@@ -763,7 +798,18 @@ def main():
                         help="If set, write one JSON per trial under DIR with "
                              "pivot log, auto-bond stats, attitude drift, "
                              "final structural state. Diagnostic only.")
+    parser.add_argument("--fast", action="store_true",
+                        help="Enable the bundled fast profile: relaxed solver "
+                             "iterations, loosened pivot convergence tols, "
+                             "shorter pivot timeout, throttled auto-bond, "
+                             "body auto-sleeping, and per-worker PyBullet "
+                             "client reuse. Target ~4-8x wall-time speedup; "
+                             "reconnection rate should track baseline within "
+                             "a few percentage points.")
     args = parser.parse_args()
+
+    if args.fast:
+        BulletSimulator.apply_fast_profile()
 
     # --- Resume mode ---
     if args.resume:
@@ -877,6 +923,7 @@ def main():
             "ablation_hops": ablation_hops,
             "n_values": n_values_explicit,
             "fault_modes": fault_modes_explicit,
+            "fast": bool(args.fast),
         }
         with open(os.path.join(output_dir, "config.json"), "w") as f:
             json.dump(config, f, indent=2)

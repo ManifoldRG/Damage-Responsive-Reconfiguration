@@ -164,6 +164,14 @@ class BulletSimulator:
     PIVOT_REL_V_TOL = 1e-2       # m/s: ||v_pivot − v_axis||
     MAX_PIVOT_TIME = 60.0        # seconds simulation time per pivot
 
+    # Fast profile: a bundled override of the speed-relevant knobs above,
+    # toggled by `BulletSimulator.apply_fast_profile()`. Existing instance
+    # code reads the class attributes directly, so flipping them in-place is
+    # sufficient. `FAST_PROFILE` itself only gates the new body-sleeping path
+    # (where the cost of always-on is non-trivial and the benefit only shows
+    # up when the rest of the knobs are loosened together).
+    FAST_PROFILE = False
+
     # 6 body-frame connector directions (cardinal axes).
     CONNECTOR_DIRS = np.array([
         [1, 0, 0], [-1, 0, 0],   # +X (0), -X (1)
@@ -192,6 +200,23 @@ class BulletSimulator:
     # (e.g. recomputing rest poses on snap).
     SNAP_TO_LATTICE_ON_PIVOT_COMPLETE = False
 
+    @classmethod
+    def apply_fast_profile(cls) -> None:
+        """Flip the speed-relevant class knobs to their fast values in place.
+
+        Idempotent. Safe to call once at process start before constructing any
+        BulletSimulator instances. See the `--fast` CLI flag in
+        run_bullet_monte_carlo.py.
+        """
+        cls.FAST_PROFILE = True
+        cls.NUM_SOLVER_ITERATIONS_RIGID = 40
+        cls.NUM_SOLVER_ITERATIONS_SPRING = 25
+        cls.PIVOT_POS_TOL = 2.5e-2
+        cls.PIVOT_OMEGA_TOL = 5e-3
+        cls.PIVOT_REL_V_TOL = 3e-2
+        cls.MAX_PIVOT_TIME = 10.0          # sphere baseline; cube path scales
+        cls.AUTO_BOND_INTERVAL_SUBSTEPS = 8
+
     def __init__(self, N: int, pos0: np.ndarray, bonded0: np.ndarray,
                  vel0: Optional[np.ndarray] = None, gui: bool = False,
                  *,
@@ -200,7 +225,8 @@ class BulletSimulator:
                  momentum_diag_subsample: int = 1,
                  momentum_diag_max_samples: int = 200_000,
                  pivot_attract_scale: float = 1.0,
-                 module_shape: Optional[str] = None):
+                 module_shape: Optional[str] = None,
+                 physics_client_id: Optional[int] = None):
         self.N = N
         self._sim_time = 0.0
         shape = module_shape if module_shape is not None else self.MODULE_SHAPE_DEFAULT
@@ -238,8 +264,15 @@ class BulletSimulator:
             "bonded_ok": 0,            # bond actually created
         }
 
-        mode = p.GUI if gui else p.DIRECT
-        self._physics_client = p.connect(mode)
+        if physics_client_id is not None:
+            # Worker owns the client; we reuse it across trials. The caller is
+            # responsible for resetSimulation() before construction.
+            self._physics_client = int(physics_client_id)
+            self._owns_physics_client = False
+        else:
+            mode = p.GUI if gui else p.DIRECT
+            self._physics_client = p.connect(mode)
+            self._owns_physics_client = True
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, 0, physicsClientId=self._physics_client)
         p.setTimeStep(self.PHYSICS_DT, physicsClientId=self._physics_client)
@@ -287,6 +320,20 @@ class BulletSimulator:
                     angularDamping=0.1,
                     physicsClientId=self._physics_client,
                 )
+            if self.FAST_PROFILE:
+                # Auto-deactivate idle bodies. PyBullet's contact/constraint
+                # impulse wake-up handles re-activation transparently; we also
+                # explicitly WAKE_UP the pivot + 1-hop neighborhood at every
+                # start_pivot below to be safe against drift-only impulses
+                # falling under threshold.
+                try:
+                    p.changeDynamics(
+                        body_id, -1,
+                        activationState=p.ACTIVATION_STATE_ENABLE_SLEEPING,
+                        physicsClientId=self._physics_client,
+                    )
+                except Exception:
+                    pass
             self._body_ids.append(body_id)
 
         self._bonds: Set[Tuple[int, int]] = set()
@@ -544,6 +591,8 @@ class BulletSimulator:
         current body frame. *attract_body_idx* / *attract_connector* are fixed for
         the whole maneuver (both lateral legs).
         """
+        if self.FAST_PROFILE:
+            self._wake_pivot_neighborhood(pivot_idx, axis_idx)
         pos = self.get_positions()
         r0 = pos[pivot_idx] - pos[axis_idx]
         target_pos_local = np.asarray(target_pos_local, dtype=float).reshape(3)
@@ -1639,12 +1688,38 @@ class BulletSimulator:
         h = np.sqrt(max(1.0 - half_dist ** 2, 0.0))
         return center_nb + mid_dir_unit * h
 
+    def _wake_pivot_neighborhood(self, pivot_idx: int, axis_idx: int) -> None:
+        """Wake the pivot, axis, and every body bonded to either (1-hop).
+
+        Called at start_pivot under FAST_PROFILE. PyBullet's auto-wake handles
+        contact and constraint impulses transparently, but the small drift
+        impulses applied between substeps near a freshly-started pivot can
+        otherwise let a tethered cluster member sleep through the maneuver.
+        """
+        to_wake: Set[int] = {int(pivot_idx), int(axis_idx)}
+        for (a, b) in self._bonds:
+            if a == pivot_idx or a == axis_idx:
+                to_wake.add(b)
+            elif b == pivot_idx or b == axis_idx:
+                to_wake.add(a)
+        for idx in to_wake:
+            if 0 <= idx < self.N:
+                try:
+                    p.changeDynamics(
+                        self._body_ids[idx], -1,
+                        activationState=p.ACTIVATION_STATE_WAKE_UP,
+                        physicsClientId=self._physics_client,
+                    )
+                except Exception:
+                    pass
+
     def disconnect(self):
         if self._physics_client is not None:
-            try:
-                p.disconnect(self._physics_client)
-            except Exception:
-                pass
+            if getattr(self, "_owns_physics_client", True):
+                try:
+                    p.disconnect(self._physics_client)
+                except Exception:
+                    pass
             self._physics_client = None
 
     def __del__(self):
