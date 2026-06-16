@@ -154,6 +154,18 @@ def _connected_components_from_bonds(
     return components
 
 
+def _phase2_diag_summary(restruct) -> Optional[Dict]:
+    """Convert a DisplacementRestructuring._p2diag (with set fields) into a
+    JSON-serializable summary of why phase 2 did or did not move."""
+    d = getattr(restruct, "_p2diag", None)
+    if d is None:
+        return None
+    out = {}
+    for k, v in d.items():
+        out[k] = len(v) if isinstance(v, set) else v
+    return out
+
+
 def _write_trial_diagnostics(
     *,
     dump_diagnostics_dir: str,
@@ -210,6 +222,7 @@ def _write_trial_diagnostics(
         "reversal_count_coag": int(getattr(coag, "reversal_count", 0)),
         "reversal_count_restruct": int(getattr(restruct, "reversal_count", 0))
         if restruct is not None else 0,
+        "phase2_diag": _phase2_diag_summary(restruct),
         "pivot_log": sim.get_pivot_diagnostic_log(),
         "auto_bond_stats": sim.get_auto_bond_stats(),
         "attitude_drift_log": [list(t) for t in sim.get_attitude_drift_log()],
@@ -764,8 +777,10 @@ def main():
     parser.add_argument("--resume", type=str, default=None, metavar="PATH",
                         help="Resume from existing output directory")
     parser.add_argument("--restructuring-method", type=str, default="rendezvous",
-                        choices=["rendezvous", "displacement"],
-                        help="Phase 2 method: rendezvous tokens or displacement-guided (default: rendezvous)")
+                        choices=["rendezvous", "displacement", "retrace"],
+                        help="Phase 2 method: rendezvous tokens, displacement-guided, "
+                             "or retrace (locally reverse the coagulation pivots) "
+                             "(default: rendezvous)")
     parser.add_argument("--module-shape", type=str, default="sphere",
                         choices=["sphere", "cube"],
                         help="Module geometry: sphere (rolling pivots) or cube "

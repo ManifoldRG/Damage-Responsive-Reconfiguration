@@ -467,65 +467,55 @@ def calculate_shape_difference(
     tolerance: float = 0.05,
 ) -> float:
     """
-    Calculate shape difference using pairwise inter-module distances.
+    Gromov-Wasserstein shape difference between the pre-damage and final
+    configurations of the surviving modules.
 
-    Per the paper's metric: diff(P, Q) = (|P| - |P ∩ Q|) / |P|
-    where P and Q are multisets of pairwise distances before/after damage.
-
-    Uses tolerance-based matching: a distance d_p in P is considered
-    matched if any unmatched distance d_q in Q satisfies
-    |d_p - d_q| <= tolerance.  This avoids false mismatches from
-    floating-point drift in physics-based simulators.
+    Each configuration is treated as a finite metric space: the surviving
+    (non-fault) modules equipped with their matrix of pairwise Euclidean
+    distances. We return the (square-loss) Gromov-Wasserstein discrepancy
+    between the two distance matrices under uniform marginals. Because the
+    metric compares intra-configuration distances rather than absolute
+    coordinates, it is invariant to global translation, rotation, and
+    reflection (and to module relabeling): a structure that is merely
+    rigidly repositioned or mirrored while modules pivot incurs no penalty,
+    and only genuine changes in the relative arrangement are measured. Both
+    distance matrices are normalized by their common maximum, so the value
+    is a dimensionless dissimilarity in [0, 1] (reported as a percentage).
 
     Args:
         original_positions: Positions of ALL modules before fault
         final_positions: Positions of surviving modules after algorithm
         faulty_modules: Set of module IDs that were marked as faulty
-        tolerance: Maximum absolute difference for two distances to be
-            considered equal (default 0.05, roughly 5% of unit spacing)
+        tolerance: Unused; retained for signature compatibility.
 
     Returns:
-        Shape difference diff(P, Q), anchored to pre-damage shape P.
+        Gromov-Wasserstein shape difference in [0, 1].
     """
-    active_orig = {
-        mid: pos for mid, pos in original_positions.items()
-        if mid not in faulty_modules
-    }
+    import ot
+    from scipy.spatial.distance import cdist
 
-    P_dists: List[float] = []
-    orig_ids = list(active_orig.keys())
-    for i, u in enumerate(orig_ids):
-        for v in orig_ids[i + 1:]:
-            P_dists.append(float(np.linalg.norm(active_orig[u] - active_orig[v])))
-
-    Q_dists: List[float] = []
-    final_ids = list(final_positions.keys())
-    for i, u in enumerate(final_ids):
-        for v in final_ids[i + 1:]:
-            Q_dists.append(float(np.linalg.norm(final_positions[u] - final_positions[v])))
-
-    if len(P_dists) == 0:
+    active_ids = [
+        mid for mid in original_positions
+        if mid not in faulty_modules and mid in final_positions
+    ]
+    n = len(active_ids)
+    if n < 2:
         return 0.0
 
-    P_dists.sort()
-    Q_dists.sort()
+    P = np.asarray([original_positions[m] for m in active_ids], dtype=float)
+    Q = np.asarray([final_positions[m] for m in active_ids], dtype=float)
+    D1 = cdist(P, P)
+    D2 = cdist(Q, Q)
+    scale = max(float(D1.max()), float(D2.max()))
+    if scale <= 0.0:
+        return 0.0
+    D1 /= scale
+    D2 /= scale
 
-    matched = 0
-    q_idx = 0
-    q_used = [False] * len(Q_dists)
-
-    for d_p in P_dists:
-        while q_idx < len(Q_dists) and Q_dists[q_idx] < d_p - tolerance:
-            q_idx += 1
-        for j in range(q_idx, len(Q_dists)):
-            if Q_dists[j] > d_p + tolerance:
-                break
-            if not q_used[j]:
-                q_used[j] = True
-                matched += 1
-                break
-
-    return (len(P_dists) - matched) / len(P_dists)
+    w = np.ones(n) / n
+    gw2 = float(ot.gromov.gromov_wasserstein2(
+        D1, D2, w, w, loss_fun="square_loss"))
+    return max(gw2, 0.0) ** 0.5
 
 
 def run_single_graph_trial(

@@ -354,6 +354,14 @@ class DecentralizedCoagulation:
         self.move_log: List[Dict] = []
         self._tick_count: int = 0
         self.reversal_count: int = 0
+        # Per-module retrace history: ordered list of the pivots each module
+        # successfully completed, recorded as (axis_module_id,
+        # source_pos_in_axis_frame, pivot_type). Phase-2 retrace replays these
+        # in reverse to undo coagulation locally. Each entry is fully local:
+        # the axis is a neighbor identity and the source position is expressed
+        # in that axis's body frame, so it reconstructs correctly against the
+        # axis's *current* pose without any absolute/global measurement.
+        self.pivot_history: Dict[str, List[Tuple[str, np.ndarray, str]]] = {}
 
         # Flood/echo protocol state
         self._flood_counter: int = 0
@@ -1237,6 +1245,18 @@ class DecentralizedCoagulation:
                         self._reconnect_bonds(agent.body_idx)
                         self._decision_bond_matrix = (
                             self.sim.get_bond_matrix().copy())
+                        # Record the retrace step BEFORE the per-pivot fields
+                        # are reset below. Source position is stored in the
+                        # axis's body frame (local + frame-robust).
+                        if (agent.pre_pivot_lattice_ref is not None
+                                and agent.pre_pivot_pos_local is not None):
+                            _ax_mid = self._idx_to_mid.get(
+                                agent.pre_pivot_lattice_ref)
+                            if _ax_mid is not None:
+                                self.pivot_history.setdefault(mid, []).append(
+                                    (_ax_mid,
+                                     agent.pre_pivot_pos_local.copy(),
+                                     agent.pivot_type))
                         agent.state = ModuleState.IDLE
                         agent.target_pos = None
                         agent.target_pos_local = None
@@ -2799,8 +2819,16 @@ class DecentralizedRestructuring:
                 if self.sim.sim_time < agent.token_hold_until:
                     any_active = True
                     continue
+                _d = getattr(self, "_p2diag", None)
+                if _d is not None:
+                    _d["engaged_ids"].add(agent.module_id)
                 if (not self.is_movable(agent.body_idx)
                         or agent.action_points <= 0):
+                    if _d is not None:
+                        if not self.is_movable(agent.body_idx):
+                            _d["blocked_not_movable_ids"].add(agent.module_id)
+                        else:
+                            _d["blocked_no_budget_ids"].add(agent.module_id)
                     agent.state = ModuleState.PROCESSING
                     agent.process_ready_time = (self.sim.sim_time
                                                 + self.TOKEN_PROCESS_DELAY)
@@ -2827,9 +2855,13 @@ class DecentralizedRestructuring:
                         agent, target_pos_local, axis_idx,
                         pivot_type, handoff_idx)
                     self._propagate_moving_tokens()
+                    if _d is not None:
+                        _d["moved_ids"].add(agent.module_id)
                     any_active = True
                     continue
 
+                if _d is not None:
+                    _d["no_target_ids"].add(agent.module_id)
                 self._on_no_pick_target(agent)
                 agent.state = ModuleState.PROCESSING
                 agent.process_ready_time = (self.sim.sim_time
@@ -3392,6 +3424,21 @@ class DisplacementRestructuring(DecentralizedRestructuring):
             token_strategy="furthest",
         )
         self.original_positions = original_positions
+        # Phase-2 diagnostics (why does restructuring make so few moves?).
+        # Counters are integers; the *_ids are sets of module ids so repeated
+        # per-tick visits are idempotent. Read by _write_trial_diagnostics.
+        self._p2diag = {
+            "coag_moved": len(coag_moved),
+            "tokens_injected": 0,
+            "inject_skip_below_threshold": 0,
+            "inject_skip_not_idle": 0,
+            "inject_skip_no_orig": 0,
+            "engaged_ids": set(),          # reached HAS_TOKEN past the hold
+            "blocked_not_movable_ids": set(),
+            "blocked_no_budget_ids": set(),
+            "no_target_ids": set(),        # held token, pick_target found nothing
+            "moved_ids": set(),            # executed >=1 pivot
+        }
 
     def generate_initial_tokens(self):
         """Inject displacement-based tokens for all displaced coag-movers."""
@@ -3400,22 +3447,27 @@ class DisplacementRestructuring(DecentralizedRestructuring):
     def _inject_displacement_tokens(self):
         """For each displaced coag-mover, set a synthetic token pointing home."""
         pos = self.sim.get_positions()
+        d = self._p2diag
         for mid in self.coag_moved:
             if mid not in self.agents:
                 continue
             if mid not in self.original_positions:
+                d["inject_skip_no_orig"] += 1
                 continue
             agent = self.agents[mid]
             if agent.state != ModuleState.IDLE:
+                d["inject_skip_not_idle"] += 1
                 continue
             disp = self.original_positions[mid] - pos[agent.body_idx]
             dist = float(np.linalg.norm(disp))
             if dist < self.DISPLACEMENT_THRESHOLD:
+                d["inject_skip_below_threshold"] += 1
                 continue
             R = self.sim.body_rotation_matrix(agent.body_idx)
             direction = R.T @ disp
             agent.incoming_tokens.append(
                 Token(direction=direction.copy(), source_id=mid))
+            d["tokens_injected"] += 1
 
     def _forward_token(self, agent: ModuleAgent):
         """Displacement tokens are per-module; forwarding is meaningless. Drop."""
@@ -3426,6 +3478,125 @@ class DisplacementRestructuring(DecentralizedRestructuring):
         """Scoring origin = the module's original (pre-damage) position."""
         if agent.module_id in self.original_positions:
             return self.original_positions[agent.module_id].copy()
+        if agent.token is None:
+            return None
+        R = self.sim.body_rotation_matrix(agent.body_idx)
+        return pos[agent.body_idx] + R @ agent.token.direction
+
+
+class RetraceRestructuring(DisplacementRestructuring):
+    """Phase-2 restructuring by locally retracing coagulation pivots.
+
+    Each module replays the pivots it executed during coagulation in reverse
+    order, attempting to undo each one. A step's target is the source cell
+    of that pivot, reconstructed relative to the current pose of the
+    axis neighbor it pivoted on: the axis is a neighbor identity and the
+    source position is stored in the axis's body frame, so the target is
+    well-defined without any absolute/global measurement and remains correct
+    even if the surrounding structure has been rigidly repositioned. When the
+    original axis is still bonded the reverse pivot is exact; when the local
+    geometry no longer admits it, the inherited ``pick_target`` rule selects
+    the admissible pivot that gets closest to the source cell --- an
+    intermediate, still-improved pose. The objective is therefore purely
+    relative (rotation/translation/reflection invariant), matching the
+    Gromov--Wasserstein shape metric, and fully decentralized: each agent uses
+    only its own pivot history and current neighborhood.
+
+    Steps whose recorded axis is no longer an active module (e.g. it was a
+    fault used as a passive pivot reference) cannot be anchored locally and
+    are skipped; the module retraces the remainder.
+    """
+
+    def __init__(self, sim, module_ids, body_indices, coag_moved,
+                 original_positions, pivot_history,
+                 pre_damage_neighbor_slots=None):
+        super().__init__(
+            sim=sim, module_ids=module_ids, body_indices=body_indices,
+            coag_moved=coag_moved, original_positions=original_positions,
+            pre_damage_neighbor_slots=pre_damage_neighbor_slots)
+        # module-id -> body-index for active modules (base class only keeps the
+        # reverse map). Used to anchor retrace targets to the axis body.
+        self._mid_to_idx: Dict[str, int] = dict(body_indices)
+        # Reversed per-module step lists (most-recent pivot undone first).
+        self._retrace: Dict[str, List[Tuple[str, np.ndarray, str]]] = {}
+        self._retrace_idx: Dict[str, int] = {}
+        self._cur_step: Dict[str, Tuple[str, np.ndarray, str]] = {}
+        for mid, hist in (pivot_history or {}).items():
+            if mid in self.agents and hist:
+                self._retrace[mid] = list(reversed(hist))
+                self._retrace_idx[mid] = 0
+
+    def _set_retrace_budgets(self):
+        """Give each retracing agent enough motion budget to undo every logged
+        pivot. Retracing is a directed rewind, not the exploratory search that
+        phase 1 caps as a regularizer, so the tight motion cap does not apply
+        (design decision). Called from generate_initial_tokens so it runs
+        AFTER any external per-agent budget reset (e.g. in the MC runner)."""
+        for mid, steps in self._retrace.items():
+            ag = self.agents[mid]
+            ag.action_points = max(int(self.INITIAL_ACTION_POINTS), len(steps))
+
+    def generate_initial_tokens(self):
+        # No displacement-to-home injection; retrace steps are fed one at a
+        # time by _refill_retrace_tokens() at the start of each tick.
+        self._set_retrace_budgets()
+        self._refill_retrace_tokens()
+
+    def tick(self) -> bool:
+        self._refill_retrace_tokens()
+        return super().tick()
+
+    def _retrace_target_world(self, step, pos: np.ndarray) -> Optional[np.ndarray]:
+        """World position of a step's source cell, anchored to the axis's
+        current pose. Returns None if the axis is not an active module."""
+        ax_mid, pre_local, _ptype = step
+        ax_idx = self._mid_to_idx.get(ax_mid)
+        if ax_idx is None:
+            return None
+        R_ax = self.sim.body_rotation_matrix(ax_idx)
+        return pos[ax_idx] + R_ax @ pre_local
+
+    def _refill_retrace_tokens(self):
+        """For each idle agent with no pending token, advance to its next
+        anchorable retrace step and inject a token toward that step's source
+        cell. Steps whose axis has vanished are skipped."""
+        pos = self.sim.get_positions()
+        for mid, steps in self._retrace.items():
+            ag = self.agents.get(mid)
+            if ag is None or ag.is_faulty:
+                continue
+            if not (ag.state == ModuleState.IDLE
+                    and not ag.incoming_tokens
+                    and ag.token is None
+                    and ag.action_points > 0):
+                continue
+            idx = self._retrace_idx.get(mid, 0)
+            target = None
+            while idx < len(steps):
+                target = self._retrace_target_world(steps[idx], pos)
+                if target is not None:
+                    break
+                idx += 1  # axis gone; skip this step
+            if idx >= len(steps) or target is None:
+                self._retrace_idx[mid] = len(steps)
+                self._cur_step.pop(mid, None)
+                continue
+            self._cur_step[mid] = steps[idx]
+            self._retrace_idx[mid] = idx + 1
+            R = self.sim.body_rotation_matrix(ag.body_idx)
+            direction = R.T @ (target - pos[ag.body_idx])
+            ag.incoming_tokens.append(
+                Token(direction=direction.copy(), source_id=mid))
+
+    def _origin_world_for_pick_target(
+            self, agent: ModuleAgent, pos: np.ndarray) -> Optional[np.ndarray]:
+        """Scoring origin = the source cell of the agent's current retrace
+        step, anchored to the axis's current pose (purely relative)."""
+        step = self._cur_step.get(agent.module_id)
+        if step is not None:
+            tgt = self._retrace_target_world(step, pos)
+            if tgt is not None:
+                return tgt
         if agent.token is None:
             return None
         R = self.sim.body_rotation_matrix(agent.body_idx)

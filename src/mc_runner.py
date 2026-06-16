@@ -42,6 +42,7 @@ from .agent_policy import (
     DecentralizedCoagulation,
     DecentralizedRestructuring,
     DisplacementRestructuring,
+    RetraceRestructuring,
     ModuleAgent,
     ModuleState,
 )
@@ -209,6 +210,15 @@ class _MCRestructuring(DecentralizedRestructuring):
 
 class _MCDisplacementRestructuring(DisplacementRestructuring):
     """Displacement-guided restructuring for MC trials."""
+
+    _safety_radius: int = 2
+
+    def is_movable(self, body_idx: int, safety_radius: int = 2) -> bool:
+        return super().is_movable(body_idx, self._safety_radius)
+
+
+class _MCRetraceRestructuring(RetraceRestructuring):
+    """Retrace-guided restructuring for MC trials."""
 
     _safety_radius: int = 2
 
@@ -547,7 +557,16 @@ def run_trial(
     restruct = None
     if phase1_connected:
         coag_moved: Set[str] = {m["module"] for m in coag.move_log}
-        if restructuring_method == "displacement":
+        if restructuring_method == "retrace":
+            restruct = _MCRetraceRestructuring(
+                sim=sim,
+                module_ids=scenario.module_ids,
+                body_indices=scenario.body_indices,
+                coag_moved=coag_moved,
+                original_positions=scenario.original_positions,
+                pivot_history=coag.pivot_history,
+            )
+        elif restructuring_method == "displacement":
             restruct = _MCDisplacementRestructuring(
                 sim=sim,
                 module_ids=scenario.module_ids,
