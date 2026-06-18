@@ -481,6 +481,7 @@ def run_trial(
     token_gen_interval: float,
     max_moves_per_module: int,
     use_position_history: bool,
+    random_baseline: bool = False,
     forward_ap_cost: float = 0.1,
     fault_mode: str = FAULT_MODE_RANDOM,
     diagnostics_callback: Optional[Callable[..., None]] = None,
@@ -514,6 +515,7 @@ def run_trial(
     coag._safety_radius = safety_radius
     coag.ALLOW_FAULT_AS_PIVOT_NEIGHBOR = True
     coag.TEMPERATURE = temperature
+    coag.RANDOM_BASELINE = bool(random_baseline)
     coag.TOKEN_GEN_INTERVAL = float(token_gen_interval)
     coag.INITIAL_ACTION_POINTS = int(max_moves_per_module)
     coag.MAX_MOVES_PER_MODULE = int(max_moves_per_module)

@@ -277,6 +277,13 @@ class DecentralizedCoagulation:
     # (e.g. tie-fighter degeneracy on a center-fault line).
     TEMPERATURE: float = 0.5  # per-tick prob of random exploration move
 
+    # Fully-random motion baseline. When True, coagulation skips distress-
+    # directed (greedy) pivot selection entirely: any movable token-holder
+    # takes a random admissible (connectivity-safe) pivot. The fault-token
+    # flood, criticality gate, and exclusion radius are unchanged, so this is
+    # an undirected-motion control for the directed policy.
+    RANDOM_BASELINE: bool = False
+
     # Per-module MOTION budget at phase start (1 point per pivot). Tuned
     # default 5: empirically agents use ~1.2-1.5 motion points regardless
     # of cap, so 5 never binds and keeps phases short. Forwards draw from
@@ -1451,7 +1458,21 @@ class DecentralizedCoagulation:
                         any_active = True
                         continue
 
-                result = self.pick_target(agent, require_closer_to_origin=True)
+                if self.RANDOM_BASELINE:
+                    # Undirected baseline: skip distress-directed selection;
+                    # take a random admissible (connectivity-safe) pivot.
+                    result = self.pick_target(
+                        agent, require_closer_to_origin=False,
+                        random_choice=True)
+                else:
+                    result = self.pick_target(
+                        agent, require_closer_to_origin=True)
+                    if (result is None and self.TEMPERATURE > 0
+                            and random.random() < self.TEMPERATURE):
+                        result = self.pick_target(
+                            agent, require_closer_to_origin=False,
+                            random_choice=True)
+
                 if result is not None:
                     target_pos_local, axis_idx, pivot_type, handoff_idx = result
                     self._start_pivot(
@@ -1460,19 +1481,6 @@ class DecentralizedCoagulation:
                     self._propagate_moving_tokens()
                     any_active = True
                     continue
-
-                if self.TEMPERATURE > 0 and random.random() < self.TEMPERATURE:
-                    result = self.pick_target(
-                        agent, require_closer_to_origin=False,
-                        random_choice=True)
-                    if result is not None:
-                        target_pos_local, axis_idx, pivot_type, handoff_idx = result
-                        self._start_pivot(
-                            agent, target_pos_local, axis_idx,
-                            pivot_type, handoff_idx)
-                        self._propagate_moving_tokens()
-                        any_active = True
-                        continue
 
                 # No target found — agent will forward this token (and
                 # spend an action point) once the PROCESSING delay expires.

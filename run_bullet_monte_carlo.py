@@ -275,6 +275,7 @@ def run_single_bullet_trial(
     dump_diagnostics_dir: Optional[str] = None,
     max_moves_per_module: int = 5,
     use_position_history: bool = True,
+    random_baseline: bool = False,
 ) -> TrialResult:
     """Execute one PyBullet-based Monte Carlo trial.
 
@@ -383,6 +384,7 @@ def run_single_bullet_trial(
             token_gen_interval=token_gen_interval,
             max_moves_per_module=max_moves_per_module,
             use_position_history=use_position_history,
+            random_baseline=random_baseline,
             forward_ap_cost=0.1,
             fault_mode=fault_mode,
             diagnostics_callback=_diag_cb,
@@ -581,6 +583,7 @@ SUMMARY_HEADERS = [
     "mean_ap_phase2_max_total",
     "fault_mode", "fault_pct",
     "token_strategy", "safety_radius", "restructuring_method",
+    "random_baseline",
 ]
 
 TRIALS_HEADERS = [
@@ -596,6 +599,7 @@ TRIALS_HEADERS = [
     "largest_component_frac_post_phase2",
     "fault_mode",
     "token_strategy", "safety_radius", "restructuring_method",
+    "random_baseline",
 ]
 
 
@@ -714,6 +718,86 @@ def print_summary_table(
 # CLI
 # ---------------------------------------------------------------------------
 
+def run_ablation_suite(args):
+    """Run the full parameter-sensitivity + random-baseline suite.
+
+    Re-invokes this script once per (swept value x topology) arm with the
+    swept flag overridden, writing each arm to its own labeled output dir
+    under ``<output-dir>/ablation_suite/``. One entry point, one shared
+    ``--trials`` for every arm. Each arm's own config.json records its
+    parameters, so the runs are self-identifying.
+    """
+    import subprocess
+
+    SWEEPS = {
+        "token_gen_interval": ("--token-gen-interval", [2.5, 5, 10, 20, 40]),
+        "safety_radius":      ("--safety-radius",      [2, 3, 4, 5]),
+        "temperature":        ("--temperature",        [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]),
+    }
+    TOPOS = {"tree": ["--tree"], "fc": ["--fully-connected"]}
+    suite_root = os.path.join(args.output_dir, "ablation_suite")
+    only = args.ablation_only
+
+    # Shared flags pin the production operating point; the swept flag is
+    # appended afterward so argparse last-wins applies the override.
+    shared = [
+        "--n-values", "40", "80", "160",
+        "--dynamic-pct",
+        "--trials", str(args.trials),
+        "--restructuring-method", "retrace",
+        "--pivot-radius", "4",
+        "--safety-radius", "4",
+        "--temperature", "0.5",
+        "--token-gen-interval", "10",
+    ]
+    if args.fast:
+        shared.append("--fast")
+    if args.workers and args.workers > 1:
+        shared += ["--workers", str(args.workers)]
+
+    arms = []  # (value_label, override_flags)
+    for param, (flag, vals) in SWEEPS.items():
+        if only and only != param:
+            continue
+        for v in vals:
+            arms.append((f"{param}={v}", [flag, str(v)]))
+    if (not only) or only == "random_baseline":
+        arms.append(("random_baseline", ["--random-baseline"]))
+
+    # configs_per_n under --dynamic-pct = 3 pcts x 2 spatial modes = 6
+    per_arm_trials = 3 * 6 * args.trials
+
+    jobs = []
+    for value_label, override in arms:
+        for tname, tflag in TOPOS.items():
+            out = os.path.join(suite_root, f"{value_label}__{tname}")
+            cmd = ([sys.executable, os.path.abspath(__file__)]
+                   + shared + override + tflag + ["--output-dir", out])
+            jobs.append((value_label, tname, out, cmd))
+
+    total = len(jobs) * per_arm_trials
+    print("=" * 70)
+    print(f"ABLATION SUITE: {len(jobs)} arms x ~{per_arm_trials} trials "
+          f"= ~{total:,} trials total")
+    print(f"  trials/cell: {args.trials} | n: 40,80,160 | fault configs: 6 "
+          f"| topologies: {list(TOPOS)}")
+    print(f"  output root: {suite_root}")
+    print("=" * 70)
+    for value_label, tname, out, cmd in jobs:
+        print(f"  [{value_label} | {tname}] -> {out}")
+        if args.dry_run:
+            print("      " + " ".join(cmd))
+    if args.dry_run:
+        print("\n(dry run: nothing executed)")
+        return
+
+    for i, (value_label, tname, out, cmd) in enumerate(jobs, 1):
+        print(f"\n>>> ARM {i}/{len(jobs)}: {value_label} | {tname}")
+        os.makedirs(out, exist_ok=True)
+        subprocess.run(cmd, check=True)
+    print("\nAblation suite complete.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PyBullet Monte Carlo simulation sweep for damage response"
@@ -821,7 +905,27 @@ def main():
                              "client reuse. Target ~4-8x wall-time speedup; "
                              "reconnection rate should track baseline within "
                              "a few percentage points.")
+    parser.add_argument("--random-baseline", action="store_true",
+                        help="Undirected random-motion baseline: movable "
+                             "token-holders take random admissible pivots "
+                             "instead of distress-directed ones (phase 1). "
+                             "Token flood and criticality gate unchanged.")
+    parser.add_argument("--ablation-suite", action="store_true",
+                        help="Run the full parameter-sensitivity + random-"
+                             "baseline suite (one arm per swept value x "
+                             "topology) by re-invoking this script per arm. "
+                             "Every arm uses the single shared --trials.")
+    parser.add_argument("--ablation-only", type=str, default=None,
+                        choices=["token_gen_interval", "safety_radius",
+                                 "temperature", "random_baseline"],
+                        help="With --ablation-suite, run only this one arm.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --ablation-suite, print the planned arms "
+                             "and commands without executing anything.")
     args = parser.parse_args()
+
+    if args.ablation_suite:
+        return run_ablation_suite(args)
 
     if args.fast:
         BulletSimulator.apply_fast_profile()
@@ -928,6 +1032,9 @@ def main():
             "dynamic_pct": dynamic_pct,
             "n_step": n_step,
             "temperature": temperature,
+            "safety_radius": args.safety_radius,
+            "token_gen_interval": args.token_gen_interval,
+            "random_baseline": bool(args.random_baseline),
             "pivot_radius": pivot_radius,
             "max_phase_time": max_phase_time,
             "stall_interval": stall_interval,
@@ -1099,6 +1206,7 @@ def main():
                     dump_diagnostics_dir=args.dump_diagnostics,
                     max_moves_per_module=args.max_moves_per_module,
                     use_position_history=not args.no_position_history,
+                    random_baseline=args.random_baseline,
                 )
 
                 summary_writer.writerow([
@@ -1135,6 +1243,7 @@ def main():
                     strat,
                     rad,
                     restructuring_method,
+                    bool(args.random_baseline),
                 ])
                 summary_file.flush()
 
@@ -1159,6 +1268,7 @@ def main():
                         strat,
                         rad,
                         restructuring_method,
+                        bool(args.random_baseline),
                     ])
                 trials_file.flush()
 
