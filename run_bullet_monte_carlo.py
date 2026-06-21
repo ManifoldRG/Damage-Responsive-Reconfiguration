@@ -730,8 +730,8 @@ def run_ablation_suite(args):
     import subprocess
 
     SWEEPS = {
-        "token_gen_interval": ("--token-gen-interval", [2.5, 5, 10, 20, 40]),
-        "safety_radius":      ("--safety-radius",      [2, 3, 4, 5]),
+        "token_gen_interval": ("--token-gen-interval", [1, 2, 5, 10, 20]),
+        "safety_radius":      ("--safety-radius",      [2, 3, 4]),
         "temperature":        ("--temperature",        [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]),
     }
     TOPOS = {"tree": ["--tree"], "fc": ["--fully-connected"]}
@@ -746,9 +746,9 @@ def run_ablation_suite(args):
         "--trials", str(args.trials),
         "--restructuring-method", "retrace",
         "--pivot-radius", "4",
-        "--safety-radius", "4",
-        "--temperature", "0.5",
-        "--token-gen-interval", "10",
+        "--safety-radius", "2",
+        "--temperature", "1.0",
+        "--token-gen-interval", "2",
     ]
     if args.fast:
         shared.append("--fast")
